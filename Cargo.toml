@@ -3,4 +3,14 @@ name = "tvisor"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tvisor_util"
+crate-type = ["rlib"]
+path = "tvisor_util/lib.rs"
+
+[[bin]]
+name = "tvisor"
+path = "src/main.rs"
+
 [dependencies]
+
