@@ -1,0 +1,686 @@
+# U-Boot handoff-state diagnostic design
+
+## 1. Purpose
+
+Before tvisor replaces the execution environment inherited from U-Boot, it
+must observe and document that environment. This diagnostic phase answers:
+
+- Which core and exception level entered tvisor?
+- Which stack pointer is active, and is it aligned?
+- Are the EL2 MMU and caches enabled?
+- Which EL2 translation tables and memory attributes are installed?
+- Is stage-2 translation already enabled?
+- Where are the inherited exception vectors, and which exceptions are masked?
+- Which architectural features are implemented by the Cortex-A72?
+- Can tvisor report the state and return without changing it?
+
+The result will be evidence for a later, permanent handoff design. It is not
+the permanent handoff itself.
+
+## 2. Scope and safety contract
+
+The diagnostic runs as an ELF application invoked by U-Boot `bootelf`. It uses
+the U-Boot stack, translation tables, exception vectors, interrupt state, and
+mini-UART configuration, then returns through the normal AArch64 calling
+convention.
+
+During this phase tvisor may:
+
+- read architectural system registers available at EL2;
+- copy their values into an ordinary Rust snapshot on the current stack;
+- decode and print the values through the inherited mini UART;
+- append invariant failures to the debug error stack;
+- read the current SP and check its alignment.
+
+It must not:
+
+- write any register described in this document;
+- change `SCTLR_EL2`, the cache state, or the MMU state;
+- change `HCR_EL2`, `TCR_EL2`, `TTBR0_EL2`, or `MAIR_EL2`;
+- replace `VBAR_EL2` or alter `DAIF`;
+- install a private stack or translation table;
+- initialize or reconfigure the UART or GPIO pins;
+- execute cache, TLB, or branch-predictor maintenance;
+- enable secondary cores;
+- enter a guest or execute `ERET`;
+- retain pointers into the U-Boot stack after returning.
+
+The only intentionally modified external state is:
+
+- bytes appended to `[0x0000_1000, 0x0000_1100)`;
+- bytes transmitted through the mini UART.
+
+The UART must be drained before returning to U-Boot.
+
+## 3. Diagnostic sequence
+
+The implementation order is fixed:
+
+1. Capture all readable handoff registers into a local snapshot.
+2. Initialize and clear the debug error stack.
+3. Validate only the invariants defined as errors in this document.
+4. Append each failed invariant to the error stack.
+5. Print all raw values and selected decoded fields through UART.
+6. Capture a second snapshot of the system registers that must remain stable.
+7. Compare the stable fields and record an error if any changed.
+8. Drain UART output.
+9. Return zero if no fatal invariant failed; otherwise return one.
+
+The initial capture comes before `debug_init()` so that the snapshot is as
+close as possible to the Rust entry point. It still is not the exact machine
+state at the `bootelf` branch: the compiler-generated function prologue can
+already have adjusted SP and used the U-Boot stack.
+
+Capturing the exact entry-time general-purpose registers and SP requires a
+future assembly entry shim. That work belongs to the permanent-handoff phase.
+
+## 4. Snapshot model
+
+The snapshot is a temporary Rust value, not a new format in debug memory. The
+byte error stack remains the only low-memory diagnostic format.
+
+The conceptual snapshot is:
+
+```rust
+struct HandoffState {
+    current_el: u64,
+    mpidr_el1: u64,
+    spsel: u64,
+    sp: u64,
+
+    sctlr_el2: u64,
+    hcr_el2: u64,
+    tcr_el2: u64,
+    ttbr0_el2: u64,
+    mair_el2: u64,
+
+    vtcr_el2: u64,
+    vttbr_el2: u64,
+
+    vbar_el2: u64,
+    daif: u64,
+    cptr_el2: u64,
+
+    cnthctl_el2: u64,
+    cntvoff_el2: u64,
+
+    id_aa64pfr0_el1: u64,
+    id_aa64mmfr0_el1: u64,
+}
+```
+
+Every field stores the unmodified raw register value. Decoded values are
+derived from this snapshot rather than replacing raw values.
+
+The structure does not need `#[repr(C)]` while it remains local Rust data and
+is never exchanged across an ABI or persisted. Add a representation attribute
+only if a future interface requires a defined binary layout.
+
+## 5. Register access
+
+Use one small function per system register. A register name is part of the A64
+instruction encoding and cannot be supplied as an ordinary runtime argument.
+
+For example:
+
+```rust
+#[inline(always)]
+fn read_sctlr_el2() -> u64 {
+    let value: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mrs {value}, SCTLR_EL2",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    value
+}
+```
+
+Read the current SP with `MOV`, not `MRS`:
+
+```rust
+#[inline(always)]
+fn read_sp() -> u64 {
+    let value: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mov {value}, sp",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    value
+}
+```
+
+These functions are safe wrappers because the register reads have no caller-
+visible side effects and are only compiled for the AArch64 EL2 target. The
+inline assembly remains the internal unsafe operation.
+
+## 6. Register specification and diagnostic policy
+
+### 6.1 `CurrentEL`
+
+`CurrentEL[3:2]` encodes the current exception level. Decode it with:
+
+```text
+EL = (CurrentEL >> 2) & 0b11
+```
+
+Policy:
+
+- EL2 is required.
+- Any other value appends `InvalidEL2State` and makes the return status one.
+- If execution is not at EL2, do not read EL2-only registers; report the error,
+  drain UART if possible, and return immediately.
+
+### 6.2 `MPIDR_EL1`
+
+`MPIDR_EL1` is the Multiprocessor Affinity Register. It identifies the
+processing element (PE) on which tvisor is executing and describes that PE’s
+position in the system affinity hierarchy. Software can read it at EL2 with:
+
+```asm
+mrs xN, MPIDR_EL1
+```
+
+Reading the register does not select or start a core. Each PE has its own
+`MPIDR_EL1` value, and the combined affinity fields identify that PE within the
+system.
+
+| Bits | Field | Description |
+| --- | --- | --- |
+| `[63:40]` | `RES0` | Reserved; reads as zero. |
+| `[39:32]` | `Aff3` | Affinity level 3 identifier. |
+| `31` | `RES1` | Reserved; reads as one. It is not the uniprocessor flag. |
+| `30` | `U` | Uniprocessor-system flag. One means the system contains one PE; zero means it is a multiprocessor system. |
+| `[29:25]` | `RES0` | Reserved; reads as zero. |
+| `24` | `MT` | Performance-interdependence indicator for PEs at affinity level 0. |
+| `[23:16]` | `Aff2` | Affinity level 2 identifier. |
+| `[15:8]` | `Aff1` | Affinity level 1 identifier. |
+| `[7:0]` | `Aff0` | Affinity level 0 identifier. |
+
+`Aff0` is the lowest affinity level and `Aff3` is the highest. The hierarchy
+describes implementation-defined processor topology; software must not assume
+that a particular level always means thread, core, cluster, or socket on every
+machine. Compare the complete tuple `(Aff3, Aff2, Aff1, Aff0)` when identifying
+a PE. The affinity fields are extracted as follows:
+
+```text
+Aff0 = (MPIDR_EL1 >>  0) & 0xff
+Aff1 = (MPIDR_EL1 >>  8) & 0xff
+Aff2 = (MPIDR_EL1 >> 16) & 0xff
+Aff3 = (MPIDR_EL1 >> 32) & 0xff
+```
+
+When `MT` is one, PEs that differ only in `Aff0` are very interdependent in
+their performance. This can describe processing elements that share substantial
+execution resources. `MT == 0` does not prove that no resources are shared, so
+the diagnostic records this bit but does not use it as a topology invariant.
+
+On Raspberry Pi 4, U-Boot normally enters tvisor on the boot PE with affinity
+`0.0.0.0`. A typical raw value is `0x0000000080000000`: bit 31 is the required
+`RES1` value, while `U == 0`, `MT == 0`, and all four affinity fields are zero.
+Other cores normally differ in `Aff0`, but tvisor should decode the register
+rather than relying on that board-specific expectation.
+
+Policy:
+
+- Print the raw value, `U`, `MT`, and all four affinity fields.
+- The initial diagnostic expects the U-Boot boot core, normally affinity
+  `0.0.0.0`, but a different affinity is observational rather than fatal.
+- Do not treat bit 31 as part of the affinity or as evidence of a uniprocessor
+  system.
+- Do not start or modify another core.
+
+### 6.3 `SPSel` and `SP`
+
+`SPSel` is the Stack Pointer Select register. It determines which stack-pointer
+register is named by the architectural `SP` operand while executing at an
+exception level that has its own stack pointer. At EL2, it selects between
+`SP_EL0` and `SP_EL2`.
+
+| Bits | Field | Description |
+| --- | --- | --- |
+| `[63:1]` | `RES0` | Reserved; reads as zero. |
+| `0` | `SP` | Selects the stack pointer used by the current exception level. |
+
+The selection has the following meaning while tvisor executes at EL2:
+
+```text
+SPSel.SP == 0: the SP operand accesses SP_EL0 (EL2t)
+SPSel.SP == 1: the SP operand accesses SP_EL2 (EL2h)
+```
+
+The `t` and `h` suffixes describe the stack selection used by an exception
+level: `t` uses `SP_EL0`, while `h` uses that exception level’s dedicated stack
+pointer. Therefore, at EL2, `EL2t` uses `SP_EL0` and `EL2h` uses `SP_EL2`.
+This selection does not change the current exception level.
+
+`SP_EL0` and `SP_EL2` are separate hardware registers that can each hold a
+stack address:
+
+- `SP_EL0` is the stack pointer that EL0 always uses. Higher exception levels
+  can also select this shared stack pointer with `SPSel.SP == 0`.
+- `SP_EL2` is the dedicated EL2 stack pointer. Only execution at EL2 can use it
+  as the current `SP`, by selecting `SPSel.SP == 1`.
+
+The available selection depends on the current exception level:
+
+| Current EL | Stack-pointer choices |
+| --- | --- |
+| EL0 | `SP_EL0` only |
+| EL1 | `SP_EL0` or `SP_EL1` |
+| EL2 | `SP_EL0` or `SP_EL2` |
+| EL3 | `SP_EL0` or `SP_EL3` |
+
+Having a dedicated stack pointer lets exception handlers avoid relying on the
+stack used by lower-level software. For example, when execution enters tvisor
+at EL2 because of an exception from a guest, EL2 can use `SP_EL2` immediately
+instead of using the guest-visible `SP_EL0`. A typical future arrangement is:
+
+```text
+EL2 hypervisor code -> SP_EL2 -> private per-core tvisor stack
+EL1 guest kernel    -> SP_EL1 -> guest kernel stack
+EL0 guest process   -> SP_EL0 -> guest userspace stack
+```
+
+Each participating core will eventually require its own valid EL2 stack even
+though the architectural stack-pointer register is called `SP_EL2`. The
+multicore entry path must choose and install that core’s stack before running
+ordinary Rust code on the core.
+
+During the current `bootelf` diagnostic, tvisor has not installed its own
+stack. It is still using whichever stack pointer and stack memory U-Boot handed
+over. The diagnostic therefore observes both `SPSel` and the selected `SP`
+value without assuming that the inherited selection is tvisor’s permanent
+configuration.
+
+Read `SPSel` with `MRS` and retain only bit 0:
+
+```rust
+#[inline(always)]
+fn read_spsel() -> u64 {
+    let value: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mrs {value}, SPSel",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    value & 1
+}
+```
+
+`SPSel` tells tvisor which stack-pointer register is selected, but it does not
+contain the stack address. Read the address currently named by `SP` separately
+with `MOV`:
+
+```rust
+#[inline(always)]
+fn read_sp() -> u64 {
+    let value: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "mov {value}, sp",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    value
+}
+```
+
+If `SPSel.SP == 0`, this value came from `SP_EL0`; if `SPSel.SP == 1`, it came
+from `SP_EL2`. The diagnostic must not change `SPSel`, because selecting another
+stack before installing a valid stack value can immediately make normal Rust
+stack accesses unsafe.
+
+The AArch64 procedure-call standard requires SP to be 16-byte aligned at a
+public interface.
+
+Policy:
+
+- Print the raw `SPSel` value, decoded selected register (`SP_EL0` or `SP_EL2`),
+  current SP address, and `SP & 0xF`.
+- Either stack selection is recorded as inherited state, not rejected.
+- A nonzero `SP & 0xF` appends `InvalidStackAlignment` and makes the return
+  status one.
+- Do not write `SPSel`, `SP_EL0`, or `SP_EL2` during the diagnostic phase.
+- This is an observation after the Rust function prologue, not the exact SP at
+  the branch from U-Boot.
+
+### 6.4 `SCTLR_EL2`
+
+Relevant fields are:
+
+| Bit | Field | Meaning |
+| --- | --- | --- |
+| 0 | `M` | EL2 stage-1 MMU enable |
+| 1 | `A` | Alignment checking enable |
+| 2 | `C` | Data/unified cache enable |
+| 3 | `SA` | EL2 stack-alignment checking enable |
+| 12 | `I` | Instruction-cache enable |
+| 19 | `WXN` | Writable mappings execute-never |
+| 25 | `EE` | EL2 data endianness; zero is little-endian |
+
+Policy:
+
+- Print the raw value and every field above.
+- `M`, `C`, and `I` are observations; the diagnostic accepts either value.
+- `EE == 1` conflicts with the little-endian tvisor build, appends
+  `UnexpectedEL2Endianness`, and makes the return status one.
+- Never write `SCTLR_EL2` in the diagnostic phase.
+
+### 6.5 `HCR_EL2`
+
+Relevant fields are `VM`, `FMO`, `IMO`, `AMO`, `TWI`, `TWE`, `TGE`, and `RW`.
+
+Policy:
+
+- Print the raw value and these fields.
+- `VM` reports whether stage-2 translation for EL1/EL0 is enabled; it does not
+  control EL2 stage-1 translation.
+- `RW` reports the intended execution state of EL1 and does not affect the
+  current AArch64 execution at EL2.
+- No inherited field is rejected during the observation phase.
+- If `VM == 1`, clearly mark `VTCR_EL2` and `VTTBR_EL2` as active state in the
+  report.
+
+### 6.6 `TCR_EL2`, `TTBR0_EL2`, and `MAIR_EL2`
+
+These registers describe EL2 stage-1 address translation. Decode the fields
+documented in `uart_rpi4_design.md`, including `T0SZ`, `TG0`, `SH0`, `IRGN0`,
+`ORGN0`, `PS`, and `TBI`.
+
+Policy:
+
+- Always print the raw values.
+- Decode them as active translation state only when `SCTLR_EL2.M == 1`.
+- When `M == 0`, label them inactive/stale rather than assuming that their
+  contents describe current accesses.
+- Print all eight `MAIR_EL2` attribute bytes.
+- Do not walk U-Boot page tables in this milestone. A table walker requires
+  careful validation of granule, levels, physical size, descriptor type, and
+  memory accessibility and should be designed separately.
+
+### 6.7 `VTCR_EL2` and `VTTBR_EL2`
+
+These registers configure stage-2 translation for EL1/EL0 guests.
+
+Policy:
+
+- Always capture and print their raw values.
+- Treat them as active only if `HCR_EL2.VM == 1`.
+- Do not reject nonzero inactive values because firmware can leave stale
+  configuration in disabled registers.
+- Do not disable stage 2 or invalidate stage-2 TLB entries in this phase.
+
+### 6.8 `VBAR_EL2`
+
+`VBAR_EL2` points to the inherited EL2 vector table. On Cortex-A72 it must be
+aligned to 2048 bytes.
+
+Policy:
+
+- Print the raw address and `VBAR_EL2 & 0x7FF`.
+- A nonzero low field appends `InvalidVectorBaseAlignment` and makes the return
+  status one.
+- Do not inspect or invoke the vector entries and never replace `VBAR_EL2`.
+
+### 6.9 `DAIF`
+
+The PSTATE mask fields are:
+
+| Bit | Field | Meaning when one |
+| --- | --- | --- |
+| 9 | `D` | Debug exceptions masked |
+| 8 | `A` | SError exceptions masked |
+| 7 | `I` | IRQ exceptions masked |
+| 6 | `F` | FIQ exceptions masked |
+
+Policy:
+
+- Print the raw value and all four masks.
+- Any combination is observational during this phase.
+- Never use `DAIFSet` or `DAIFClr`.
+- Compare `DAIF` before and after reporting; a change appends
+  `HandoffStateChanged`.
+
+### 6.10 `CPTR_EL2`
+
+`CPTR_EL2` controls traps for floating-point, Advanced SIMD, and related
+coprocessor functionality. On the Cortex-A72, `TFP` at bit 10 is the primary
+field relevant to accidental FP/SIMD use below EL2.
+
+Policy:
+
+- Print the complete raw value and `TFP`.
+- Do not execute floating-point or SIMD instructions as part of the diagnostic.
+- Do not modify trap controls.
+
+### 6.11 `CNTHCTL_EL2` and `CNTVOFF_EL2`
+
+`CNTHCTL_EL2` controls timer/counter access from EL1. On Armv8.0,
+`EL1PCTEN` at bit 0 permits EL1 physical counter access and `EL1PCEN` at bit 1
+permits EL1 physical timer access. `CNTVOFF_EL2` is the virtual counter offset
+applied below EL2.
+
+Policy:
+
+- Print both raw values and the two access-control bits.
+- Do not read a changing counter into the stable-state comparison.
+- Do not change timer access or the virtual offset.
+
+### 6.12 `ID_AA64PFR0_EL1`
+
+Relevant feature fields include:
+
+| Bits | Field | Purpose |
+| --- | --- | --- |
+| `[11:8]` | `EL2` | EL2 implementation and execution-state support |
+| `[19:16]` | `FP` | Floating-point support |
+| `[23:20]` | `AdvSIMD` | Advanced SIMD support |
+| `[27:24]` | `GIC` | System-register GIC interface support |
+
+Policy:
+
+- Print the raw value and these fields.
+- An `EL2` field indicating no EL2 is inconsistent with executing at EL2;
+  append `UnsupportedEL2Feature` and return one.
+- Other fields are capability observations.
+
+### 6.13 `ID_AA64MMFR0_EL1`
+
+Relevant memory-model fields include:
+
+| Bits | Field | Purpose |
+| --- | --- | --- |
+| `[3:0]` | `PARange` | Implemented physical-address range |
+| `[7:4]` | `ASIDBits` | Supported ASID width |
+| `[23:20]` | `TGran16` | 16 KiB translation-granule support |
+| `[27:24]` | `TGran64` | 64 KiB translation-granule support |
+| `[31:28]` | `TGran4` | 4 KiB translation-granule support |
+
+Policy:
+
+- Print the raw value and these fields.
+- Do not yet reject a granule encoding. The permanent MMU design will select a
+  granule and then turn the relevant capability into a required invariant.
+- Use `PARange` when designing address masks; do not assume all 64 address bits
+  are implemented.
+
+## 7. Error-stack allocation
+
+Existing values retain their meaning:
+
+| Value | Error |
+| --- | --- |
+| `0x01` | `InvalidEL2State` |
+| `0x02` | `WaitUartIoComplete` |
+| `0x03` | `UartTxTimeout` |
+
+Reserve the following values for the handoff diagnostic:
+
+| Value | Error | Fatal |
+| --- | --- | --- |
+| `0x04` | `InvalidStackAlignment` | Yes |
+| `0x05` | `UnexpectedEL2Endianness` | Yes |
+| `0x06` | `InvalidVectorBaseAlignment` | Yes |
+| `0x07` | `UnsupportedEL2Feature` | Yes |
+| `0x08` | `HandoffStateChanged` | Yes |
+
+An observation such as MMU enabled, caches enabled, `SPSel == 0`, stage 2
+enabled, or interrupts unmasked is printed but does not receive an error code
+until the permanent-handoff contract explicitly requires a value.
+
+When multiple invariants fail, append every error in validation order rather
+than returning after the first failure, except when `CurrentEL != EL2`. EL2-only
+register reads are unsafe at a lower exception level, so that case terminates
+the remaining checks.
+
+## 8. Stable-state comparison
+
+The diagnostic promises not to modify inherited EL2 state. After UART
+reporting, capture a second snapshot and compare:
+
+- `CurrentEL`;
+- `MPIDR_EL1`;
+- `SPSel`;
+- `SCTLR_EL2`;
+- `HCR_EL2`;
+- `TCR_EL2`;
+- `TTBR0_EL2`;
+- `MAIR_EL2`;
+- `VTCR_EL2`;
+- `VTTBR_EL2`;
+- `VBAR_EL2`;
+- `DAIF`;
+- `CPTR_EL2`;
+- `CNTHCTL_EL2`;
+- `CNTVOFF_EL2`;
+- both feature-identification registers.
+
+Do not compare SP: ordinary Rust calls and formatting legitimately change SP
+temporarily, and capture can occur at different stack depths. Check only its
+alignment. Do not include running timer/counter registers.
+
+If a stable field differs, append one `HandoffStateChanged` error and print the
+name, before value, and after value if UART remains operational. The comparison
+must not attempt to restore a changed register during this phase.
+
+## 9. UART report format
+
+Print fixed-width hexadecimal raw values so captures can be compared between
+U-Boot or firmware versions:
+
+```text
+tvisor handoff diagnostic
+  CurrentEL       0x0000000000000008  EL=2
+  MPIDR_EL1       0x0000000080000000  Aff=0.0.0.0
+  SPSel           0x0000000000000001  SP_EL2
+  SP              0x0000000037b3ac90  align=0
+  SCTLR_EL2       0x................  M=. C=. I=. A=. SA=. EE=. WXN=.
+  HCR_EL2         0x................  VM=. RW=. FMO=. IMO=. AMO=. TWI=. TWE=. TGE=.
+  TCR_EL2         0x................  active=<yes|no>
+  TTBR0_EL2       0x................  active=<yes|no>
+  MAIR_EL2        0x................  Attr0=.. Attr1=.. ... Attr7=..
+  VTCR_EL2        0x................  active=<yes|no>
+  VTTBR_EL2       0x................  active=<yes|no>
+  VBAR_EL2        0x................  align=...
+  DAIF            0x................  D=. A=. I=. F=.
+  CPTR_EL2        0x................  TFP=.
+  CNTHCTL_EL2     0x................  EL1PCTEN=. EL1PCEN=.
+  CNTVOFF_EL2     0x................
+  ID_AA64PFR0_EL1 0x................  EL2=. FP=. AdvSIMD=. GIC=.
+  ID_AA64MMFR0_EL1 0x...............  PARange=. ASIDBits=. TG4=. TG16=. TG64=.
+  fatal_errors    <count>
+  state_unchanged <yes|no>
+```
+
+Formatting must not allocate. Existing `core::fmt` UART output is sufficient.
+If a transmit timeout occurs, `UartTxTimeout` remains available in the memory
+error stack even though the text report is incomplete.
+
+## 10. Return policy
+
+Return zero only when:
+
+- execution is at EL2;
+- SP is observed 16-byte aligned;
+- `SCTLR_EL2.EE == 0`;
+- `VBAR_EL2` is 2048-byte aligned;
+- the processor reports EL2 support;
+- no stable inherited register changed.
+
+UART failures remain recorded in the error stack. A UART drain failure occurs
+during finalization, so the implementation must decide the return code after
+`debug_fini()` or have `debug_fini()` return a result. The design treats UART
+TX and drain failures as diagnostic failures and therefore expects a nonzero
+return status.
+
+## 11. Validation on Raspberry Pi 4
+
+Build-time checks:
+
+```text
+cargo check
+cargo clippy --bin tvisor --lib -- -D warnings
+cargo fmt --all -- --check
+```
+
+Board procedure:
+
+1. Clear or note the current U-Boot console.
+2. Load the ELF at `0x0200_0000` and execute it with `bootelf`.
+3. Save the complete UART report.
+4. Confirm tvisor returns to a working U-Boot prompt.
+5. Inspect the error stack:
+
+   ```text
+   U-Boot> md.b 0x00001000 0x100
+   ```
+
+6. Confirm a normal run begins with `00` and reports `state_unchanged yes`.
+7. Repeat after U-Boot, firmware, device-tree, or boot-configuration updates
+   and compare the raw register values.
+
+Negative checks should be performed only through safe test hooks, not by
+corrupting live EL2 state. Unit-test pure decoding and validation functions on
+the host where practical. Hardware-only register reads remain covered by board
+testing.
+
+## 12. Output of this phase
+
+After the diagnostic is reviewed on the real board, record:
+
+- the U-Boot version and Raspberry Pi firmware version;
+- the complete raw UART report;
+- which inherited values are stable across several boots;
+- which values change after firmware or U-Boot updates;
+- the accepted entry invariants for permanent takeover;
+- the normalization required for stack, vectors, MMU, caches, stage 2,
+  interrupts, timers, and UART.
+
+Only then should tvisor design the assembly entry point and the one-way
+transition away from U-Boot.
+
+## 13. References
+
+- [UART support design for Raspberry Pi 4](uart_rpi4_design.md)
+- [Peripheral address translation on Raspberry Pi 4](peripheral_address_translation.md)
+- [U-Boot memory layout on Raspberry Pi 4](uboot_rpi4_memory.md)
+- [Arm A-profile AArch64 register reference](https://developer.arm.com/documentation/ddi0601/latest)
+- [Arm memory-management guide](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf)
+- [Arm exception-model guide](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Exception%20model.pdf)
