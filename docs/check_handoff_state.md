@@ -618,7 +618,129 @@ Policy:
 
 ### 6.7 `VTCR_EL2` and `VTTBR_EL2`
 
-These registers configure stage-2 translation for EL1/EL0 guests.
+These two registers configure stage-2 translation for EL1/EL0 guests. Stage 2
+maps an Intermediate Physical Address (IPA), supplied by a guest's stage-1
+translation, to the final Physical Address. `VTCR_EL2` selects the translation
+regime's geometry and memory attributes, and `VTTBR_EL2` points at the initial
+stage-2 translation table:
+
+```text
+guest virtual address
+    |
+    | guest stage-1 translation (controlled by the guest)
+    v
+intermediate physical address (IPA)
+    |
+    | VTCR_EL2 selects address size, granule, and table-walk attributes
+    | VTTBR_EL2 points to the first stage-2 translation table
+    v
+physical address
+```
+
+Stage-2 translation is active only when `HCR_EL2.VM == 1`. The registers can
+retain nonzero values while stage 2 is disabled, so the diagnostic records
+them but labels the group inactive when `VM == 0`.
+
+#### 6.7.1 `VTCR_EL2`
+
+`VTCR_EL2` is the Virtualization Translation Control Register. It selects the
+size and starting level of the stage-2 translation regime, the granule, the
+shareability and cacheability of stage-2 walks, and the maximum output
+physical-address size.
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[4:0]` | `T0SZ` | Size offset of the stage-2 input address space. The IPA width is `64 - T0SZ`. |
+| `[7:6]` | `VS` | Virtualization Secure; `FEAT_SEL2` only, `RES0` on the Cortex-A72. |
+| `[10:8]` | `PS` | Maximum physical output-address size of the stage-2 regime. |
+| `[15:14]` | `TG0` | Stage-2 translation granule. |
+| `[19:16]` | `SH0` | Shareability used for stage-2 translation-table walks. |
+| `[21:20]` | `ORGN0` | Outer cacheability used for stage-2 translation-table walks. |
+| `[23:22]` | `IRGN0` | Inner cacheability used for stage-2 translation-table walks. |
+| `[29:28]` | `SL0` | Starting level of the stage-2 lookup: `00`=level 0, `01`=level 1, `10`=level 2, `11`=level 3. |
+| `30` | `DS` | Default shareability: when a stage-2 descriptor uses shareability `00`, `1` selects Outer Shareable and `0` selects Inner Shareable. |
+
+All remaining bits are `RES0`.
+
+`IRGN0` and `ORGN0` use the same encoding as `TCR_EL2`:
+
+| Encoding | Table-walk cacheability |
+| --- | --- |
+| `00` | Normal memory, Non-cacheable |
+| `01` | Normal memory, Write-Back Read-Allocate Write-Allocate |
+| `10` | Normal memory, Write-Through Read-Allocate, no Write-Allocate |
+| `11` | Normal memory, Write-Back Read-Allocate, no Write-Allocate |
+
+`SH0` is:
+
+| Encoding | Shareability |
+| --- | --- |
+| `00` | Non-shareable |
+| `01` | Reserved |
+| `10` | Outer Shareable |
+| `11` | Inner Shareable |
+
+`TG0` is:
+
+| Encoding | Granule |
+| --- | --- |
+| `00` | 4 KiB |
+| `01` | 64 KiB |
+| `10` | 16 KiB |
+| `11` | Reserved |
+
+`PS` encodes the maximum output PA size with the same encodings as
+`TCR_EL2.PS`:
+
+| Encoding | PA width |
+| --- | --- |
+| `000` | 32 bits, 4 GiB |
+| `001` | 36 bits, 64 GiB |
+| `010` | 40 bits, 1 TiB |
+| `011` | 42 bits, 4 TiB |
+| `100` | 44 bits, 16 TiB |
+| `101` | 48 bits, 256 TiB |
+| `110` | 52 bits, when the required architecture feature is implemented |
+| `111` | Reserved |
+
+`T0SZ` and `SL0` together fix the stage-2 input-address width and the number
+of table levels. For the common 4 KiB granule:
+
+| `T0SZ` | IPA width | `SL0` | Levels |
+| --- | --- | --- | --- |
+| `16` | 48 bits | `00` | level 0 through level 3 |
+| `25` | 39 bits | `01` | level 1 through level 3 |
+| `34` | 30 bits | `10` | invalid for stage 2 (below the 32-bit minimum) |
+| `43` | 21 bits | `11` | invalid for stage 2 |
+
+The minimum stage-2 input-address width is 32 bits, so only `SL0 == 0` and
+`SL0 == 1` are valid starting levels with a 4 KiB granule. Validate granule and
+PA-size support against `ID_AA64MMFR0_EL1` before constructing a permanent
+`VTCR_EL2`.
+
+#### 6.7.2 `VTTBR_EL2`
+
+`VTTBR_EL2` is the Virtualization Translation Table Base Register. It holds the
+base address of the initial stage-2 translation table:
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[47:x]` | `BADDR` | Physical base address of the starting-level stage-2 table. |
+| `[x-1:0]` | `RES0` | Reserved; must be zero. `x` is the table alignment required for the selected granule. |
+| `[63:48]` | `RES0` | Reserved. |
+
+The table base must be aligned to the size of the starting-level translation
+table, so the number of valid `BADDR` bits depends on the granule:
+
+| Granule | Table size | Valid `BADDR` | `RES0` low bits |
+| --- | --- | --- | --- |
+| 4 KiB | 4 KiB | `[47:12]` | `[11:0]` |
+| 16 KiB | 16 KiB | `[47:14]` | `[13:0]` |
+| 64 KiB | 64 KiB | `[47:16]` | `[15:0]` |
+
+Unlike `TTBR0_EL2`, `VTTBR_EL2` has no `CnP` bit: bit `0` is always `RES0`.
+`VTTBR_EL2` belongs to a guest's stage-2 tables and must not be confused with
+`TTBR0_EL2`, which points to tvisor's own EL2 stage-1 tables.
 
 Policy:
 
