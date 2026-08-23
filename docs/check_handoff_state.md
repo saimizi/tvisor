@@ -746,6 +746,10 @@ Policy:
 
 - Always capture and print their raw values.
 - Treat them as active only if `HCR_EL2.VM == 1`.
+- Print `VTCR_EL2.T0SZ`, nominal IPA width, `VS`, `PS`, `TG0`, `SH0`,
+  `ORGN0`, `IRGN0`, `SL0`, and `DS`.
+- Print the baseline `VTTBR_EL2.BADDR[47:0]` field; the valid bits depend
+  on `VTCR_EL2.TG0`.
 - Do not reject nonzero inactive values because firmware can leave stale
   configuration in disabled registers.
 - Do not disable stage 2 or invalidate stage-2 TLB entries in this phase.
@@ -919,8 +923,8 @@ tvisor handoff diagnostic
   TCR_EL2         0x................  active=<yes|no>
   TTBR0_EL2       0x................  active=<yes|no>
   MAIR_EL2        0x................  Attr0=.. Attr1=.. ... Attr7=..
-  VTCR_EL2        0x................  active=<yes|no>
-  VTTBR_EL2       0x................  active=<yes|no>
+  VTCR_EL2        0x................  active=<yes|no> T0SZ=. IPA_BITS=. VS=. PS=. TG0=. SH0=. ORGN0=. IRGN0=. SL0=. DS=.
+  VTTBR_EL2       0x................  active=<yes|no> BADDR=..
   VBAR_EL2        0x................  align=...
   DAIF            0x................  D=. A=. I=. F=.
   CPTR_EL2        0x................  TFP=.

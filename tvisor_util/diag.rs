@@ -166,6 +166,76 @@ impl MairEl2 {
 }
 
 #[derive(Default)]
+pub struct VtcrEl2 {
+    pub vtcr_el2: u64,
+}
+
+impl VtcrEl2 {
+    // Size offset of the stage-2 input address space
+    pub fn t0sz(&self) -> u8 {
+        (self.vtcr_el2 & 0x1f) as u8
+    }
+
+    // Nominal intermediate-physical-address width
+    pub fn ipa_bits(&self) -> u8 {
+        64 - self.t0sz()
+    }
+
+    // Virtualization Secure (FEAT_SEL2 only; RES0 on Cortex-A72)
+    pub fn vs(&self) -> u8 {
+        ((self.vtcr_el2 >> 6) & 0b11) as u8
+    }
+
+    // Maximum physical output-address size
+    pub fn ps(&self) -> u8 {
+        ((self.vtcr_el2 >> 8) & 0b111) as u8
+    }
+
+    // Stage-2 translation granule
+    pub fn tg0(&self) -> u8 {
+        ((self.vtcr_el2 >> 14) & 0b11) as u8
+    }
+
+    // Shareability used for stage-2 walks
+    pub fn sh0(&self) -> u8 {
+        ((self.vtcr_el2 >> 16) & 0b1111) as u8
+    }
+
+    // Outer cacheability used for stage-2 walks
+    pub fn orgn0(&self) -> u8 {
+        ((self.vtcr_el2 >> 20) & 0b11) as u8
+    }
+
+    // Inner cacheability used for stage-2 walks
+    pub fn irgn0(&self) -> u8 {
+        ((self.vtcr_el2 >> 22) & 0b11) as u8
+    }
+
+    // Starting level of the stage-2 lookup
+    pub fn sl0(&self) -> u8 {
+        ((self.vtcr_el2 >> 28) & 0b11) as u8
+    }
+
+    // Default shareability
+    pub fn bit_ds(&self) -> bool {
+        bit_check(self.vtcr_el2, 30)
+    }
+}
+
+#[derive(Default)]
+pub struct VttbrEl2 {
+    pub vttbr_el2: u64,
+}
+
+impl VttbrEl2 {
+    // Physical base address of the starting-level stage-2 table.
+    // Bits [63:48] are RES0; the valid low bits depend on VTCR_EL2.TG0.
+    pub fn baddr(&self) -> u64 {
+        self.vttbr_el2 & 0x0000_ffff_ffff_ffff
+    }
+}
+
+#[derive(Default)]
 pub struct MpidrEl1 {
     pub mpidr_el1: u64,
 }
@@ -222,8 +292,8 @@ pub struct DiagState {
     pub ttbr0_el2: Option<Ttbr0El2>,
     pub mair_el2: Option<MairEl2>,
 
-    pub vtcr_el2: Option<u64>,
-    pub vttbr_el2: Option<u64>,
+    pub vtcr_el2: Option<VtcrEl2>,
+    pub vttbr_el2: Option<VttbrEl2>,
 
     pub vbar_el2: u64,
     pub daif: u64,
@@ -403,8 +473,10 @@ impl DiagState {
                 .map(|v| Ttbr0El2 { ttbr0_el2: v }),
             mair_el2: DiagState::dump_register(DiagStateReg::MairEl2, Some(current_el))
                 .map(|v| MairEl2 { mair_el2: v }),
-            vtcr_el2: DiagState::dump_register(DiagStateReg::VtcrEl2, Some(current_el)),
-            vttbr_el2: DiagState::dump_register(DiagStateReg::VttbrEl2, Some(current_el)),
+            vtcr_el2: DiagState::dump_register(DiagStateReg::VtcrEl2, Some(current_el))
+                .map(|v| VtcrEl2 { vtcr_el2: v }),
+            vttbr_el2: DiagState::dump_register(DiagStateReg::VttbrEl2, Some(current_el))
+                .map(|v| VttbrEl2 { vttbr_el2: v }),
             ..Default::default()
         }
     }
@@ -534,14 +606,35 @@ impl core::fmt::Display for DiagState {
             )?;
         }
 
-        if let Some(v) = self.vtcr_el2 {
+        if let Some(v) = self.vtcr_el2.as_ref() {
             let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
-            writeln!(f, " VTCR_EL2: {:#018x} active={}", v, active)?;
+            writeln!(
+                f,
+                " VTCR_EL2: {:#018x} active={} T0SZ={} IPA_BITS={} VS={:#x} PS={:#x} TG0={:#x} SH0={:#x} ORGN0={:#x} IRGN0={:#x} SL0={:#x} DS={}",
+                v.vtcr_el2,
+                active,
+                v.t0sz(),
+                v.ipa_bits(),
+                v.vs(),
+                v.ps(),
+                v.tg0(),
+                v.sh0(),
+                v.orgn0(),
+                v.irgn0(),
+                v.sl0(),
+                v.bit_ds(),
+            )?;
         }
 
-        if let Some(v) = self.vttbr_el2 {
+        if let Some(v) = self.vttbr_el2.as_ref() {
             let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
-            writeln!(f, "VTTBR_EL2: {:#018x} active={}", v, active)?;
+            writeln!(
+                f,
+                "VTTBR_EL2: {:#018x} active={} BADDR={:#014x}",
+                v.vttbr_el2,
+                active,
+                v.baddr(),
+            )?;
         }
         Ok(())
     }
