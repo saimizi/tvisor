@@ -385,11 +385,76 @@ Policy:
 
 ### 6.5 `HCR_EL2`
 
-Relevant fields are `VM`, `FMO`, `IMO`, `AMO`, `TWI`, `TWE`, `TGE`, and `RW`.
+`HCR_EL2` is the Hypervisor Configuration Register. It controls how EL2
+virtualizes EL1 and EL0: stage-2 translation, physical-exception routing,
+virtual exceptions, traps, and EL1's execution state. Most fields affect
+execution below EL2; reading the register does not alter current EL2 execution.
+
+Read it with `mrs xN, HCR_EL2`. The Cortex-A72 implements the original
+Armv8-A controls relevant to this diagnostic:
+
+| Bits | Field | Meaning when set |
+| --- | --- | --- |
+| `0` | `VM` | Enables stage-2 translation for Non-secure EL1/EL0 using `VTCR_EL2` and `VTTBR_EL2`. It does not enable EL2 stage 1. |
+| `1` | `SWIO` | Changes treatment of AArch32 set/way cache maintenance. |
+| `2` | `PTW` | With stage 2 active, faults a stage-1 table walk whose stage-2 attributes are not Normal memory. |
+| `3` | `FMO` | Routes physical FIQ to EL2. |
+| `4` | `IMO` | Routes physical IRQ to EL2. |
+| `5` | `AMO` | Routes physical SError to EL2. |
+| `6` | `VF` | Makes a virtual FIQ pending when delivery conditions permit. |
+| `7` | `VI` | Makes a virtual IRQ pending when delivery conditions permit. |
+| `8` | `VSE` | Makes a virtual SError pending. |
+| `9` | `FB` | Forces broadcast behavior for selected cache/TLB maintenance. |
+| `[11:10]` | `BSU` | Upgrades the shareability domain of barriers below EL2. |
+| `12` | `DC` | Default-cacheability control for EL1/EL0 stage 1; it is unrelated to `SCTLR_EL2.C`. |
+| `13` | `TWI` | Traps eligible `WFI` (Wait For Interrupt) execution to EL2. |
+| `14` | `TWE` | Traps eligible `WFE` (Wait For Event) execution to EL2. |
+| `[18:15]` | `TID0..3` | Trap defined groups of feature-identification register accesses. |
+| `19` | `TSC` | Traps an EL1 `SMC` instruction to EL2. |
+| `20` | `TIDCP` | Traps selected implementation-defined functionality. |
+| `21` | `TACR` | Traps AArch32 auxiliary-control-register accesses. |
+| `22` | `TSW` | Traps AArch32 set/way cache maintenance. |
+| `23` | `TPCP` | Traps cache maintenance by physical address. |
+| `24` | `TPU` | Traps cache maintenance to Point of Unification. |
+| `25` | `TTLB` | Traps selected EL1 TLB-maintenance instructions. |
+| `26` | `TVM` | Traps writes to selected EL1 virtual-memory control registers. |
+| `27` | `TGE` | Routes general exceptions normally handled at EL1 to EL2, changing the overall EL1/EL0 exception model. |
+| `28` | `TDZ` | Traps AArch32 use of `DC ZVA`. |
+| `29` | `HCD` | Disables normal use of `HVC` at EL1. |
+| `30` | `TRVM` | Traps selected reads of EL1 virtual-memory control registers. |
+| `31` | `RW` | Selects EL1 execution state: one is AArch64, zero is AArch32. It does not change EL2's state. |
+
+Do not confuse physical routing with virtual injection. `FMO`, `IMO`, and
+`AMO` route physical exceptions to EL2; `VF`, `VI`, and `VSE` make
+virtual exceptions pending below EL2. Guest `PSTATE.DAIF` and the interrupt
+controller also participate, so HCR fields alone do not describe delivery.
+
+`VM` adds a second translation stage:
+
+```text
+EL1/EL0 VA -- stage 1 (EL1 registers) --> IPA
+           -- stage 2 (VM, VTCR_EL2, VTTBR_EL2) --> PA
+```
+
+When `VM == 0`, nonzero `VTCR_EL2` or `VTTBR_EL2` values can be stale.
+When `VM == 1`, both stages must permit an access and stage-2 faults are
+handled at EL2.
+
+For an AArch64 guest, permanent handoff will eventually require `RW == 1`
+before entering EL1. An inherited zero is only observational while tvisor is
+already executing as AArch64 at EL2.
+
+Later Arm revisions add optional fields above bit 31. Decode those only after
+feature-register checks establish that they exist. Always retain the complete
+raw `u64`. Some fields have architecturally unknown reset values, and U-Boot
+can leave its own configuration; permanent handoff must construct a deliberate
+value rather than reuse this snapshot.
 
 Policy:
 
-- Print the raw value and these fields.
+- Print the raw value and at least `VM`, `PTW`, `FMO`, `IMO`, `AMO`,
+  `VF`, `VI`, `VSE`, `TWI`, `TWE`, `TTLB`, `TVM`, `TGE`, `HCD`,
+  `TRVM`, and `RW`.
 - `VM` reports whether stage-2 translation for EL1/EL0 is enabled; it does not
   control EL2 stage-1 translation.
 - `RW` reports the intended execution state of EL1 and does not affect the
@@ -397,6 +462,12 @@ Policy:
 - No inherited field is rejected during the observation phase.
 - If `VM == 1`, clearly mark `VTCR_EL2` and `VTTBR_EL2` as active state in the
   report.
+- Report physical-routing and virtual-pending controls separately.
+- Compare raw `HCR_EL2` in the before/after snapshots. A change appends
+  `HandoffStateChanged`.
+- Never write `HCR_EL2` in the diagnostic phase. Changing exception routing
+  or trap controls without valid EL2 vectors can make the next event
+  unrecoverable.
 
 ### 6.6 `TCR_EL2`, `TTBR0_EL2`, and `MAIR_EL2`
 

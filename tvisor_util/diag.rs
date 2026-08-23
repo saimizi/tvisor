@@ -45,6 +45,62 @@ impl SctlrEl2 {
 }
 
 #[derive(Default)]
+pub struct HcrEl2 {
+    pub hcr_el2: u64,
+}
+
+impl HcrEl2 {
+    pub fn bit_vm(&self) -> bool {
+        bit_check(self.hcr_el2, 0)
+    }
+    pub fn bit_ptw(&self) -> bool {
+        bit_check(self.hcr_el2, 2)
+    }
+    pub fn bit_fmo(&self) -> bool {
+        bit_check(self.hcr_el2, 3)
+    }
+    pub fn bit_imo(&self) -> bool {
+        bit_check(self.hcr_el2, 4)
+    }
+    pub fn bit_amo(&self) -> bool {
+        bit_check(self.hcr_el2, 5)
+    }
+    pub fn bit_vf(&self) -> bool {
+        bit_check(self.hcr_el2, 6)
+    }
+    pub fn bit_vi(&self) -> bool {
+        bit_check(self.hcr_el2, 7)
+    }
+    pub fn bit_vse(&self) -> bool {
+        bit_check(self.hcr_el2, 8)
+    }
+    pub fn bit_twi(&self) -> bool {
+        bit_check(self.hcr_el2, 13)
+    }
+    pub fn bit_twe(&self) -> bool {
+        bit_check(self.hcr_el2, 14)
+    }
+    pub fn bit_ttlb(&self) -> bool {
+        bit_check(self.hcr_el2, 25)
+    }
+    pub fn bit_tvm(&self) -> bool {
+        bit_check(self.hcr_el2, 26)
+    }
+    pub fn bit_tge(&self) -> bool {
+        bit_check(self.hcr_el2, 27)
+    }
+    pub fn bit_hcd(&self) -> bool {
+        bit_check(self.hcr_el2, 29)
+    }
+    pub fn bit_trvm(&self) -> bool {
+        bit_check(self.hcr_el2, 30)
+    }
+    pub fn bit_rw(&self) -> bool {
+        bit_check(self.hcr_el2, 31)
+    }
+}
+
+#[derive(Default)]
 pub struct MpidrEl1 {
     pub mpidr_el1: u64,
 }
@@ -80,6 +136,7 @@ enum DiagStateReg {
     SpSel,
     Sp,
     SctlrEl2,
+    HcrEl2,
 }
 
 #[derive(Default)]
@@ -90,7 +147,7 @@ pub struct DiagState {
     pub sp: Option<u64>,
 
     pub sctlr_el2: Option<SctlrEl2>,
-    pub hcr_el2: u64,
+    pub hcr_el2: Option<HcrEl2>,
     pub tcr_el2: u64,
     pub ttbr0_el2: u64,
     pub mair_el2: u64,
@@ -172,6 +229,19 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::HcrEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, HCR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -190,6 +260,8 @@ impl DiagState {
             sp: DiagState::dump_register(DiagStateReg::Sp, Some(current_el)),
             sctlr_el2: DiagState::dump_register(DiagStateReg::SctlrEl2, Some(current_el))
                 .map(|v| SctlrEl2 { sctlr_el2: v }),
+            hcr_el2: DiagState::dump_register(DiagStateReg::HcrEl2, Some(current_el))
+                .map(|v| HcrEl2 { hcr_el2: v }),
             ..Default::default()
         }
     }
@@ -243,6 +315,30 @@ impl core::fmt::Display for DiagState {
                 v.bit_i(),
                 v.bit_wxn(),
                 v.bit_ee(),
+            )?;
+        }
+
+        if let Some(v) = self.hcr_el2.as_ref() {
+            writeln!(
+                f,
+                "  HCR_EL2: {:#018x} VM={} PTW={} FMO={} IMO={} AMO={} VF={} VI={} VSE={} TWI={} TWE={} TTLB={} TVM={} TGE={} HCD={} TRVM={} RW={}",
+                v.hcr_el2,
+                v.bit_vm(),
+                v.bit_ptw(),
+                v.bit_fmo(),
+                v.bit_imo(),
+                v.bit_amo(),
+                v.bit_vf(),
+                v.bit_vi(),
+                v.bit_vse(),
+                v.bit_twi(),
+                v.bit_twe(),
+                v.bit_ttlb(),
+                v.bit_tvm(),
+                v.bit_tge(),
+                v.bit_hcd(),
+                v.bit_trvm(),
+                v.bit_rw(),
             )?;
         }
         Ok(())
