@@ -60,6 +60,16 @@ extern "C" fn rust_main(_argc: isize, _argv: *const *const u8) -> isize {
             break 'diagnostic;
         }
 
+        // VBAR_EL2 must be 2048-byte aligned; a misaligned vector base is fatal
+        if diag_state
+            .vbar_el2
+            .as_ref()
+            .is_some_and(|v| !v.is_aligned())
+        {
+            debug_mem_error(DebugMemError::InvalidVectorBaseAlignment);
+            ret = 1;
+        }
+
         // this should be outputted after endian (EE) is checked
         println!("{}", diag_state);
     }
