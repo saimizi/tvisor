@@ -16,6 +16,8 @@ pub enum DebugMemError {
     InvalidEL2State = 0x1,
     WaitUartIoComplete = 0x2,
     UartTxTimeout = 0x3,
+    InvalidStackAlignment = 0x4,
+    UnexpectedEL2Endianness = 0x5,
 }
 
 impl DebugMem {
