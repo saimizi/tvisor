@@ -471,20 +471,150 @@ Policy:
 
 ### 6.6 `TCR_EL2`, `TTBR0_EL2`, and `MAIR_EL2`
 
-These registers describe EL2 stage-1 address translation. Decode the fields
-documented in `uart_rpi4_design.md`, including `T0SZ`, `TG0`, `SH0`, `IRGN0`,
-`ORGN0`, `PS`, and `TBI`.
+These three registers describe EL2 stage-1 translation. They form one
+configuration and must be interpreted together:
+
+```text
+EL2 virtual address
+    |
+    | TCR_EL2 selects address size, granule, and table-walk attributes
+    | TTBR0_EL2 points to the first translation table
+    | table descriptors select MAIR_EL2 attribute bytes
+    v
+physical address
+```
+
+They affect ordinary EL2 translation only when `SCTLR_EL2.M == 1`. A raw
+value can remain nonzero after the MMU is disabled, so the diagnostic records
+every register but labels the group inactive when `M == 0`.
+
+#### 6.6.1 `TCR_EL2`
+
+`TCR_EL2` is the Translation Control Register for the non-VHE EL2 stage-1
+regime used by the Cortex-A72.
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[5:0]` | `T0SZ` | Size offset of the input virtual-address region. The nominal input address width is `64 - T0SZ`. |
+| `[9:8]` | `IRGN0` | Inner cacheability used for translation-table walks. |
+| `[11:10]` | `ORGN0` | Outer cacheability used for translation-table walks. |
+| `[13:12]` | `SH0` | Shareability used for translation-table walks. |
+| `[15:14]` | `TG0` | Translation granule selected for the table rooted at `TTBR0_EL2`. |
+| `[18:16]` | `PS` | Maximum physical output-address size of the EL2 translation regime. |
+| `20` | `TBI` | When implemented and enabled, the top byte of applicable EL2 virtual addresses is ignored for translation. |
+
+`IRGN0` and `ORGN0` use the same encoding:
+
+| Encoding | Table-walk cacheability |
+| --- | --- |
+| `00` | Normal memory, Non-cacheable |
+| `01` | Normal memory, Write-Back Read-Allocate Write-Allocate |
+| `10` | Normal memory, Write-Through Read-Allocate, no Write-Allocate |
+| `11` | Normal memory, Write-Back Read-Allocate, no Write-Allocate |
+
+`SH0` is:
+
+| Encoding | Shareability |
+| --- | --- |
+| `00` | Non-shareable |
+| `01` | Reserved |
+| `10` | Outer Shareable |
+| `11` | Inner Shareable |
+
+`TG0` is:
+
+| Encoding | Granule |
+| --- | --- |
+| `00` | 4 KiB |
+| `01` | 64 KiB |
+| `10` | 16 KiB |
+| `11` | Reserved |
+
+`PS` encodes the maximum output PA size:
+
+| Encoding | PA width |
+| --- | --- |
+| `000` | 32 bits, 4 GiB |
+| `001` | 36 bits, 64 GiB |
+| `010` | 40 bits, 1 TiB |
+| `011` | 42 bits, 4 TiB |
+| `100` | 44 bits, 16 TiB |
+| `101` | 48 bits, 256 TiB |
+| `110` | 52 bits, when the required architecture feature is implemented |
+| `111` | Reserved |
+
+An encoding is not proof that the processor implements it. Validate granule
+and PA-size support using `ID_AA64MMFR0_EL1` before constructing a permanent
+`TCR_EL2`. `T0SZ`, `TG0`, and the starting table level together determine
+the number of table levels and the alignment required for the root table.
+
+#### 6.6.2 `TTBR0_EL2`
+
+`TTBR0_EL2` is Translation Table Base Register 0 for EL2. On the baseline
+Cortex-A72 translation regime:
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[47:1]` | `BADDR` | Physical base-address field for the initial EL2 stage-1 translation table. |
+| `0` | `CnP` or `RES0` | Common-not-Private when `FEAT_TTCNP` exists; otherwise reserved zero. Cortex-A72 does not provide this later optional feature. |
+| `[63:48]` | `RES0` | Reserved in the baseline non-VHE Cortex-A72 regime. |
+
+The useful root address is not obtained safely by applying one universal
+alignment mask. Which low `BADDR` bits are valid depends on `TCR_EL2.T0SZ`,
+`TG0`, the initial lookup level, and implemented PA size. The diagnostic may
+print the baseline `BADDR[47:1]` field, but it must not walk or dereference the
+table until those constraints have been validated.
+
+`TTBR0_EL2` belongs to tvisor's EL2 stage 1. Do not confuse it with
+`VTTBR_EL2`, which points to a guest's stage-2 tables.
+
+#### 6.6.3 `MAIR_EL2`
+
+`MAIR_EL2` contains eight independent memory-attribute encodings:
+
+```text
+Attr0 = MAIR_EL2[7:0]
+Attr1 = MAIR_EL2[15:8]
+...
+Attr7 = MAIR_EL2[63:56]
+```
+
+An EL2 stage-1 leaf descriptor contains a three-bit `AttrIndx` field. Value
+`N` selects `MAIR_EL2.AttrN`. Unreferenced attribute bytes have no effect,
+even if they are nonzero.
+
+Common complete attribute-byte encodings are:
+
+| Value | Memory type |
+| --- | --- |
+| `0x00` | Device-nGnRnE |
+| `0x04` | Device-nGnRE |
+| `0x08` | Device-nGRE |
+| `0x0c` | Device-GRE |
+| `0x44` | Normal memory, Outer and Inner Non-cacheable |
+| `0xff` | Normal memory, Outer and Inner Write-Back, Read-Allocate and Write-Allocate |
+
+For Normal memory, the upper nibble defines Outer cacheability and the lower
+nibble defines Inner cacheability. Device encodings describe gathering,
+reordering, and early-write-acknowledgement properties. Tvisor must use Device
+memory for MMIO and suitable Normal memory for RAM; an incorrect memory type
+can break device ordering or cache coherency.
 
 Policy:
 
 - Always print the raw values.
-- Decode them as active translation state only when `SCTLR_EL2.M == 1`.
+- Print `TCR_EL2.T0SZ`, nominal VA width, `IRGN0`, `ORGN0`, `SH0`, `TG0`,
+  `PS`, and `TBI`.
+- Print the baseline `TTBR0_EL2.BADDR[47:1]` field and bit 0, but label bit 0
+  reserved on Cortex-A72 rather than claiming that `CnP` is implemented.
+- Print all eight raw `MAIR_EL2` attribute bytes.
+- Decode the group as active translation state only when `SCTLR_EL2.M == 1`.
 - When `M == 0`, label them inactive/stale rather than assuming that their
   contents describe current accesses.
-- Print all eight `MAIR_EL2` attribute bytes.
 - Do not walk U-Boot page tables in this milestone. A table walker requires
   careful validation of granule, levels, physical size, descriptor type, and
   memory accessibility and should be designed separately.
+- Never write any of these registers during the diagnostic phase.
 
 ### 6.7 `VTCR_EL2` and `VTTBR_EL2`
 

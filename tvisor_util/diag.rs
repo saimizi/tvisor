@@ -101,6 +101,71 @@ impl HcrEl2 {
 }
 
 #[derive(Default)]
+pub struct TcrEl2 {
+    pub tcr_el2: u64,
+}
+
+impl TcrEl2 {
+    pub fn t0sz(&self) -> u8 {
+        (self.tcr_el2 & 0x3f) as u8
+    }
+
+    pub fn input_address_bits(&self) -> u8 {
+        64 - self.t0sz()
+    }
+
+    pub fn irgn0(&self) -> u8 {
+        ((self.tcr_el2 >> 8) & 0b11) as u8
+    }
+
+    pub fn orgn0(&self) -> u8 {
+        ((self.tcr_el2 >> 10) & 0b11) as u8
+    }
+
+    pub fn sh0(&self) -> u8 {
+        ((self.tcr_el2 >> 12) & 0b11) as u8
+    }
+
+    pub fn tg0(&self) -> u8 {
+        ((self.tcr_el2 >> 14) & 0b11) as u8
+    }
+
+    pub fn ps(&self) -> u8 {
+        ((self.tcr_el2 >> 16) & 0b111) as u8
+    }
+
+    pub fn bit_tbi(&self) -> bool {
+        bit_check(self.tcr_el2, 20)
+    }
+}
+
+#[derive(Default)]
+pub struct Ttbr0El2 {
+    pub ttbr0_el2: u64,
+}
+
+impl Ttbr0El2 {
+    pub fn baddr(&self) -> u64 {
+        self.ttbr0_el2 & 0x0000_ffff_ffff_fffe
+    }
+
+    pub fn bit_cnp(&self) -> bool {
+        bit_check(self.ttbr0_el2, 0)
+    }
+}
+
+#[derive(Default)]
+pub struct MairEl2 {
+    pub mair_el2: u64,
+}
+
+impl MairEl2 {
+    pub fn attributes(&self) -> [u8; 8] {
+        core::array::from_fn(|index| ((self.mair_el2 >> (index * 8)) & 0xff) as u8)
+    }
+}
+
+#[derive(Default)]
 pub struct MpidrEl1 {
     pub mpidr_el1: u64,
 }
@@ -137,6 +202,9 @@ enum DiagStateReg {
     Sp,
     SctlrEl2,
     HcrEl2,
+    TcrEl2,
+    Ttbr0El2,
+    MairEl2,
 }
 
 #[derive(Default)]
@@ -148,9 +216,9 @@ pub struct DiagState {
 
     pub sctlr_el2: Option<SctlrEl2>,
     pub hcr_el2: Option<HcrEl2>,
-    pub tcr_el2: u64,
-    pub ttbr0_el2: u64,
-    pub mair_el2: u64,
+    pub tcr_el2: Option<TcrEl2>,
+    pub ttbr0_el2: Option<Ttbr0El2>,
+    pub mair_el2: Option<MairEl2>,
 
     pub vtcr_el2: u64,
     pub vttbr_el2: u64,
@@ -242,6 +310,45 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::TcrEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, TCR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
+
+                DiagStateReg::Ttbr0El2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, TTBR0_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
+
+                DiagStateReg::MairEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, MAIR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -262,6 +369,12 @@ impl DiagState {
                 .map(|v| SctlrEl2 { sctlr_el2: v }),
             hcr_el2: DiagState::dump_register(DiagStateReg::HcrEl2, Some(current_el))
                 .map(|v| HcrEl2 { hcr_el2: v }),
+            tcr_el2: DiagState::dump_register(DiagStateReg::TcrEl2, Some(current_el))
+                .map(|v| TcrEl2 { tcr_el2: v }),
+            ttbr0_el2: DiagState::dump_register(DiagStateReg::Ttbr0El2, Some(current_el))
+                .map(|v| Ttbr0El2 { ttbr0_el2: v }),
+            mair_el2: DiagState::dump_register(DiagStateReg::MairEl2, Some(current_el))
+                .map(|v| MairEl2 { mair_el2: v }),
             ..Default::default()
         }
     }
@@ -339,6 +452,55 @@ impl core::fmt::Display for DiagState {
                 v.bit_hcd(),
                 v.bit_trvm(),
                 v.bit_rw(),
+            )?;
+        }
+
+        if let Some(v) = self.tcr_el2.as_ref() {
+            let active = self.sctlr_el2.as_ref().is_some_and(|sctlr| sctlr.bit_m());
+            writeln!(
+                f,
+                "  TCR_EL2: {:#018x} active={} T0SZ={} VA_BITS={} IRGN0={:#x} ORGN0={:#x} SH0={:#x} TG0={:#x} PS={:#x} TBI={}",
+                v.tcr_el2,
+                active,
+                v.t0sz(),
+                v.input_address_bits(),
+                v.irgn0(),
+                v.orgn0(),
+                v.sh0(),
+                v.tg0(),
+                v.ps(),
+                v.bit_tbi(),
+            )?;
+        }
+
+        if let Some(v) = self.ttbr0_el2.as_ref() {
+            let active = self.sctlr_el2.as_ref().is_some_and(|sctlr| sctlr.bit_m());
+            writeln!(
+                f,
+                "TTBR0_EL2: {:#018x} active={} BADDR={:#014x} CnP={}",
+                v.ttbr0_el2,
+                active,
+                v.baddr(),
+                v.bit_cnp(),
+            )?;
+        }
+
+        if let Some(v) = self.mair_el2.as_ref() {
+            let active = self.sctlr_el2.as_ref().is_some_and(|sctlr| sctlr.bit_m());
+            let attr = v.attributes();
+            writeln!(
+                f,
+                " MAIR_EL2: {:#018x} active={} Attr0={:#04x} Attr1={:#04x} Attr2={:#04x} Attr3={:#04x} Attr4={:#04x} Attr5={:#04x} Attr6={:#04x} Attr7={:#04x}",
+                v.mair_el2,
+                active,
+                attr[0],
+                attr[1],
+                attr[2],
+                attr[3],
+                attr[4],
+                attr[5],
+                attr[6],
+                attr[7],
             )?;
         }
         Ok(())
