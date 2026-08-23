@@ -205,6 +205,8 @@ enum DiagStateReg {
     TcrEl2,
     Ttbr0El2,
     MairEl2,
+    VtcrEl2,
+    VttbrEl2,
 }
 
 #[derive(Default)]
@@ -220,8 +222,8 @@ pub struct DiagState {
     pub ttbr0_el2: Option<Ttbr0El2>,
     pub mair_el2: Option<MairEl2>,
 
-    pub vtcr_el2: u64,
-    pub vttbr_el2: u64,
+    pub vtcr_el2: Option<u64>,
+    pub vttbr_el2: Option<u64>,
 
     pub vbar_el2: u64,
     pub daif: u64,
@@ -349,6 +351,32 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::VtcrEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, VTCR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
+
+                DiagStateReg::VttbrEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, VTTBR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -375,6 +403,8 @@ impl DiagState {
                 .map(|v| Ttbr0El2 { ttbr0_el2: v }),
             mair_el2: DiagState::dump_register(DiagStateReg::MairEl2, Some(current_el))
                 .map(|v| MairEl2 { mair_el2: v }),
+            vtcr_el2: DiagState::dump_register(DiagStateReg::VtcrEl2, Some(current_el)),
+            vttbr_el2: DiagState::dump_register(DiagStateReg::VttbrEl2, Some(current_el)),
             ..Default::default()
         }
     }
@@ -502,6 +532,16 @@ impl core::fmt::Display for DiagState {
                 attr[6],
                 attr[7],
             )?;
+        }
+
+        if let Some(v) = self.vtcr_el2 {
+            let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
+            writeln!(f, " VTCR_EL2: {:#018x} active={}", v, active)?;
+        }
+
+        if let Some(v) = self.vttbr_el2 {
+            let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
+            writeln!(f, "VTTBR_EL2: {:#018x} active={}", v, active)?;
         }
         Ok(())
     }
