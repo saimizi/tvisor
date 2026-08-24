@@ -327,7 +327,7 @@ pub struct CptrEl2 {
 }
 
 impl CptrEl2 {
-    // Traps FP/Advanced SIMD accesses from EL0/EL1 to EL2
+    // Traps FP/Advanced SIMD instructions at EL0, EL1, and EL2
     pub fn bit_tfp(&self) -> bool {
         bit_check(self.cptr_el2, 10)
     }
