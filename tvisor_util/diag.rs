@@ -888,9 +888,9 @@ mod tests {
 
     #[test]
     fn cptr_el2_tfp_does_not_leak_from_other_bits() {
-        // RES1 bits [7:0], [9], and [13] are set but TFP must stay clear.
+        // RES1 bits [13:12] and [9:0] are set but TFP must stay clear.
         let r = CptrEl2 {
-            cptr_el2: (1 << 0) | (1 << 7) | (1 << 9) | (1 << 13),
+            cptr_el2: (0b11 << 12) | 0x3ff,
         };
         assert!(!r.bit_tfp());
     }
