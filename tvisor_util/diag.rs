@@ -321,6 +321,17 @@ impl Daif {
     }
 }
 
+#[derive(Default)]
+pub struct CptrEl2 {
+    pub cptr_el2: u64,
+}
+
+impl CptrEl2 {
+    // Traps FP/Advanced SIMD instructions at EL0, EL1, and EL2
+    pub fn bit_tfp(&self) -> bool {
+        bit_check(self.cptr_el2, 10)
+    }
+}
 #[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
@@ -336,6 +347,7 @@ enum DiagStateReg {
     VttbrEl2,
     VbarEl2,
     Daif,
+    CptrEl2,
 }
 
 #[derive(Default)]
@@ -356,7 +368,7 @@ pub struct DiagState {
 
     pub vbar_el2: Option<VbarEl2>,
     pub daif: Option<Daif>,
-    pub cptr_el2: u64,
+    pub cptr_el2: Option<CptrEl2>,
 
     pub cnthctl_el2: u64,
     pub cntvoff_el2: u64,
@@ -535,6 +547,19 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::CptrEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, CPTR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -569,6 +594,8 @@ impl DiagState {
                 .map(|v| VbarEl2 { vbar_el2: v }),
             daif: DiagState::dump_register(DiagStateReg::Daif, Some(current_el))
                 .map(|v| Daif { daif: v }),
+            cptr_el2: DiagState::dump_register(DiagStateReg::CptrEl2, Some(current_el))
+                .map(|v| CptrEl2 { cptr_el2: v }),
             ..Default::default()
         }
     }
@@ -752,13 +779,16 @@ impl core::fmt::Display for DiagState {
             )?;
         }
 
+        if let Some(v) = self.cptr_el2.as_ref() {
+            writeln!(f, " CPTR_EL2: {:#018x} TFP={}", v.cptr_el2, v.bit_tfp(),)?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Daif, VtcrEl2, VttbrEl2};
+    use super::{CptrEl2, Daif, VtcrEl2, VttbrEl2};
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -848,5 +878,20 @@ mod tests {
         assert!(!r.bit_a());
         assert!(!r.bit_i());
         assert!(!r.bit_f());
+    }
+
+    #[test]
+    fn cptr_el2_decodes_tfp() {
+        assert!(CptrEl2 { cptr_el2: 1 << 10 }.bit_tfp());
+        assert!(!CptrEl2 { cptr_el2: 0 }.bit_tfp());
+    }
+
+    #[test]
+    fn cptr_el2_tfp_does_not_leak_from_other_bits() {
+        // RES1 bits [13:12] and [9:0] are set but TFP must stay clear.
+        let r = CptrEl2 {
+            cptr_el2: (0b11 << 12) | 0x3ff,
+        };
+        assert!(!r.bit_tfp());
     }
 }

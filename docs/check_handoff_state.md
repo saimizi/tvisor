@@ -875,13 +875,38 @@ Policy:
 ### 6.10 `CPTR_EL2`
 
 `CPTR_EL2` controls traps for floating-point, Advanced SIMD, and related
-coprocessor functionality. On the Cortex-A72, `TFP` at bit 10 is the primary
-field relevant to accidental FP/SIMD use below EL2.
+coprocessor functionality. On the Cortex-A72, `HCR_EL2.E2H` is effectively `0`,
+so the baseline Armv8.0 register layout applies, with the fixed field layout:
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[63:32]` | `RES0` | Reserved. |
+| `[31]` | `TCPAC` | Traps EL1 access to `CPACR_EL1`. |
+| `[30:21]` | `RES0` | Reserved. |
+| `[20]` | `TTA` | Trace trap; `RES0` on the Cortex-A72. |
+| `[19:14]` | `RES0` | Reserved. |
+| `[13:12]` | `RES1` | Reserved, read-as-one. |
+| `[11]` | `RES0` | Reserved. |
+| `[10]` | `TFP` | Traps FP/Advanced SIMD instructions. |
+| `[9:0]` | `RES1` | Reserved, read-as-one. |
+
+With `E2H == 0`, the `TFP` meanings are:
+
+- `TFP == 0`: FP/Advanced SIMD instructions are not trapped by this control.
+- `TFP == 1`: FP/Advanced SIMD instructions executed at EL2, EL1, and EL0 are
+  trapped to EL2 (reported with `ESR_ELx.EC == 0x07`).
+
+Access:
+
+- `CPTR_EL2` is accessible at EL2 and EL3.
+- It is not accessible at EL0 or EL1.
 
 Policy:
 
 - Print the complete raw value and `TFP`.
-- Do not execute floating-point or SIMD instructions as part of the diagnostic.
+- The diagnostic must remain integer-only: inherited `TFP` may be `1`, in which
+  case accidental FP/SIMD use at EL2 would itself trap. Do not execute
+  floating-point or SIMD instructions as part of the diagnostic.
 - Do not modify trap controls.
 
 ### 6.11 `CNTHCTL_EL2` and `CNTVOFF_EL2`
