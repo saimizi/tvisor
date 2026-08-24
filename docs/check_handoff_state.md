@@ -911,15 +911,38 @@ Policy:
 
 ### 6.11 `CNTHCTL_EL2` and `CNTVOFF_EL2`
 
-`CNTHCTL_EL2` controls timer/counter access from EL1. On Armv8.0,
-`EL1PCTEN` at bit 0 permits EL1 physical counter access and `EL1PCEN` at bit 1
-permits EL1 physical timer access. `CNTVOFF_EL2` is the virtual counter offset
-applied below EL2.
+`CNTHCTL_EL2` controls timer/counter access from EL1. On the Cortex-A72,
+`HCR_EL2.E2H` is effectively `0`, so the baseline Armv8.0 register layout
+applies. The field layout is:
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `0` | `EL1PCTEN` | Permits EL1 access to the physical counter. |
+| `1` | `EL1PCEN` | Permits EL1 access to the physical timer. |
+| `2` | `EVNTEN` | Enables the event stream from `CNTPCT_EL0`. |
+| `3` | `EVNTDIR` | Event-stream trigger transition direction. |
+| `[7:4]` | `EVNTI` | Event-stream trigger bit select. |
+| `[11:8]` | `RES0` | Reserved. |
+| `[63:12]` | `RES0` | Reserved (feature-dependent in later revisions). |
+
+`EL1PCTEN` / `EL1PCEN` meanings:
+
+- `0`: EL1 accesses to the corresponding counter/timer are trapped to EL2.
+- `1`: the corresponding EL1 access is permitted.
+
+`CNTVOFF_EL2` is the 64-bit virtual counter offset applied below EL2; it holds
+no sub-fields and is printed as a raw value.
+
+Access:
+
+- Both registers are accessible at EL2 and EL3, and are not accessible at EL0
+  or EL1.
 
 Policy:
 
 - Print both raw values and the two access-control bits.
-- Do not read a changing counter into the stable-state comparison.
+- Do not read a changing counter into the stable-state comparison; `CNTHCTL_EL2`
+  and `CNTVOFF_EL2` are control/offset values, not the counter itself.
 - Do not change timer access or the virtual offset.
 
 ### 6.12 `ID_AA64PFR0_EL1`

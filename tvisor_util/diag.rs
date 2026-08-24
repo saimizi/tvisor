@@ -332,6 +332,29 @@ impl CptrEl2 {
         bit_check(self.cptr_el2, 10)
     }
 }
+
+#[derive(Default)]
+pub struct CnthctlEl2 {
+    pub cnthctl_el2: u64,
+}
+
+impl CnthctlEl2 {
+    // EL1 physical counter access enable
+    pub fn bit_el1pcten(&self) -> bool {
+        bit_check(self.cnthctl_el2, 0)
+    }
+
+    // EL1 physical timer access enable
+    pub fn bit_el1pcen(&self) -> bool {
+        bit_check(self.cnthctl_el2, 1)
+    }
+}
+
+#[derive(Default)]
+pub struct CntvoffEl2 {
+    pub cntvoff_el2: u64,
+}
+
 #[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
@@ -348,6 +371,8 @@ enum DiagStateReg {
     VbarEl2,
     Daif,
     CptrEl2,
+    CnthctlEl2,
+    CntvoffEl2,
 }
 
 #[derive(Default)]
@@ -370,8 +395,8 @@ pub struct DiagState {
     pub daif: Option<Daif>,
     pub cptr_el2: Option<CptrEl2>,
 
-    pub cnthctl_el2: u64,
-    pub cntvoff_el2: u64,
+    pub cnthctl_el2: Option<CnthctlEl2>,
+    pub cntvoff_el2: Option<CntvoffEl2>,
 
     pub id_aa64pfr0_el1: u64,
     pub id_aa64mmfr0_el1: u64,
@@ -560,6 +585,32 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::CnthctlEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, CNTHCTL_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
+
+                DiagStateReg::CntvoffEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, CNTVOFF_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -596,6 +647,10 @@ impl DiagState {
                 .map(|v| Daif { daif: v }),
             cptr_el2: DiagState::dump_register(DiagStateReg::CptrEl2, Some(current_el))
                 .map(|v| CptrEl2 { cptr_el2: v }),
+            cnthctl_el2: DiagState::dump_register(DiagStateReg::CnthctlEl2, Some(current_el))
+                .map(|v| CnthctlEl2 { cnthctl_el2: v }),
+            cntvoff_el2: DiagState::dump_register(DiagStateReg::CntvoffEl2, Some(current_el))
+                .map(|v| CntvoffEl2 { cntvoff_el2: v }),
             ..Default::default()
         }
     }
@@ -782,13 +837,27 @@ impl core::fmt::Display for DiagState {
         if let Some(v) = self.cptr_el2.as_ref() {
             writeln!(f, " CPTR_EL2: {:#018x} TFP={}", v.cptr_el2, v.bit_tfp(),)?;
         }
+
+        if let Some(v) = self.cnthctl_el2.as_ref() {
+            writeln!(
+                f,
+                "CNTHCTL_EL2: {:#018x} EL1PCTEN={} EL1PCEN={}",
+                v.cnthctl_el2,
+                v.bit_el1pcten(),
+                v.bit_el1pcen(),
+            )?;
+        }
+
+        if let Some(v) = self.cntvoff_el2.as_ref() {
+            writeln!(f, "CNTVOFF_EL2: {:#018x}", v.cntvoff_el2)?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CptrEl2, Daif, VtcrEl2, VttbrEl2};
+    use super::{CnthctlEl2, CptrEl2, Daif, VtcrEl2, VttbrEl2};
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -893,5 +962,43 @@ mod tests {
             cptr_el2: (0b11 << 12) | 0x3ff,
         };
         assert!(!r.bit_tfp());
+    }
+
+    #[test]
+    fn cnthctl_el2_decodes_access_bits() {
+        assert!(
+            CnthctlEl2 {
+                cnthctl_el2: 1 << 0
+            }
+            .bit_el1pcten()
+        );
+        assert!(
+            !CnthctlEl2 {
+                cnthctl_el2: 1 << 0
+            }
+            .bit_el1pcen()
+        );
+        assert!(
+            CnthctlEl2 {
+                cnthctl_el2: 1 << 1
+            }
+            .bit_el1pcen()
+        );
+        assert!(
+            !CnthctlEl2 {
+                cnthctl_el2: 1 << 1
+            }
+            .bit_el1pcten()
+        );
+    }
+
+    #[test]
+    fn cnthctl_el2_reserved_bits_do_not_leak() {
+        // A high reserved bit must not decode as EL1PCTEN/EL1PCEN.
+        let r = CnthctlEl2 {
+            cnthctl_el2: 1 << 63,
+        };
+        assert!(!r.bit_el1pcten());
+        assert!(!r.bit_el1pcen());
     }
 }
