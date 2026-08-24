@@ -650,17 +650,18 @@ physical-address size.
 
 | Bits | Field | Meaning |
 | --- | --- | --- |
-| `[4:0]` | `T0SZ` | Size offset of the stage-2 input address space. The IPA width is `64 - T0SZ`. |
-| `[7:6]` | `VS` | Virtualization Secure; `FEAT_SEL2` only, `RES0` on the Cortex-A72. |
-| `[10:8]` | `PS` | Maximum physical output-address size of the stage-2 regime. |
+| `[5:0]` | `T0SZ` | Size offset of the stage-2 input address space. The IPA width is `64 - T0SZ`. |
+| `[7:6]` | `SL0` | Starting level of the stage-2 lookup. |
+| `[9:8]` | `IRGN0` | Inner cacheability used for stage-2 translation-table walks. |
+| `[11:10]` | `ORGN0` | Outer cacheability used for stage-2 translation-table walks. |
+| `[13:12]` | `SH0` | Shareability used for stage-2 translation-table walks. |
 | `[15:14]` | `TG0` | Stage-2 translation granule. |
-| `[19:16]` | `SH0` | Shareability used for stage-2 translation-table walks. |
-| `[21:20]` | `ORGN0` | Outer cacheability used for stage-2 translation-table walks. |
-| `[23:22]` | `IRGN0` | Inner cacheability used for stage-2 translation-table walks. |
-| `[29:28]` | `SL0` | Starting level of the stage-2 lookup: `00`=level 0, `01`=level 1, `10`=level 2, `11`=level 3. |
-| `30` | `DS` | Default shareability: when a stage-2 descriptor uses shareability `00`, `1` selects Outer Shareable and `0` selects Inner Shareable. |
+| `[18:16]` | `PS` | Maximum physical output-address size of the stage-2 regime. |
+| `[19]` | `VS` | VMID Size (`FEAT_VMID16`): `0` selects an 8-bit VMID, `1` a 16-bit VMID. |
+| `[32]` | `DS` | 52-bit stage-2 output-address and IPA support (`FEAT_LPA2`). |
 
-All remaining bits are `RES0`.
+Bit `30` is `NSA` (`FEAT_SEL2`), not `DS`; the other unlisted bits are `RES0`,
+except bit `31` which is `RES1`.
 
 `IRGN0` and `ORGN0` use the same encoding as `TCR_EL2`:
 
@@ -703,20 +704,30 @@ All remaining bits are `RES0`.
 | `110` | 52 bits, when the required architecture feature is implemented |
 | `111` | Reserved |
 
+`SL0` selects the starting level of the stage-2 lookup. For the baseline 4 KiB
+granule the encoding is:
+
+| `SL0` | Starting level (4 KiB) |
+| --- | --- |
+| `10` | level 0 |
+| `01` | level 1 |
+| `00` | level 2 |
+| `11` | level 3 (`FEAT_TTST`) |
+
 `T0SZ` and `SL0` together fix the stage-2 input-address width and the number
-of table levels. For the common 4 KiB granule:
+of table levels:
 
-| `T0SZ` | IPA width | `SL0` | Levels |
+| `T0SZ` | IPA width | `SL0` | Starting level |
 | --- | --- | --- | --- |
-| `16` | 48 bits | `00` | level 0 through level 3 |
-| `25` | 39 bits | `01` | level 1 through level 3 |
-| `34` | 30 bits | `10` | invalid for stage 2 (below the 32-bit minimum) |
-| `43` | 21 bits | `11` | invalid for stage 2 |
+| `16` | 48 bits | `10` | level 0 (levels 0–3) |
+| `25` | 39 bits | `01` | level 1 (levels 1–3) |
+| `34` | 30 bits | `00` | level 2 (below the 32-bit minimum) |
+| `43` | 21 bits | `11` | level 3 (below the 32-bit minimum) |
 
-The minimum stage-2 input-address width is 32 bits, so only `SL0 == 0` and
-`SL0 == 1` are valid starting levels with a 4 KiB granule. Validate granule and
-PA-size support against `ID_AA64MMFR0_EL1` before constructing a permanent
-`VTCR_EL2`.
+The minimum stage-2 input-address width is 32 bits, so only the `T0SZ == 16`
+and `T0SZ == 25` rows are valid starting levels with a 4 KiB granule. Validate
+granule and PA-size support against `ID_AA64MMFR0_EL1` before constructing a
+permanent `VTCR_EL2`.
 
 #### 6.7.2 `VTTBR_EL2`
 
@@ -725,31 +736,37 @@ base address of the initial stage-2 translation table:
 
 | Bits | Field | Meaning |
 | --- | --- | --- |
+| `[63:48]` | `VMID` | Virtual Machine Identifier. With an 8-bit VMID (`VTCR_EL2.VS == 0`) only `[55:48]` are used and `[63:56]` are `RES0`; with `FEAT_VMID16` and `VS == 1` all 16 bits are used. |
 | `[47:x]` | `BADDR` | Physical base address of the starting-level stage-2 table. |
-| `[x-1:0]` | `RES0` | Reserved; must be zero. `x` is the table alignment required for the selected granule. |
-| `[63:48]` | `RES0` | Reserved. |
+| `[x-1:1]` | `RES0` | Reserved; must be zero. `x` is the alignment required for the starting table. |
+| `[0]` | `CnP` | Common-not-Private (`FEAT_TTCNP`); `RES0` otherwise. |
 
 The table base must be aligned to the size of the starting-level translation
-table, so the number of valid `BADDR` bits depends on the granule:
+table, so the number of valid `BADDR` bits depends on `VTCR_EL2.T0SZ`, `SL0`,
+and `TG0`. A starting table is not necessarily one complete granule in size: it
+can hold fewer entries than a full granule-sized table. For the common case of
+the 4 KiB granule starting at level 0, the starting table is a full 4 KiB (512
+entries), so `BADDR[47:12]` hold the base address and `[11:1]` are `RES0`:
 
-| Granule | Table size | Valid `BADDR` | `RES0` low bits |
-| --- | --- | --- | --- |
-| 4 KiB | 4 KiB | `[47:12]` | `[11:0]` |
-| 16 KiB | 16 KiB | `[47:14]` | `[13:0]` |
-| 64 KiB | 64 KiB | `[47:16]` | `[15:0]` |
+| Starting table size | Valid `BADDR` | `RES0` low bits |
+| --- | --- | --- |
+| 4 KiB | `[47:12]` | `[11:1]` |
+| 16 KiB | `[47:14]` | `[13:1]` |
+| 64 KiB | `[47:16]` | `[15:1]` |
 
-Unlike `TTBR0_EL2`, `VTTBR_EL2` has no `CnP` bit: bit `0` is always `RES0`.
-`VTTBR_EL2` belongs to a guest's stage-2 tables and must not be confused with
-`TTBR0_EL2`, which points to tvisor's own EL2 stage-1 tables.
+`VTTBR_EL2` bit 0 is a `CnP` (Common-not-Private) hint when `FEAT_TTCNP` is
+implemented, and `RES0` otherwise. `VTTBR_EL2` belongs to a guest's stage-2
+tables and must not be confused with `TTBR0_EL2`, which points to tvisor's own
+EL2 stage-1 tables.
 
 Policy:
 
 - Always capture and print their raw values.
 - Treat them as active only if `HCR_EL2.VM == 1`.
-- Print `VTCR_EL2.T0SZ`, nominal IPA width, `VS`, `PS`, `TG0`, `SH0`,
-  `ORGN0`, `IRGN0`, `SL0`, and `DS`.
-- Print the baseline `VTTBR_EL2.BADDR[47:0]` field; the valid bits depend
-  on `VTCR_EL2.TG0`.
+- Print `VTCR_EL2.T0SZ`, nominal IPA width, `SL0`, `IRGN0`, `ORGN0`, `SH0`,
+  `TG0`, `PS`, `VS`, and `DS`.
+- Print `VTTBR_EL2.VMID`, `BADDR[47:1]`, and `CnP`; the valid `BADDR` bits
+  depend on `VTCR_EL2.T0SZ`, `SL0`, and `TG0`.
 - Do not reject nonzero inactive values because firmware can leave stale
   configuration in disabled registers.
 - Do not disable stage 2 or invalidate stage-2 TLB entries in this phase.
@@ -923,8 +940,8 @@ tvisor handoff diagnostic
   TCR_EL2         0x................  active=<yes|no>
   TTBR0_EL2       0x................  active=<yes|no>
   MAIR_EL2        0x................  Attr0=.. Attr1=.. ... Attr7=..
-  VTCR_EL2        0x................  active=<yes|no> T0SZ=. IPA_BITS=. VS=. PS=. TG0=. SH0=. ORGN0=. IRGN0=. SL0=. DS=.
-  VTTBR_EL2       0x................  active=<yes|no> BADDR=..
+  VTCR_EL2        0x................  active=<yes|no> T0SZ=. IPA_BITS=. SL0=. IRGN0=. ORGN0=. SH0=. TG0=. PS=. VS=. DS=.
+  VTTBR_EL2       0x................  active=<yes|no> VMID=.... BADDR=.. CnP=.
   VBAR_EL2        0x................  align=...
   DAIF            0x................  D=. A=. I=. F=.
   CPTR_EL2        0x................  TFP=.

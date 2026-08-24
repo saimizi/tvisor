@@ -173,7 +173,7 @@ pub struct VtcrEl2 {
 impl VtcrEl2 {
     // Size offset of the stage-2 input address space
     pub fn t0sz(&self) -> u8 {
-        (self.vtcr_el2 & 0x1f) as u8
+        (self.vtcr_el2 & 0x3f) as u8
     }
 
     // Nominal intermediate-physical-address width
@@ -181,14 +181,24 @@ impl VtcrEl2 {
         64 - self.t0sz()
     }
 
-    // Virtualization Secure (FEAT_SEL2 only; RES0 on Cortex-A72)
-    pub fn vs(&self) -> u8 {
+    // Starting level of the stage-2 lookup
+    pub fn sl0(&self) -> u8 {
         ((self.vtcr_el2 >> 6) & 0b11) as u8
     }
 
-    // Maximum physical output-address size
-    pub fn ps(&self) -> u8 {
-        ((self.vtcr_el2 >> 8) & 0b111) as u8
+    // Inner cacheability used for stage-2 walks
+    pub fn irgn0(&self) -> u8 {
+        ((self.vtcr_el2 >> 8) & 0b11) as u8
+    }
+
+    // Outer cacheability used for stage-2 walks
+    pub fn orgn0(&self) -> u8 {
+        ((self.vtcr_el2 >> 10) & 0b11) as u8
+    }
+
+    // Shareability used for stage-2 walks
+    pub fn sh0(&self) -> u8 {
+        ((self.vtcr_el2 >> 12) & 0b11) as u8
     }
 
     // Stage-2 translation granule
@@ -196,29 +206,19 @@ impl VtcrEl2 {
         ((self.vtcr_el2 >> 14) & 0b11) as u8
     }
 
-    // Shareability used for stage-2 walks
-    pub fn sh0(&self) -> u8 {
-        ((self.vtcr_el2 >> 16) & 0b1111) as u8
+    // Maximum physical output-address size
+    pub fn ps(&self) -> u8 {
+        ((self.vtcr_el2 >> 16) & 0b111) as u8
     }
 
-    // Outer cacheability used for stage-2 walks
-    pub fn orgn0(&self) -> u8 {
-        ((self.vtcr_el2 >> 20) & 0b11) as u8
+    // VMID Size (FEAT_VMID16): 0 = 8-bit VMID, 1 = 16-bit VMID
+    pub fn bit_vs(&self) -> bool {
+        bit_check(self.vtcr_el2, 19)
     }
 
-    // Inner cacheability used for stage-2 walks
-    pub fn irgn0(&self) -> u8 {
-        ((self.vtcr_el2 >> 22) & 0b11) as u8
-    }
-
-    // Starting level of the stage-2 lookup
-    pub fn sl0(&self) -> u8 {
-        ((self.vtcr_el2 >> 28) & 0b11) as u8
-    }
-
-    // Default shareability
+    // 52-bit IPA and output-address support (FEAT_LPA2)
     pub fn bit_ds(&self) -> bool {
-        bit_check(self.vtcr_el2, 30)
+        bit_check(self.vtcr_el2, 32)
     }
 }
 
@@ -228,10 +228,23 @@ pub struct VttbrEl2 {
 }
 
 impl VttbrEl2 {
-    // Physical base address of the starting-level stage-2 table.
-    // Bits [63:48] are RES0; the valid low bits depend on VTCR_EL2.TG0.
+    // Virtual Machine Identifier, bits [63:48].
+    // With an 8-bit VMID (VTCR_EL2.VS == 0) only the low 8 bits hold the VMID and
+    // the upper 8 bits are RES0. With FEAT_VMID16 and VTCR_EL2.VS == 1 all 16 bits
+    // are used.
+    pub fn vmid(&self) -> u16 {
+        ((self.vttbr_el2 >> 48) & 0xffff) as u16
+    }
+
+    // Physical base address of the starting-level stage-2 table, bits [47:1].
+    // Bit 0 is CnP (FEAT_TTCNP) and is not part of the base address.
     pub fn baddr(&self) -> u64 {
-        self.vttbr_el2 & 0x0000_ffff_ffff_ffff
+        self.vttbr_el2 & 0x0000_ffff_ffff_fffe
+    }
+
+    // Common-not-Private (FEAT_TTCNP); RES0 otherwise.
+    pub fn bit_cnp(&self) -> bool {
+        bit_check(self.vttbr_el2, 0)
     }
 }
 
@@ -265,6 +278,7 @@ impl MpidrEl1 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
     MpidrEl1,
@@ -306,6 +320,7 @@ pub struct DiagState {
     pub id_aa64mmfr0_el1: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl DiagState {
     fn dump_register(register: DiagStateReg, el: Option<u64>) -> Option<u64> {
         let result;
@@ -610,18 +625,18 @@ impl core::fmt::Display for DiagState {
             let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
             writeln!(
                 f,
-                " VTCR_EL2: {:#018x} active={} T0SZ={} IPA_BITS={} VS={:#x} PS={:#x} TG0={:#x} SH0={:#x} ORGN0={:#x} IRGN0={:#x} SL0={:#x} DS={}",
+                " VTCR_EL2: {:#018x} active={} T0SZ={} IPA_BITS={} SL0={:#x} IRGN0={:#x} ORGN0={:#x} SH0={:#x} TG0={:#x} PS={:#x} VS={} DS={}",
                 v.vtcr_el2,
                 active,
                 v.t0sz(),
                 v.ipa_bits(),
-                v.vs(),
-                v.ps(),
-                v.tg0(),
-                v.sh0(),
-                v.orgn0(),
-                v.irgn0(),
                 v.sl0(),
+                v.irgn0(),
+                v.orgn0(),
+                v.sh0(),
+                v.tg0(),
+                v.ps(),
+                v.bit_vs(),
                 v.bit_ds(),
             )?;
         }
@@ -630,12 +645,86 @@ impl core::fmt::Display for DiagState {
             let active = self.hcr_el2.as_ref().is_some_and(|hcr| hcr.bit_vm());
             writeln!(
                 f,
-                "VTTBR_EL2: {:#018x} active={} BADDR={:#014x}",
+                "VTTBR_EL2: {:#018x} active={} VMID={:#06x} BADDR={:#014x} CnP={}",
                 v.vttbr_el2,
                 active,
+                v.vmid(),
                 v.baddr(),
+                v.bit_cnp(),
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VtcrEl2, VttbrEl2};
+
+    #[test]
+    fn vtcr_el2_decodes_every_field() {
+        // Set each field to a distinct, non-trivial value at its architectural position.
+        let raw = (0b100001_u64 << 0) // T0SZ [5:0] = 33
+            | (0b01_u64 << 6) // SL0 [7:6] = 1
+            | (0b10_u64 << 8) // IRGN0 [9:8] = 2
+            | (0b11_u64 << 10) // ORGN0 [11:10] = 3
+            | (0b01_u64 << 12) // SH0 [13:12] = 1
+            | (0b10_u64 << 14) // TG0 [15:14] = 2
+            | (0b101_u64 << 16) // PS [18:16] = 5
+            | (1_u64 << 19) // VS [19] = 1
+            | (1_u64 << 32); // DS [32] = 1
+
+        let r = VtcrEl2 { vtcr_el2: raw };
+        assert_eq!(r.t0sz(), 33);
+        assert_eq!(r.ipa_bits(), 31);
+        assert_eq!(r.sl0(), 1);
+        assert_eq!(r.irgn0(), 2);
+        assert_eq!(r.orgn0(), 3);
+        assert_eq!(r.sh0(), 1);
+        assert_eq!(r.tg0(), 2);
+        assert_eq!(r.ps(), 5);
+        assert!(r.bit_vs());
+        assert!(r.bit_ds());
+    }
+
+    #[test]
+    fn vtcr_el2_fields_do_not_overlap() {
+        // A value with every bit set must decode each field to its full mask width,
+        // catching any accessor that reads too many (or too few) bits.
+        let r = VtcrEl2 { vtcr_el2: u64::MAX };
+        assert_eq!(r.t0sz(), 0x3f);
+        assert_eq!(r.sl0(), 0b11);
+        assert_eq!(r.irgn0(), 0b11);
+        assert_eq!(r.orgn0(), 0b11);
+        assert_eq!(r.sh0(), 0b11);
+        assert_eq!(r.tg0(), 0b11);
+        assert_eq!(r.ps(), 0b111);
+        assert!(r.bit_vs());
+        assert!(r.bit_ds());
+    }
+
+    #[test]
+    fn vttbr_el2_decodes_vmid_baddr_and_cnp() {
+        let vmid = 0x1234_u64;
+        let baddr = 0x0000_0a5a_5a5a_u64 & 0x0000_ffff_ffff_fffe;
+        // Bit 0 is CnP, not part of BADDR.
+        let raw = (vmid << 48) | baddr | 1_u64;
+
+        let r = VttbrEl2 { vttbr_el2: raw };
+        assert_eq!(r.vmid(), 0x1234);
+        assert_eq!(r.baddr(), baddr);
+        assert!(r.bit_cnp());
+    }
+
+    #[test]
+    fn vttbr_el2_baddr_excludes_cnp_bit() {
+        // Bit 0 must never leak into BADDR, and the VMID field must never leak
+        // into BADDR either.
+        let r = VttbrEl2 {
+            vttbr_el2: 0xffff_ffff_ffff_ffff,
+        };
+        assert_eq!(r.baddr(), 0x0000_ffff_ffff_fffe);
+        assert_eq!(r.vmid(), 0xffff);
+        assert!(r.bit_cnp());
     }
 }
