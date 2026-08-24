@@ -278,6 +278,22 @@ impl MpidrEl1 {
     }
 }
 
+#[derive(Default)]
+pub struct VbarEl2 {
+    pub vbar_el2: u64,
+}
+
+impl VbarEl2 {
+    // Low 11 bits. VBAR_EL2 must be 2048-byte aligned, so these are zero.
+    pub fn alignment(&self) -> u64 {
+        self.vbar_el2 & 0x7ff
+    }
+
+    pub fn is_aligned(&self) -> bool {
+        self.alignment() == 0
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
@@ -291,6 +307,7 @@ enum DiagStateReg {
     MairEl2,
     VtcrEl2,
     VttbrEl2,
+    VbarEl2,
 }
 
 #[derive(Default)]
@@ -309,7 +326,7 @@ pub struct DiagState {
     pub vtcr_el2: Option<VtcrEl2>,
     pub vttbr_el2: Option<VttbrEl2>,
 
-    pub vbar_el2: u64,
+    pub vbar_el2: Option<VbarEl2>,
     pub daif: u64,
     pub cptr_el2: u64,
 
@@ -462,6 +479,19 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::VbarEl2 => {
+                    if el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, VBAR_EL2",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -492,6 +522,8 @@ impl DiagState {
                 .map(|v| VtcrEl2 { vtcr_el2: v }),
             vttbr_el2: DiagState::dump_register(DiagStateReg::VttbrEl2, Some(current_el))
                 .map(|v| VttbrEl2 { vttbr_el2: v }),
+            vbar_el2: DiagState::dump_register(DiagStateReg::VbarEl2, Some(current_el))
+                .map(|v| VbarEl2 { vbar_el2: v }),
             ..Default::default()
         }
     }
@@ -653,6 +685,16 @@ impl core::fmt::Display for DiagState {
                 v.bit_cnp(),
             )?;
         }
+
+        if let Some(v) = self.vbar_el2.as_ref() {
+            writeln!(
+                f,
+                " VBAR_EL2: {:#018x} align={:#x}",
+                v.vbar_el2,
+                v.alignment()
+            )?;
+        }
+
         Ok(())
     }
 }

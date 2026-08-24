@@ -791,8 +791,40 @@ cargo test-host
 
 ### 6.8 `VBAR_EL2`
 
-`VBAR_EL2` points to the inherited EL2 vector table. On Cortex-A72 it must be
-aligned to 2048 bytes.
+`VBAR_EL2` is the Vector Base Address Register for EL2. It holds the base
+address of the exception-vector table used when an exception is taken to EL2.
+On Cortex-A72 the table occupies 2048 bytes (16 vector entries × 128 bytes), so
+the base address must be 2048-byte aligned.
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `[10:0]` | `RES0` | Reserved; must be zero. This enforces the 2048-byte alignment. |
+| `[63:11]` | `VectorBase` | Base address of the EL2 exception-vector table. |
+
+The AArch64 vector table contains 16 entries of 128 bytes each, selected by
+the exception type and the source of the exception:
+
+| Exception type | Source | Offset |
+| --- | --- | --- |
+| Synchronous | Current EL with `SP_EL0` (`EL2t`) | `0x000` |
+| IRQ | Current EL with `SP_EL0` | `0x080` |
+| FIQ | Current EL with `SP_EL0` | `0x100` |
+| SError | Current EL with `SP_EL0` | `0x180` |
+| Synchronous | Current EL with `SP_ELx` (`EL2h`) | `0x200` |
+| IRQ | Current EL with `SP_ELx` | `0x280` |
+| FIQ | Current EL with `SP_ELx` | `0x300` |
+| SError | Current EL with `SP_ELx` | `0x380` |
+| Synchronous | Lower EL, AArch64 | `0x400` |
+| IRQ | Lower EL, AArch64 | `0x480` |
+| FIQ | Lower EL, AArch64 | `0x500` |
+| SError | Lower EL, AArch64 | `0x580` |
+| Synchronous | Lower EL, AArch32 | `0x600` |
+| IRQ | Lower EL, AArch32 | `0x680` |
+| FIQ | Lower EL, AArch32 | `0x700` |
+| SError | Lower EL, AArch32 | `0x780` |
+
+The diagnostic does not dereference these entries. It only validates that the
+inherited base address is aligned and records it for the permanent handoff.
 
 Policy:
 
