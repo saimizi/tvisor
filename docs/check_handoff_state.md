@@ -660,8 +660,10 @@ physical-address size.
 | `[19]` | `VS` | VMID Size (`FEAT_VMID16`): `0` selects an 8-bit VMID, `1` a 16-bit VMID. |
 | `[32]` | `DS` | 52-bit stage-2 output-address and IPA support (`FEAT_LPA2`). |
 
-Bit `30` is `NSA` (`FEAT_SEL2`), not `DS`; the other unlisted bits are `RES0`,
-except bit `31` which is `RES1`.
+Bit `31` is `RES1`. Bit `30` is `NSA` (`FEAT_SEL2`), not `DS`. The other
+unlisted fields (`HA[21]`, `HD[22]`, `HWU59`–`HWU62[25:28]`, `NSW[29]`,
+`SL2[33]`, and so on) are feature-dependent and are `RES0` on the Cortex-A72
+when their corresponding features are not implemented.
 
 `IRGN0` and `ORGN0` use the same encoding as `TCR_EL2`:
 
@@ -770,6 +772,22 @@ Policy:
 - Do not reject nonzero inactive values because firmware can leave stale
   configuration in disabled registers.
 - Do not disable stage 2 or invalidate stage-2 TLB entries in this phase.
+
+#### 6.7.3 Testing
+
+The accessor unit tests in `tvisor_util/diag.rs` build synthetic raw register
+values and can be run on the host, because the bare-metal `aarch64-unknown-none`
+target has no Rust test harness:
+
+```bash
+cargo test --lib --target x86_64-unknown-linux-gnu
+```
+
+The `.cargo/config.toml` `test-host` alias is equivalent:
+
+```bash
+cargo test-host
+```
 
 ### 6.8 `VBAR_EL2`
 

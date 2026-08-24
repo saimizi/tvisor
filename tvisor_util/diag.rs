@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn vtcr_el2_decodes_every_field() {
         // Set each field to a distinct, non-trivial value at its architectural position.
-        let raw = (0b100001_u64 << 0) // T0SZ [5:0] = 33
+        let raw = 0b100001_u64 // T0SZ [5:0] = 33
             | (0b01_u64 << 6) // SL0 [7:6] = 1
             | (0b10_u64 << 8) // IRGN0 [9:8] = 2
             | (0b11_u64 << 10) // ORGN0 [11:10] = 3
