@@ -876,14 +876,19 @@ Policy:
 
 `CPTR_EL2` controls traps for floating-point, Advanced SIMD, and related
 coprocessor functionality. On the Cortex-A72, `HCR_EL2.E2H` is effectively `0`,
-so the baseline Armv8.0 register layout applies. In that layout `TFP` is the
-field relevant to FP/SIMD use:
+so the baseline Armv8.0 register layout applies, with the fixed field layout:
 
-| Bit | Field | Meaning |
+| Bits | Field | Meaning |
 | --- | --- | --- |
-| `10` | `TFP` | Traps FP/Advanced SIMD instructions. |
-| `[7:0]`, `[9]`, `[13]` | `RES1` | Reserved, read-as-one in the baseline layout. |
-| other bits | — | `RES0`, or feature-dependent and `RES0` when the feature is absent. |
+| `[63:32]` | `RES0` | Reserved. |
+| `[31]` | `TCPAC` | Traps EL1 access to `CPACR_EL1`. |
+| `[30:21]` | `RES0` | Reserved. |
+| `[20]` | `TTA` | Trace trap; `RES0` on the Cortex-A72. |
+| `[19:14]` | `RES0` | Reserved. |
+| `[13:12]` | `RES1` | Reserved, read-as-one. |
+| `[11]` | `RES0` | Reserved. |
+| `[10]` | `TFP` | Traps FP/Advanced SIMD instructions. |
+| `[9:0]` | `RES1` | Reserved, read-as-one. |
 
 With `E2H == 0`, the `TFP` meanings are:
 
