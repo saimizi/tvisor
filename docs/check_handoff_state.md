@@ -835,22 +835,42 @@ Policy:
 
 ### 6.9 `DAIF`
 
-The PSTATE mask fields are:
+`DAIF` is a special-purpose register that exposes the exception mask bits of
+the current PSTATE. It is a view of `PSTATE.D`, `PSTATE.A`, `PSTATE.I`, and
+`PSTATE.F`:
 
-| Bit | Field | Meaning when one |
+| Bit | Field | Meaning |
 | --- | --- | --- |
-| 9 | `D` | Debug exceptions masked |
-| 8 | `A` | SError exceptions masked |
-| 7 | `I` | IRQ exceptions masked |
-| 6 | `F` | FIQ exceptions masked |
+| `9` | `D` | Masks eligible debug exceptions. |
+| `8` | `A` | Masks SError exceptions. |
+| `7` | `I` | Masks IRQ exceptions. |
+| `6` | `F` | Masks FIQ exceptions. |
+
+Bits `[63:10]` and `[5:0]` are `RES0`.
+
+A mask value of `1` means the corresponding exception class is masked; `0`
+means unmasked, subject to the architecture's exception-routing and priority
+rules.
+
+Access:
+
+- At EL1–EL3, `MRS DAIF` is accessible.
+- At EL0, access depends on `SCTLR_EL1.UMA`; when `UMA == 0`, an EL0 `MRS DAIF`
+  traps to EL1 or EL2 according to the configured routing. The diagnostic
+  therefore reads `DAIF` only at EL1–EL3 and treats EL0 as unavailable.
+- The warm-reset values of `D`, `A`, `I`, and `F` are `1` (all masked).
+
+`MRS DAIF` reads the combined state. `MSR DAIF, Xt` writes it, while `DAIFSet`
+and `DAIFClr` selectively set or clear individual mask bits.
 
 Policy:
 
 - Print the raw value and all four masks.
 - Any combination is observational during this phase.
-- Never use `DAIFSet` or `DAIFClr`.
+- Read `DAIF` only, at EL1–EL3; never use `MSR DAIF`, `DAIFSet`, or `DAIFClr`.
 - Compare `DAIF` before and after reporting; a change appends
-  `HandoffStateChanged`.
+  `HandoffStateChanged`. This before/after comparison belongs to the section 8
+  stable-state phase and is intentionally deferred from this section.
 
 ### 6.10 `CPTR_EL2`
 

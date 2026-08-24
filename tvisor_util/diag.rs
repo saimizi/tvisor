@@ -294,6 +294,33 @@ impl VbarEl2 {
     }
 }
 
+#[derive(Default)]
+pub struct Daif {
+    pub daif: u64,
+}
+
+impl Daif {
+    // Debug exceptions masked
+    pub fn bit_d(&self) -> bool {
+        bit_check(self.daif, 9)
+    }
+
+    // SError exceptions masked
+    pub fn bit_a(&self) -> bool {
+        bit_check(self.daif, 8)
+    }
+
+    // IRQ exceptions masked
+    pub fn bit_i(&self) -> bool {
+        bit_check(self.daif, 7)
+    }
+
+    // FIQ exceptions masked
+    pub fn bit_f(&self) -> bool {
+        bit_check(self.daif, 6)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
@@ -308,6 +335,7 @@ enum DiagStateReg {
     VtcrEl2,
     VttbrEl2,
     VbarEl2,
+    Daif,
 }
 
 #[derive(Default)]
@@ -327,7 +355,7 @@ pub struct DiagState {
     pub vttbr_el2: Option<VttbrEl2>,
 
     pub vbar_el2: Option<VbarEl2>,
-    pub daif: u64,
+    pub daif: Option<Daif>,
     pub cptr_el2: u64,
 
     pub cnthctl_el2: u64,
@@ -492,6 +520,21 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::Daif => {
+                    // DAIF is not unconditionally readable at EL0: access
+                    // depends on SCTLR_EL1.UMA and traps when UMA == 0.
+                    if el == Some(1) || el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, DAIF",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -524,6 +567,8 @@ impl DiagState {
                 .map(|v| VttbrEl2 { vttbr_el2: v }),
             vbar_el2: DiagState::dump_register(DiagStateReg::VbarEl2, Some(current_el))
                 .map(|v| VbarEl2 { vbar_el2: v }),
+            daif: DiagState::dump_register(DiagStateReg::Daif, Some(current_el))
+                .map(|v| Daif { daif: v }),
             ..Default::default()
         }
     }
@@ -695,13 +740,25 @@ impl core::fmt::Display for DiagState {
             )?;
         }
 
+        if let Some(v) = self.daif.as_ref() {
+            writeln!(
+                f,
+                "     DAIF: {:#018x} D={} A={} I={} F={}",
+                v.daif,
+                v.bit_d(),
+                v.bit_a(),
+                v.bit_i(),
+                v.bit_f(),
+            )?;
+        }
+
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{VtcrEl2, VttbrEl2};
+    use super::{Daif, VtcrEl2, VttbrEl2};
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -768,5 +825,28 @@ mod tests {
         assert_eq!(r.baddr(), 0x0000_ffff_ffff_fffe);
         assert_eq!(r.vmid(), 0xffff);
         assert!(r.bit_cnp());
+    }
+
+    #[test]
+    fn daif_decodes_each_mask_bit() {
+        // D/A/I/F live at bits 9/8/7/6 and must not bleed into one another.
+        assert!(Daif { daif: 1 << 9 }.bit_d());
+        assert!(!Daif { daif: 1 << 9 }.bit_a());
+        assert!(Daif { daif: 1 << 8 }.bit_a());
+        assert!(!Daif { daif: 1 << 8 }.bit_i());
+        assert!(Daif { daif: 1 << 7 }.bit_i());
+        assert!(!Daif { daif: 1 << 7 }.bit_f());
+        assert!(Daif { daif: 1 << 6 }.bit_f());
+        assert!(!Daif { daif: 1 << 6 }.bit_d());
+    }
+
+    #[test]
+    fn daif_reserved_bits_are_ignored() {
+        // Bits above 9 are RES0 and must not decode as any mask.
+        let r = Daif { daif: 1 << 63 };
+        assert!(!r.bit_d());
+        assert!(!r.bit_a());
+        assert!(!r.bit_i());
+        assert!(!r.bit_f());
     }
 }
