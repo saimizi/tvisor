@@ -70,6 +70,17 @@ extern "C" fn rust_main(_argc: isize, _argv: *const *const u8) -> isize {
             ret = 1;
         }
 
+        // The processor must report EL2 support; EL2 == 0 is inconsistent with
+        // executing at EL2.
+        if diag_state
+            .id_aa64pfr0_el1
+            .as_ref()
+            .is_some_and(|r| r.el2() == 0)
+        {
+            debug_mem_error(DebugMemError::UnsupportedEL2Feature);
+            ret = 1;
+        }
+
         // this should be outputted after endian (EE) is checked
         println!("{}", diag_state);
     }

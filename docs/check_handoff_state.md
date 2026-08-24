@@ -951,21 +951,27 @@ Policy:
 
 ### 6.12 `ID_AA64PFR0_EL1`
 
-Relevant feature fields include:
+`ID_AA64PFR0_EL1` reports implemented AArch64 PE features. The relevant fields
+are:
 
-| Bits | Field | Purpose |
+| Bits | Field | Meaning |
 | --- | --- | --- |
-| `[11:8]` | `EL2` | EL2 implementation and execution-state support |
-| `[19:16]` | `FP` | Floating-point support |
-| `[23:20]` | `AdvSIMD` | Advanced SIMD support |
-| `[27:24]` | `GIC` | System-register GIC interface support |
+| `[11:8]` | `EL2` | EL2 support. `0` = not implemented, `1` = AArch64 only, `2` = AArch64 and AArch32. |
+| `[19:16]` | `FP` | Floating-point support. `0` = implemented, `1` = implemented with `FEAT_FP16`, `0xf` = not implemented. |
+| `[23:20]` | `AdvSIMD` | Advanced SIMD support. Same encoding as `FP` (and must equal `FP`). |
+| `[27:24]` | `GIC` | System-register GIC CPU interface. `0` = not implemented, `1` = GICv3/v4.0, `3` = GICv4.1. |
+
+Access:
+
+- `ID_AA64PFR0_EL1` is accessible at EL1, EL2, and EL3; at EL0 it traps or is
+  undefined. At EL1 it traps to EL2 when `HCR_EL2.TID3 == 1`.
 
 Policy:
 
 - Print the raw value and these fields.
-- An `EL2` field indicating no EL2 is inconsistent with executing at EL2;
-  append `UnsupportedEL2Feature` and return one.
-- Other fields are capability observations.
+- An `EL2` field of `0` (no EL2) is inconsistent with executing at EL2; append
+  `UnsupportedEL2Feature` and return one.
+- Other fields are capability observations; do not reject them.
 
 ### 6.13 `ID_AA64MMFR0_EL1`
 
