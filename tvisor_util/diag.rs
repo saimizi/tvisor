@@ -380,6 +380,38 @@ impl IdAa64Pfr0El1 {
         ((self.id_aa64pfr0_el1 >> 24) & 0xf) as u8
     }
 }
+
+#[derive(Default)]
+pub struct IdAa64Mmfr0El1 {
+    pub id_aa64mmfr0_el1: u64,
+}
+
+impl IdAa64Mmfr0El1 {
+    // Implemented physical-address range
+    pub fn parange(&self) -> u8 {
+        (self.id_aa64mmfr0_el1 & 0xf) as u8
+    }
+
+    // Supported ASID width (0 = 8-bit, 2 = 16-bit)
+    pub fn asidbits(&self) -> u8 {
+        ((self.id_aa64mmfr0_el1 >> 4) & 0xf) as u8
+    }
+
+    // 16 KiB translation-granule support (0 = not supported)
+    pub fn tgran16(&self) -> u8 {
+        ((self.id_aa64mmfr0_el1 >> 20) & 0xf) as u8
+    }
+
+    // 64 KiB translation-granule support (0 = supported, 0xf = not supported)
+    pub fn tgran64(&self) -> u8 {
+        ((self.id_aa64mmfr0_el1 >> 24) & 0xf) as u8
+    }
+
+    // 4 KiB translation-granule support (0 = supported, 0xf = not supported)
+    pub fn tgran4(&self) -> u8 {
+        ((self.id_aa64mmfr0_el1 >> 28) & 0xf) as u8
+    }
+}
 #[cfg(target_arch = "aarch64")]
 enum DiagStateReg {
     CurrentEl,
@@ -399,6 +431,7 @@ enum DiagStateReg {
     CnthctlEl2,
     CntvoffEl2,
     IdAa64Pfr0El1,
+    IdAa64Mmfr0El1,
 }
 
 #[derive(Default)]
@@ -425,7 +458,7 @@ pub struct DiagState {
     pub cntvoff_el2: Option<CntvoffEl2>,
 
     pub id_aa64pfr0_el1: Option<IdAa64Pfr0El1>,
-    pub id_aa64mmfr0_el1: u64,
+    pub id_aa64mmfr0_el1: Option<IdAa64Mmfr0El1>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -650,6 +683,19 @@ impl DiagState {
                         result = None;
                     }
                 }
+
+                DiagStateReg::IdAa64Mmfr0El1 => {
+                    if el == Some(1) || el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, ID_AA64MMFR0_EL1",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
+                }
             }
         }
 
@@ -695,7 +741,13 @@ impl DiagState {
                 Some(current_el),
             )
             .map(|v| IdAa64Pfr0El1 { id_aa64pfr0_el1: v }),
-            ..Default::default()
+            id_aa64mmfr0_el1: DiagState::dump_register(
+                DiagStateReg::IdAa64Mmfr0El1,
+                Some(current_el),
+            )
+            .map(|v| IdAa64Mmfr0El1 {
+                id_aa64mmfr0_el1: v,
+            }),
         }
     }
 }
@@ -895,7 +947,6 @@ impl core::fmt::Display for DiagState {
         if let Some(v) = self.cntvoff_el2.as_ref() {
             writeln!(f, "CNTVOFF_EL2: {:#018x}", v.cntvoff_el2)?;
         }
-
         if let Some(v) = self.id_aa64pfr0_el1.as_ref() {
             writeln!(
                 f,
@@ -907,13 +958,26 @@ impl core::fmt::Display for DiagState {
                 v.gic(),
             )?;
         }
+
+        if let Some(v) = self.id_aa64mmfr0_el1.as_ref() {
+            writeln!(
+                f,
+                "ID_AA64MMFR0_EL1: {:#018x} PARange={:#x} ASIDBits={:#x} TGran4={:#x} TGran16={:#x} TGran64={:#x}",
+                v.id_aa64mmfr0_el1,
+                v.parange(),
+                v.asidbits(),
+                v.tgran4(),
+                v.tgran16(),
+                v.tgran64(),
+            )?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CnthctlEl2, CptrEl2, Daif, IdAa64Pfr0El1, VtcrEl2, VttbrEl2};
+    use super::{CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, VtcrEl2, VttbrEl2};
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -1056,7 +1120,6 @@ mod tests {
         assert!(!r.bit_el1pcten());
         assert!(!r.bit_el1pcen());
     }
-
     #[test]
     fn id_aa64pfr0_el1_decodes_fields() {
         let raw = (0b0001_u64 << 8) // EL2 [11:8] = 1 (AArch64 only)
@@ -1082,5 +1145,35 @@ mod tests {
         assert_eq!(r.fp(), 0xf);
         assert_eq!(r.advsimd(), 0xf);
         assert_eq!(r.gic(), 0xf);
+    }
+
+    #[test]
+    fn id_aa64mmfr0_el1_decodes_fields() {
+        let raw = (0b0110_u64 << 0) // PARange [3:0] = 6 (52-bit)
+            | (0b0010_u64 << 4) // ASIDBits [7:4] = 2 (16-bit)
+            | (0b0001_u64 << 20) // TGran16 [23:20] = 1 (supported)
+            | (0b0000_u64 << 24) // TGran64 [27:24] = 0 (supported)
+            | (0b0000_u64 << 28); // TGran4 [31:28] = 0 (supported)
+
+        let r = IdAa64Mmfr0El1 {
+            id_aa64mmfr0_el1: raw,
+        };
+        assert_eq!(r.parange(), 6);
+        assert_eq!(r.asidbits(), 2);
+        assert_eq!(r.tgran16(), 1);
+        assert_eq!(r.tgran64(), 0);
+        assert_eq!(r.tgran4(), 0);
+    }
+
+    #[test]
+    fn id_aa64mmfr0_el1_fields_do_not_overlap() {
+        let r = IdAa64Mmfr0El1 {
+            id_aa64mmfr0_el1: u64::MAX,
+        };
+        assert_eq!(r.parange(), 0xf);
+        assert_eq!(r.asidbits(), 0xf);
+        assert_eq!(r.tgran16(), 0xf);
+        assert_eq!(r.tgran64(), 0xf);
+        assert_eq!(r.tgran4(), 0xf);
     }
 }
