@@ -930,8 +930,9 @@ applies. The field layout is:
 - `0`: EL1 accesses to the corresponding counter/timer are trapped to EL2.
 - `1`: the corresponding EL1 access is permitted.
 
-`CNTVOFF_EL2` is the 64-bit virtual counter offset applied below EL2; it holds
-no sub-fields and is printed as a raw value.
+`CNTVOFF_EL2` is the 64-bit virtual counter offset; it holds no sub-fields and
+is printed as a raw value. The virtual count seen below EL2 is computed as the
+physical count minus `CNTVOFF_EL2` (modulo `2^64`).
 
 Access:
 
