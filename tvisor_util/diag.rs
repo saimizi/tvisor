@@ -522,12 +522,18 @@ impl DiagState {
                 }
 
                 DiagStateReg::Daif => {
-                    core::arch::asm!(
-                        "mrs {value}, DAIF",
-                        value = out(reg) value,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                    result = Some(value);
+                    // DAIF is not unconditionally readable at EL0: access
+                    // depends on SCTLR_EL1.UMA and traps when UMA == 0.
+                    if el == Some(1) || el == Some(2) || el == Some(3) {
+                        core::arch::asm!(
+                            "mrs {value}, DAIF",
+                            value = out(reg) value,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        result = Some(value);
+                    } else {
+                        result = None;
+                    }
                 }
             }
         }
