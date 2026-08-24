@@ -975,15 +975,21 @@ Policy:
 
 ### 6.13 `ID_AA64MMFR0_EL1`
 
-Relevant memory-model fields include:
+`ID_AA64MMFR0_EL1` reports the implemented memory model and translation-granule
+support. The relevant fields are:
 
-| Bits | Field | Purpose |
+| Bits | Field | Meaning |
 | --- | --- | --- |
-| `[3:0]` | `PARange` | Implemented physical-address range |
-| `[7:4]` | `ASIDBits` | Supported ASID width |
-| `[23:20]` | `TGran16` | 16 KiB translation-granule support |
-| `[27:24]` | `TGran64` | 64 KiB translation-granule support |
-| `[31:28]` | `TGran4` | 4 KiB translation-granule support |
+| `[3:0]` | `PARange` | Implemented physical-address range. `0` = 32-bit, `1` = 36-bit, `2` = 40-bit, `3` = 42-bit, `4` = 44-bit, `5` = 48-bit, `6` = 52-bit. |
+| `[7:4]` | `ASIDBits` | Supported ASID width. `0` = 8-bit, `2` = 16-bit. |
+| `[23:20]` | `TGran16` | 16 KiB translation-granule support. `0` = not supported, `1` = supported. |
+| `[27:24]` | `TGran64` | 64 KiB translation-granule support. `0` = supported, `0xf` = not supported. |
+| `[31:28]` | `TGran4` | 4 KiB translation-granule support. `0` = supported, `0xf` = not supported. |
+
+Access:
+
+- `ID_AA64MMFR0_EL1` is accessible at EL1, EL2, and EL3; at EL0 it traps or is
+  undefined. At EL1 it traps to EL2 when `HCR_EL2.TID3 == 1`.
 
 Policy:
 
