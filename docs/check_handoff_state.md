@@ -911,15 +911,42 @@ Policy:
 
 ### 6.11 `CNTHCTL_EL2` and `CNTVOFF_EL2`
 
-`CNTHCTL_EL2` controls timer/counter access from EL1. On Armv8.0,
-`EL1PCTEN` at bit 0 permits EL1 physical counter access and `EL1PCEN` at bit 1
-permits EL1 physical timer access. `CNTVOFF_EL2` is the virtual counter offset
-applied below EL2.
+`CNTHCTL_EL2` controls timer/counter access from EL0 and EL1. On the Cortex-A72,
+`HCR_EL2.E2H` is effectively `0`, so the baseline Armv8.0 register layout
+applies. The field layout is:
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| `0` | `EL1PCTEN` | When `0`, traps EL0 and EL1 physical-counter accesses to EL2. |
+| `1` | `EL1PCEN` | When `0`, traps EL0 and EL1 physical-timer accesses to EL2. |
+| `2` | `EVNTEN` | Enables the event stream from `CNTPCT_EL0`. |
+| `3` | `EVNTDIR` | Event-stream trigger transition direction. |
+| `[7:4]` | `EVNTI` | Event-stream trigger bit select. |
+| `[11:8]` | `RES0` | Reserved. |
+| `[63:12]` | `RES0` | Reserved (feature-dependent in later revisions). |
+
+`EL1PCTEN` / `EL1PCEN` meanings (despite the `EL1` name, they cover EL0 too):
+
+- `0`: applicable EL0 and EL1 physical-counter/timer accesses are trapped to
+  EL2 when EL2 is enabled. For EL0, `CNTKCTL_EL1.EL0PCTEN` / `EL0PTEN` can
+  instead route the trap to EL1.
+- `1`: this `CNTHCTL_EL2` control does not trap to EL2. This does not by itself
+  guarantee EL0 access, because `CNTKCTL_EL1` still controls EL0 separately.
+
+`CNTVOFF_EL2` is the 64-bit virtual counter offset; it holds no sub-fields and
+is printed as a raw value. The virtual count seen below EL2 is computed as the
+physical count minus `CNTVOFF_EL2` (modulo `2^64`).
+
+Access:
+
+- Both registers are accessible at EL2 and EL3, and are not accessible at EL0
+  or EL1.
 
 Policy:
 
 - Print both raw values and the two access-control bits.
-- Do not read a changing counter into the stable-state comparison.
+- Do not read a changing counter into the stable-state comparison; `CNTHCTL_EL2`
+  and `CNTVOFF_EL2` are control/offset values, not the counter itself.
 - Do not change timer access or the virtual offset.
 
 ### 6.12 `ID_AA64PFR0_EL1`
