@@ -2,9 +2,9 @@
 #![no_main]
 
 use core::arch::global_asm;
-use tvisor_util::aarch64_reg::ExceptionLevel;
+use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
-use tvisor_util::diag::DiagState;
+use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
 use tvisor_util::println;
 
 global_asm!(
@@ -45,14 +45,19 @@ extern "C" fn rust_main(_argc: isize, _argv: *const *const u8) -> isize {
     debug_init();
 
     'diagnostic: {
-        let diag_state = DiagState::dump();
-
-        if diag_state.current_el.current_el() != ExceptionLevel::EL2 {
+        // Validate the execution level before reading any trap-sensitive
+        // registers. In particular, ID-group register reads performed at EL1
+        // can be redirected to EL2 by HCR_EL2.TID3.
+        let current_el = CurrentEL::dump();
+        if !should_collect_full_diagnostics(current_el.current_el()) {
             debug_mem_error(DebugMemError::InvalidEL2State);
+            println!("CurrentEL: {:#018x}", current_el.value);
             ret = 1;
             // We can only run at EL2
             break 'diagnostic;
         }
+
+        let diag_state = DiagState::dump();
 
         // we are using little endian, don't support bigendian
         if diag_state.sctlr_el2.as_ref().is_some_and(|s| s.bit_ee()) {

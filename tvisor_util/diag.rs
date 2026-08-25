@@ -1,5 +1,9 @@
 use crate::aarch64_reg::*;
 
+pub fn should_collect_full_diagnostics(current_el: ExceptionLevel) -> bool {
+    current_el == ExceptionLevel::EL2
+}
+
 #[derive(Default)]
 pub struct DiagState {
     pub current_el: CurrentEL,
@@ -267,5 +271,20 @@ impl core::fmt::Display for DiagState {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_collect_full_diagnostics;
+    use crate::aarch64_reg::ExceptionLevel;
+
+    #[test]
+    fn full_diagnostics_are_only_collected_at_el2() {
+        assert!(!should_collect_full_diagnostics(ExceptionLevel::Invalid));
+        assert!(!should_collect_full_diagnostics(ExceptionLevel::EL0));
+        assert!(!should_collect_full_diagnostics(ExceptionLevel::EL1));
+        assert!(should_collect_full_diagnostics(ExceptionLevel::EL2));
+        assert!(!should_collect_full_diagnostics(ExceptionLevel::EL3));
     }
 }
