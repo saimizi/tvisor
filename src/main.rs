@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::arch::global_asm;
+use tvisor_util::aarch64_reg::ExceptionLevel;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
 use tvisor_util::diag::DiagState;
 use tvisor_util::println;
@@ -46,7 +47,7 @@ extern "C" fn rust_main(_argc: isize, _argv: *const *const u8) -> isize {
     'diagnostic: {
         let diag_state = DiagState::dump();
 
-        if diag_state.current_el != 2 {
+        if diag_state.current_el.current_el() != ExceptionLevel::EL2 {
             debug_mem_error(DebugMemError::InvalidEL2State);
             ret = 1;
             // We can only run at EL2
