@@ -20,6 +20,7 @@ pub enum DebugMemError {
     UnexpectedEL2Endianness = 0x5,
     InvalidVectorBaseAlignment = 0x6,
     UnsupportedEL2Feature = 0x7,
+    InvalidDTB = 0x8,
 }
 
 impl DebugMem {

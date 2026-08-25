@@ -25,6 +25,9 @@ SECTIONS {
     }
 
     .bss : ALIGN(__ALIGN_SIZE) {
+        __bss_start = .;
         *(.bss .bss.*)
+        . = ALIGN(16);
+        __bss_end = .;
     }
 }

@@ -13,4 +13,5 @@ name = "tvisor"
 path = "src/main.rs"
 
 [dependencies]
-
+dtoolkit = { path = "third_party/dtoolkit", default-features = false }
+spin = { version = "=0.10.1", default-features = false, features = ["once"] }
