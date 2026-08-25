@@ -45,10 +45,9 @@ It must not:
 - enter a guest or execute `ERET`;
 - retain pointers into the U-Boot stack after returning.
 
-The only intentionally modified external state is:
-
-- bytes appended to `[0x0000_1000, 0x0000_1100)`;
-- bytes transmitted through the mini UART.
+The only intentionally modified external state is bytes transmitted through
+the DTB-selected UART. The diagnostic error stack is stored inside tvisor's
+linker-owned .bss; it does not write to an unrelated fixed physical address.
 
 The UART must be drained before returning to U-Boot.
 
@@ -56,28 +55,28 @@ The UART must be drained before returning to U-Boot.
 
 The implementation order is fixed:
 
-1. Capture all readable handoff registers into a local snapshot.
-2. Initialize and clear the debug error stack.
-3. Validate only the invariants defined as errors in this document.
-4. Append each failed invariant to the error stack.
-5. Print all raw values and selected decoded fields through UART.
-6. Capture a second snapshot of the system registers that must remain stable.
-7. Compare the stable fields and record an error if any changed.
-8. Drain UART output.
-9. Return zero if no fatal invariant failed; otherwise return one.
+1. Decode the bounded U-Boot argument list and obtain the fdt= address.
+2. Validate the DTB without using UART or accessing diagnostic MMIO.
+3. Resolve /chosen/stdout-path, aliases, compatible, reg, and ancestor
+   ranges properties into a supported UART type and CPU physical address.
+4. Initialize the debug backend with the discovered UART register window.
+5. Print DTB identity and the resolved console information.
+6. Capture the readable handoff registers into a local snapshot.
+7. Validate the invariants defined as errors in this document.
+8. Append failed post-console invariants to the linker-owned error stack.
+9. Print all raw values and selected decoded fields through UART.
+10. Drain UART output and return the diagnostic status.
 
-The initial capture comes before `debug_init()` so that the snapshot is as
-close as possible to the Rust entry point. It still is not the exact machine
-state at the `bootelf` branch: the compiler-generated function prologue can
-already have adjusted SP and used the U-Boot stack.
-
-Capturing the exact entry-time general-purpose registers and SP requires a
-future assembly entry shim. That work belongs to the permanent-handoff phase.
+Before step 4, failures cannot be printed. U-Boot receives a distinct nonzero
+return code for invalid arguments, invalid DTB contents, or failed console
+discovery. The pre-UART code relies only on the entry stack, initialized
+.bss, little-endian execution, and the handoff contract that the complete DTB
+range is readable.
 
 ## 4. Snapshot model
 
-The snapshot is a temporary Rust value, not a new format in debug memory. The
-byte error stack remains the only low-memory diagnostic format.
+The snapshot is a temporary Rust value. The byte error stack is private runtime
+state stored in tvisor's linker-owned .bss; it is not a fixed low-memory ABI.
 
 The conceptual snapshot is:
 
@@ -1001,6 +1000,10 @@ Policy:
 
 ## 7. Error-stack allocation
 
+The stack is allocated inside tvisor's .bss and cleared by debug_init().
+Its location is intentionally not fixed or exposed as a U-Boot memory ABI.
+
+
 Existing values retain their meaning:
 
 | Value | Error |
@@ -1121,16 +1124,13 @@ cargo fmt --all -- --check
 Board procedure:
 
 1. Clear or note the current U-Boot console.
-2. Load the ELF at `0x0200_0000` and execute it with `bootelf`.
+2. Load the ELF and execute it with the required fdt= argument.
 3. Save the complete UART report.
-4. Confirm tvisor returns to a working U-Boot prompt.
-5. Inspect the error stack:
-
-   ```text
-   U-Boot> md.b 0x00001000 0x100
-   ```
-
-6. Confirm a normal run begins with `00` and reports `state_unchanged yes`.
+4. Confirm the report identifies the DTB-selected console and translated CPU
+   physical register address.
+5. Confirm tvisor returns zero to a working U-Boot prompt.
+6. Confirm invalid pre-UART test inputs return the documented 0x10-0x12 status
+   without attempting serial output.
 7. Repeat after U-Boot, firmware, device-tree, or boot-configuration updates
    and compare the raw register values.
 

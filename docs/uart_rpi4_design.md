@@ -332,65 +332,35 @@ does not change `SP`, `SP_EL0`, `SP_EL2`, or `SPSel`.
 
 ## 6. Debug error stack
 
-tvisor uses a byte-oriented error stack instead of a structured diagnostic
-record. This is simple enough to inspect from U-Boot without a matching Rust
-structure or parser.
+The byte-oriented error stack is private tvisor runtime state stored in the
+linker-owned .bss section:
 
-```text
-Address range:  [0x0000_1000, 0x0000_1100)
-Entry size:     1 byte
-Capacity:       256 error entries
-Ordering:       chronological
-Terminator:     first 0x00 byte
-Overflow:       retain the first 256 entries; do not wrap
-```
+~~~
+Entry size:  1 byte
+Capacity:    256 error entries
+Ordering:    chronological
+Terminator:  first 0x00 byte
+Overflow:    retain the first 256 entries; do not wrap
+~~~
 
-`debug_init()` resets the cursor and clears all 256 bytes before other debug
-operations. Every valid error code must be nonzero so that a cleared byte can
-serve as the end marker.
+The assembly entry clears .bss before Rust starts. After DTB parsing and
+console discovery, debug_init() resets the cursor and clears the entries.
+No diagnostic write targets a fixed physical address such as 0x1000.
 
-The initial assignments are:
+Pre-UART failures cannot be appended or printed. They are returned directly to
+U-Boot as distinct status codes:
 
-| Value | Error | Meaning |
-| --- | --- | --- |
-| `0x01` | `InvalidEL2State` | tvisor did not enter at EL2 |
-| `0x02` | `WaitUartIoComplete` | the transmitter did not become idle before the polling limit |
-| `0x03` | `UartTxTimeout` | the transmitter did not accept a byte before the polling limit |
+| Value | Meaning |
+| --- | --- |
+| 0x10 | Invalid or missing U-Boot fdt= argument |
+| 0x11 | DTB validation failed |
+| 0x12 | Console discovery or address translation failed |
 
-Error-code meanings are stable once assigned. New errors receive new nonzero
-values; existing values must not be reused for a different condition.
-
-For example:
-
-```text
-Address      Value  Meaning
-0x0000_1000  0x01   InvalidEL2State
-0x0000_1001  0x02   WaitUartIoComplete
-0x0000_1002  0x00   end of stack
-```
-
-U-Boot can inspect the stack after tvisor returns:
-
-```text
-U-Boot> md.b 0x00001000 0x100
-```
-
-Appending an error reserves the next byte and writes the code with a volatile
-store. An atomic cursor prevents two cores from selecting the same slot.
-Initialization must finish before secondary cores or interrupt handlers append
-errors.
-
-The stack records events, not arbitrary register values. If raw EL2 register
-snapshots become necessary, reserve a separate region such as
-`[0x0000_1100, 0x0000_1200)` with its own documented format. Do not mix
-multi-byte values into the byte error stack.
-
-UART remains useful for human-readable register values. A future diagnostic
-line can be:
-
-```text
-tvisor: EL=2 SCTLR_EL2=<hex> MMU=<0|1> D-cache=<0|1> I-cache=<0|1>
-```
+After UART initialization, the error stack records diagnostic events such as
+invalid EL2 state or UART timeouts. It is not an external memory ABI and is not
+inspected with U-Boot md.b. A future exported diagnostic record should receive
+an explicit linker symbol and documented lifetime instead of relying on an
+unrelated low-memory address.
 
 ## 7. Ownership by milestone
 
@@ -414,14 +384,12 @@ The returnable UART milestone is successful when all of the following hold:
 2. `bootelf 0x02000000` enters tvisor at EL2.
 3. The diagnostic appears correctly at 115200 8N1, including CRLF newlines.
 4. The printed EL is 2.
-5. A successful run leaves the error stack zero-filled.
+5. The DTB-selected console path resolves to the expected compatible device and CPU physical address.
 6. The final byte drains before tvisor returns.
 7. U-Boot reports a zero return status and its prompt and serial input/output
    continue to work.
-8. A wrong UART mapping or unavailable transmitter returns a timeout instead
-   of hanging forever and appends the appropriate UART error when possible.
-9. The error stack can be read with `md.b`; entries appear chronologically and
-   the first zero byte terminates the list.
+8. A pre-UART discovery failure returns one of the documented early status codes without MMIO access.
+9. An unavailable transmitter times out instead of polling forever.
 
 ## 9. Future permanent-handoff sequence
 
