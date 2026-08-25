@@ -2,11 +2,11 @@
 #![no_main]
 
 use core::arch::global_asm;
-use dtoolkit::{Node, Property};
+use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
 use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
-use tvisor_util::fdt::{fdt_address_from_uboot_args, fdt_init};
+use tvisor_util::fdt::{ConsoleKind, discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::println;
 
 global_asm!(
@@ -55,12 +55,56 @@ main:
 "#,
 );
 
+#[repr(isize)]
+enum EarlyBootError {
+    InvalidUbootArguments = 0x10,
+    InvalidDtb = 0x11,
+    ConsoleDiscovery = 0x12,
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
-    let mut ret = 0_isize;
-    debug_init();
+    // Before debug_init, startup must not access UART MMIO or the error stack.
+    // U-Boot reports these return values if early DTB discovery fails.
+    let dtb_base = match unsafe { fdt_address_from_uboot_args(argc, argv) } {
+        Ok(address) => address,
+        Err(_) => return EarlyBootError::InvalidUbootArguments as isize,
+    };
 
-    'main: {
+    // SAFETY: The U-Boot handoff contract requires fdt= to identify a complete,
+    // readable DTB that remains unchanged while tvisor uses it.
+    let fdt = match unsafe { fdt_init(dtb_base) } {
+        Ok(fdt) => fdt,
+        Err(_) => return EarlyBootError::InvalidDtb as isize,
+    };
+
+    let console = match discover_console(*fdt) {
+        Ok(console) => console,
+        Err(_) => return EarlyBootError::ConsoleDiscovery as isize,
+    };
+
+    match console.kind {
+        ConsoleKind::MiniUart => debug_init(console.register_base),
+    }
+
+    println!(
+        "DTB base={:#x}, version={}, size={:#x}",
+        dtb_base as usize,
+        fdt.version(),
+        fdt.data().len()
+    );
+    match fdt.root().model() {
+        Ok(Some(model)) => println!("DTB model={}", model),
+        Ok(None) => println!("DTB model=<missing>"),
+        Err(error) => println!("DTB model is invalid: {}", error),
+    }
+    println!(
+        "Console: {:?}, register_base={:#x}, register_size={:#x}",
+        console.kind, console.register_base, console.register_size
+    );
+
+    let mut ret = 0_isize;
+    'diagnostic: {
         // Validate the execution level before reading any trap-sensitive
         // registers. In particular, ID-group register reads performed at EL1
         // can be redirected to EL2 by HCR_EL2.TID3.
@@ -69,20 +113,17 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
             debug_mem_error(DebugMemError::InvalidEL2State);
             println!("CurrentEL: {:#018x}", current_el.value);
             ret = 1;
-            // We can only run at EL2
-            break 'main;
+            break 'diagnostic;
         }
 
         let diag_state = DiagState::dump();
 
-        // we are using little endian, don't support bigendian
         if diag_state.sctlr_el2.as_ref().is_some_and(|s| s.bit_ee()) {
             debug_mem_error(DebugMemError::UnexpectedEL2Endianness);
             ret = 1;
-            break 'main;
+            break 'diagnostic;
         }
 
-        // VBAR_EL2 must be 2048-byte aligned; a misaligned vector base is fatal
         if diag_state
             .vbar_el2
             .as_ref()
@@ -90,11 +131,9 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         {
             debug_mem_error(DebugMemError::InvalidVectorBaseAlignment);
             ret = 1;
-            break 'main;
+            break 'diagnostic;
         }
 
-        // The processor must report EL2 support; EL2 == 0 is inconsistent with
-        // executing at EL2.
         if diag_state
             .id_aa64pfr0_el1
             .as_ref()
@@ -102,56 +141,13 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         {
             debug_mem_error(DebugMemError::UnsupportedEL2Feature);
             ret = 1;
-            break 'main;
+            break 'diagnostic;
         }
 
-        // this should be outputted after endian (EE) is checked
         println!("{}", diag_state);
-
-        // SAFETY: U-Boot invokes tvisor using its standalone-application ABI,
-        // which supplies argc readable, NUL-terminated strings through argv.
-        let dtb_base = match unsafe { fdt_address_from_uboot_args(argc, argv) } {
-            Ok(address) => address,
-            Err(error) => {
-                println!("Invalid U-Boot FDT argument: {}", error);
-                ret = 1;
-                debug_mem_error(DebugMemError::InvalidDTB);
-                break 'main;
-            }
-        };
-
-        println!("DTB base: {:#x}", dtb_base as usize);
-
-        // SAFETY: The fdt= argument names U-Boot's live working DTB, whose
-        // complete totalsize range remains readable while tvisor can return to
-        // U-Boot.
-        match unsafe { fdt_init(dtb_base) } {
-            Ok(fdt) => {
-                println!(
-                    "DTB version={}, size={:#x}",
-                    fdt.version(),
-                    fdt.data().len()
-                );
-
-                match fdt.root().property("model") {
-                    Some(property) => match property.as_str() {
-                        Ok(model) => println!("DTB model={}", model),
-                        Err(error) => println!("DTB model is invalid: {}", error),
-                    },
-                    None => println!("DTB model=<missing>"),
-                }
-            }
-            Err(error) => {
-                println!("Failed to parse DTB: {}", error);
-                ret = 1;
-                debug_mem_error(DebugMemError::InvalidDTB);
-                break 'main;
-            }
-        }
     }
 
     debug_fini();
-
     ret
 }
 

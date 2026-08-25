@@ -1,7 +1,11 @@
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+const DEBUG_MEM_SIZE: usize = 0x100;
+const UART_TX_POLL_COUNT: usize = 1_000_000;
 
 static GLOBAL_DEBUG_MEM: DebugMem = DebugMem::new();
+static MINI_UART_BASE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn debug_mem_error(err: DebugMemError) {
     GLOBAL_DEBUG_MEM.push_err(err)
@@ -9,6 +13,7 @@ pub fn debug_mem_error(err: DebugMemError) {
 
 struct DebugMem {
     cur: AtomicUsize,
+    errors: [AtomicU8; DEBUG_MEM_SIZE],
 }
 
 #[repr(u8)]
@@ -20,24 +25,20 @@ pub enum DebugMemError {
     UnexpectedEL2Endianness = 0x5,
     InvalidVectorBaseAlignment = 0x6,
     UnsupportedEL2Feature = 0x7,
-    InvalidDTB = 0x8,
 }
 
 impl DebugMem {
-    const DEBUG_MEM_START: *mut u8 = 0x00001000 as *mut u8;
-    const DEBUG_MEM_SIZE: usize = 0x00000100;
-
     pub const fn new() -> Self {
         Self {
             cur: AtomicUsize::new(0),
+            errors: [const { AtomicU8::new(0) }; DEBUG_MEM_SIZE],
         }
     }
 
     pub fn init(&self) {
         self.cur.store(0, Ordering::Relaxed);
-
-        for offset in 0..Self::DEBUG_MEM_SIZE {
-            unsafe { core::ptr::write_volatile(Self::DEBUG_MEM_START.add(offset), 0) }
+        for error in &self.errors {
+            error.store(0, Ordering::Relaxed);
         }
     }
 
@@ -45,71 +46,57 @@ impl DebugMem {
         let result = self
             .cur
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current < Self::DEBUG_MEM_SIZE {
-                    Some(current + 1)
-                } else {
-                    None
-                }
+                (current < DEBUG_MEM_SIZE).then_some(current + 1)
             });
 
         if let Ok(offset) = result {
-            unsafe { core::ptr::write_volatile(Self::DEBUG_MEM_START.add(offset), code as u8) }
+            self.errors[offset].store(code as u8, Ordering::Relaxed);
         }
     }
 }
 
-struct AuxRegister;
+struct MiniUart {
+    register_base: usize,
+}
 
-#[allow(unused)]
-impl AuxRegister {
-    const LSR_TX_READY: u32 = 0x1 << 5;
-    const LSR_IDLE: u32 = 0x1 << 6;
-    const AUX_BASE: usize = 0xFE21_5000;
-    const IRQ: usize = AuxRegister::AUX_BASE;
-    const ENABLES: usize = AuxRegister::AUX_BASE + 0x04;
-    const MU_IO: usize = AuxRegister::AUX_BASE + 0x40;
-    const MU_IER: usize = AuxRegister::AUX_BASE + 0x44;
-    const MU_IIR: usize = AuxRegister::AUX_BASE + 0x48;
-    const MU_LCR: usize = AuxRegister::AUX_BASE + 0x4C;
-    const MU_MCR: usize = AuxRegister::AUX_BASE + 0x50;
-    const MU_LSR: usize = AuxRegister::AUX_BASE + 0x54;
-    const MU_MSR: usize = AuxRegister::AUX_BASE + 0x58;
-    const MU_SCRATCH: usize = AuxRegister::AUX_BASE + 0x5C;
-    const MU_CNTL: usize = AuxRegister::AUX_BASE + 0x60;
-    const MU_STAT: usize = AuxRegister::AUX_BASE + 0x64;
-    const MU_BAUD: usize = AuxRegister::AUX_BASE + 0x68;
+impl MiniUart {
+    const IO_OFFSET: usize = 0x00;
+    const LSR_OFFSET: usize = 0x14;
+    const LSR_TX_READY: u32 = 1 << 5;
+    const LSR_IDLE: u32 = 1 << 6;
 
-    pub fn wait_io_completed(max_pool_cnt: Option<usize>) -> bool {
-        let poll_cnt = max_pool_cnt.unwrap_or(1_000_000);
+    fn configured() -> Option<Self> {
+        let register_base = MINI_UART_BASE.load(Ordering::Relaxed);
+        (register_base != 0).then_some(Self { register_base })
+    }
 
-        for _ in 0..poll_cnt {
-            if unsafe { mmio_read32(AuxRegister::MU_LSR) } & AuxRegister::LSR_IDLE != 0 {
+    fn register(&self, offset: usize) -> usize {
+        self.register_base + offset
+    }
+
+    fn wait_io_completed(&self) -> bool {
+        for _ in 0..UART_TX_POLL_COUNT {
+            if unsafe { mmio_read32(self.register(Self::LSR_OFFSET)) } & Self::LSR_IDLE != 0 {
                 return true;
             }
-
             core::hint::spin_loop();
         }
-
         false
     }
 
-    pub fn is_tx_ready(max_pool_cnt: Option<usize>) -> bool {
-        let poll_cnt = max_pool_cnt.unwrap_or(1_000_000);
-
-        for _ in 0..poll_cnt {
-            if unsafe { mmio_read32(AuxRegister::MU_LSR) } & AuxRegister::LSR_TX_READY != 0 {
+    fn is_tx_ready(&self) -> bool {
+        for _ in 0..UART_TX_POLL_COUNT {
+            if unsafe { mmio_read32(self.register(Self::LSR_OFFSET)) } & Self::LSR_TX_READY != 0 {
                 return true;
             }
-
             core::hint::spin_loop();
         }
-
         false
     }
 
-    pub fn write_byte_raw(byte: u8) -> Result<(), ()> {
-        if AuxRegister::is_tx_ready(None) {
-            unsafe { mmio_write32(AuxRegister::MU_IO, byte as u32) };
+    fn write_byte_raw(&self, byte: u8) -> Result<(), ()> {
+        if self.is_tx_ready() {
+            unsafe { mmio_write32(self.register(Self::IO_OFFSET), u32::from(byte)) };
             Ok(())
         } else {
             debug_mem_error(DebugMemError::UartTxTimeout);
@@ -117,21 +104,19 @@ impl AuxRegister {
         }
     }
 
-    pub fn write_byte(byte: u8) -> Result<(), ()> {
+    fn write_byte(&self, byte: u8) -> Result<(), ()> {
         if byte == b'\n' {
-            AuxRegister::write_byte_raw(b'\r')?;
+            self.write_byte_raw(b'\r')?;
         }
-
-        AuxRegister::write_byte_raw(byte)
+        self.write_byte_raw(byte)
     }
 }
 
-impl core::fmt::Write for AuxRegister {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+impl Write for MiniUart {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
         for byte in text.bytes() {
-            AuxRegister::write_byte(byte).map_err(|_| core::fmt::Error)?;
+            self.write_byte(byte).map_err(|_| fmt::Error)?;
         }
-
         Ok(())
     }
 }
@@ -146,8 +131,8 @@ unsafe fn mmio_write32(address: usize, value: u32) {
     unsafe { core::ptr::write_volatile(address as *mut u32, value) }
 }
 
-pub fn print(args: core::fmt::Arguments<'_>) -> fmt::Result {
-    let mut uart = AuxRegister;
+pub fn print(args: fmt::Arguments<'_>) -> fmt::Result {
+    let mut uart = MiniUart::configured().ok_or(fmt::Error)?;
     uart.write_fmt(args)
 }
 
@@ -169,13 +154,18 @@ macro_rules! println {
     };
 }
 
-pub fn debug_init() {
+/// Enables diagnostic output through a DTB-discovered Mini UART register
+/// window. No MMIO is accessed before this function is called.
+pub fn debug_init(mini_uart_register_base: usize) {
+    MINI_UART_BASE.store(mini_uart_register_base, Ordering::Relaxed);
     GLOBAL_DEBUG_MEM.init();
 }
 
 pub fn debug_fini() {
     println!("Wait IO completed...");
-    if !AuxRegister::wait_io_completed(None) {
+    if let Some(uart) = MiniUart::configured()
+        && !uart.wait_io_completed()
+    {
         debug_mem_error(DebugMemError::WaitUartIoComplete);
     }
 }

@@ -1,6 +1,7 @@
 use core::fmt;
+use core::mem::size_of;
 
-use dtoolkit::{error::FdtParseError, fdt::Fdt};
+use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
 use spin::Once;
 
 const MAX_UBOOT_ARGS: usize = 16;
@@ -184,6 +185,211 @@ fn parse_hex_address(value: &[u8]) -> Result<usize, FdtArgError> {
     })
 }
 
+const MINI_UART_COMPATIBLE: &str = "brcm,bcm2835-aux-uart";
+const MINI_UART_MIN_REGISTER_SIZE: u64 = 0x18;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleKind {
+    MiniUart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleInfo {
+    pub kind: ConsoleKind,
+    /// CPU physical address of the UART's first register.
+    pub register_base: usize,
+    pub register_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleDiscoveryError {
+    MissingChosen,
+    MissingStdoutPath,
+    InvalidStdoutPath,
+    MissingAliases,
+    MissingAlias,
+    MissingConsoleNode,
+    ConsoleDisabled,
+    UnsupportedConsole,
+    MissingRegister,
+    InvalidRegister,
+    MissingParent,
+    MissingRanges,
+    AddressNotMapped,
+    AddressOverflow,
+}
+
+impl fmt::Display for ConsoleDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingChosen => "the /chosen node is missing",
+            Self::MissingStdoutPath => "the /chosen stdout-path property is missing",
+            Self::InvalidStdoutPath => "the stdout-path property is invalid",
+            Self::MissingAliases => "stdout-path uses an alias but /aliases is missing",
+            Self::MissingAlias => "the stdout-path alias is missing or invalid",
+            Self::MissingConsoleNode => "the stdout-path console node is missing",
+            Self::ConsoleDisabled => "the stdout-path console is not enabled",
+            Self::UnsupportedConsole => "the stdout-path console type is unsupported",
+            Self::MissingRegister => "the console has no reg entry",
+            Self::InvalidRegister => "the console reg entry is invalid",
+            Self::MissingParent => "the console path has no parent bus",
+            Self::MissingRanges => "a console parent bus has no ranges property",
+            Self::AddressNotMapped => "the console address is not covered by parent ranges",
+            Self::AddressOverflow => "the translated console address overflows",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Discovers the active console without performing MMIO.
+///
+/// /chosen/stdout-path may contain either an absolute path or an alias and
+/// may include serial options after a colon. The first reg address is
+/// translated through every ancestor bus's ranges property into the CPU
+/// physical address space.
+pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryError> {
+    let path = resolve_stdout_path(fdt)?;
+    let node = fdt
+        .find_node(path)
+        .ok_or(ConsoleDiscoveryError::MissingConsoleNode)?;
+
+    if node
+        .status()
+        .map_err(|_| ConsoleDiscoveryError::ConsoleDisabled)?
+        != dtoolkit::standard::Status::Okay
+    {
+        return Err(ConsoleDiscoveryError::ConsoleDisabled);
+    }
+
+    let kind = if node.is_compatible(MINI_UART_COMPATIBLE) {
+        ConsoleKind::MiniUart
+    } else {
+        return Err(ConsoleDiscoveryError::UnsupportedConsole);
+    };
+
+    let mut registers = node
+        .reg()
+        .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?
+        .ok_or(ConsoleDiscoveryError::MissingRegister)?;
+    let register = registers
+        .next()
+        .ok_or(ConsoleDiscoveryError::MissingRegister)?;
+    let bus_address = register
+        .address::<u64>()
+        .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
+    let register_size = register
+        .size::<u64>()
+        .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
+
+    if register_size < MINI_UART_MIN_REGISTER_SIZE {
+        return Err(ConsoleDiscoveryError::InvalidRegister);
+    }
+
+    let physical_address = translate_to_cpu_address(fdt, path, bus_address)?;
+    let register_base =
+        usize::try_from(physical_address).map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
+    let register_size =
+        usize::try_from(register_size).map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
+    if register_base == 0 || !register_base.is_multiple_of(size_of::<u32>()) {
+        return Err(ConsoleDiscoveryError::InvalidRegister);
+    }
+
+    Ok(ConsoleInfo {
+        kind,
+        register_base,
+        register_size,
+    })
+}
+
+fn resolve_stdout_path<'a>(fdt: Fdt<'a>) -> Result<&'a str, ConsoleDiscoveryError> {
+    let chosen = fdt.chosen().ok_or(ConsoleDiscoveryError::MissingChosen)?;
+    let stdout_path = chosen
+        .stdout_path()
+        .map_err(|_| ConsoleDiscoveryError::InvalidStdoutPath)?
+        .ok_or(ConsoleDiscoveryError::MissingStdoutPath)?;
+    let selector = stdout_path
+        .split(':')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or(ConsoleDiscoveryError::InvalidStdoutPath)?;
+
+    if selector.starts_with('/') {
+        return Ok(selector);
+    }
+
+    let aliases = fdt
+        .find_node("/aliases")
+        .ok_or(ConsoleDiscoveryError::MissingAliases)?;
+    aliases
+        .property(selector)
+        .ok_or(ConsoleDiscoveryError::MissingAlias)?
+        .as_str()
+        .map_err(|_| ConsoleDiscoveryError::MissingAlias)
+}
+
+fn translate_to_cpu_address(
+    fdt: Fdt<'_>,
+    device_path: &str,
+    mut address: u64,
+) -> Result<u64, ConsoleDiscoveryError> {
+    let mut bus_path = parent_path(device_path).ok_or(ConsoleDiscoveryError::MissingParent)?;
+
+    while bus_path != "/" {
+        let bus = fdt
+            .find_node(bus_path)
+            .ok_or(ConsoleDiscoveryError::MissingParent)?;
+        let mut ranges = bus
+            .ranges()
+            .map_err(|_| ConsoleDiscoveryError::MissingRanges)?
+            .ok_or(ConsoleDiscoveryError::MissingRanges)?;
+
+        if let Some(first) = ranges.next() {
+            let mut translated = None;
+            for range in core::iter::once(first).chain(ranges) {
+                let child = range
+                    .child_bus_address::<u64>()
+                    .map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
+                let parent = range
+                    .parent_bus_address::<u64>()
+                    .map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
+                let length = range
+                    .length::<u64>()
+                    .map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
+
+                let Some(offset) = address.checked_sub(child) else {
+                    continue;
+                };
+                if offset >= length {
+                    continue;
+                }
+
+                translated = Some(
+                    parent
+                        .checked_add(offset)
+                        .ok_or(ConsoleDiscoveryError::AddressOverflow)?,
+                );
+                break;
+            }
+            address = translated.ok_or(ConsoleDiscoveryError::AddressNotMapped)?;
+        }
+
+        bus_path = parent_path(bus_path).ok_or(ConsoleDiscoveryError::MissingParent)?;
+    }
+
+    Ok(address)
+}
+
+fn parent_path(path: &str) -> Option<&str> {
+    if path == "/" || !path.starts_with('/') {
+        return None;
+    }
+    let separator = path.rfind('/')?;
+    Some(if separator == 0 {
+        "/"
+    } else {
+        &path[..separator]
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +454,13 @@ mod tests {
         let result = unsafe { fdt_address_from_uboot_args(argv.len() as isize, argv.as_ptr()) };
 
         assert_eq!(result, Err(FdtArgError::ZeroAddress));
+    }
+
+    #[test]
+    fn finds_parent_paths() {
+        assert_eq!(parent_path("/soc/serial@7e215040"), Some("/soc"));
+        assert_eq!(parent_path("/soc"), Some("/"));
+        assert_eq!(parent_path("/"), None);
+        assert_eq!(parent_path("relative"), None);
     }
 }

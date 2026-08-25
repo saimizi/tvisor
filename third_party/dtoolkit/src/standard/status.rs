@@ -32,7 +32,7 @@ impl Status {
     fn as_str(self) -> &'static str {
         match self {
             Status::Okay => "okay",
-            Status::Disabled => "disadbled",
+            Status::Disabled => "disabled",
             Status::Reserved => "reserved",
             Status::Fail => "fail",
             Status::FailSss => "fail-sss",
@@ -52,11 +52,21 @@ impl FromStr for Status {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "okay" => Ok(Self::Okay),
-            "disadbled" => Ok(Self::Disabled),
+            "disabled" => Ok(Self::Disabled),
             "reserved" => Ok(Self::Reserved),
             "fail" => Ok(Self::Fail),
             "fail-sss" => Ok(Self::FailSss),
             _ => Err(StandardError::InvalidStatus),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_disabled_status() {
+        assert_eq!("disabled".parse(), Ok(Status::Disabled));
     }
 }

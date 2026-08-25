@@ -16,3 +16,5 @@ Local changes:
   DTBs contain `arm,cpu-registers-not-fw-configured`; the binary FDT format can
   represent this name even though it exceeds the specification's recommended
   limit. Character validation remains enabled.
+- Correct the misspelled standard `disabled` status so disabled DTB devices are
+  rejected correctly.

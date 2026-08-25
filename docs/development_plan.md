@@ -382,8 +382,8 @@ assume that a DT unit address is already an ARM physical address.
 - Extend `tvisor_util/platform.rs`.
 - Add `tvisor_util/bcm2711.rs` for narrowly scoped BCM2711 knowledge that is
   not expressed sufficiently by standard bindings.
-- Refactor `tvisor_util/debug_util.rs` so the later initialized UART can use a
-  discovered CPU physical base while preserving a minimal early-console path.
+- Refactor `tvisor_util/debug_util.rs` so UART MMIO remains disabled until the DTB-selected console has been translated to a
+  CPU physical register base.
 - Reuse `tvisor_util/aarch64_reg.rs` for `MPIDR_EL1`; do not specialize the
   generic register wrapper for `SystemInfo`.
 
@@ -392,8 +392,8 @@ assume that a DT unit address is already an ARM physical address.
 - **Host:** Tests cover one and multiple `ranges` translations, nested buses,
   empty identity `ranges`, untranslated addresses, disabled devices, alias
   resolution, and `stdout-path` options.
-- **AArch64 build:** Both early fixed-console and discovered-console paths
-  compile without allocation.
+- **AArch64 build:** The DTB-first console-discovery path compiles without allocation and performs no
+  MMIO before debug initialization.
 - **Raspberry Pi 4:** The discovered mini-UART CPU physical address agrees
   with the current working DTB and existing output (`0xFE21_5040` for the
   observed configuration). CPU affinity agrees with `MPIDR_EL1`. UART remains
