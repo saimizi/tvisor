@@ -4,6 +4,8 @@ use core::mem::size_of;
 use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
 use spin::Once;
 
+use crate::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
+
 const MAX_UBOOT_ARGS: usize = 16;
 const MAX_UBOOT_ARG_LEN: usize = 64;
 const FDT_ARG_PREFIX: &[u8] = b"fdt=";
@@ -189,19 +191,6 @@ const MINI_UART_COMPATIBLE: &str = "brcm,bcm2835-aux-uart";
 const MINI_UART_MIN_REGISTER_SIZE: u64 = 0x18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsoleKind {
-    MiniUart,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConsoleInfo {
-    pub kind: ConsoleKind,
-    /// CPU physical address of the UART's first register.
-    pub register_base: usize,
-    pub register_size: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleDiscoveryError {
     MissingChosen,
     MissingStdoutPath,
@@ -286,19 +275,13 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
     }
 
     let physical_address = translate_to_cpu_address(fdt, path, bus_address)?;
-    let register_base =
-        usize::try_from(physical_address).map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
-    let register_size =
-        usize::try_from(register_size).map_err(|_| ConsoleDiscoveryError::AddressOverflow)?;
-    if register_base == 0 || !register_base.is_multiple_of(size_of::<u32>()) {
+    if physical_address == 0 || !physical_address.is_multiple_of(size_of::<u32>() as u64) {
         return Err(ConsoleDiscoveryError::InvalidRegister);
     }
+    let registers = PhysRegion::new(PhysAddr::new(physical_address), register_size)
+        .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
 
-    Ok(ConsoleInfo {
-        kind,
-        register_base,
-        register_size,
-    })
+    Ok(ConsoleInfo { kind, registers })
 }
 
 fn resolve_stdout_path<'a>(fdt: Fdt<'a>) -> Result<&'a str, ConsoleDiscoveryError> {

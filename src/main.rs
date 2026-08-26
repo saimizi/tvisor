@@ -6,8 +6,9 @@ use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
 use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
-use tvisor_util::fdt::{ConsoleKind, discover_console, fdt_address_from_uboot_args, fdt_init};
+use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::println;
+use tvisor_util::system_info::ConsoleKind;
 
 global_asm!(
     r#"
@@ -83,8 +84,12 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         Err(_) => return EarlyBootError::ConsoleDiscovery as isize,
     };
 
+    let console_register_base = match usize::try_from(console.registers.start().value()) {
+        Ok(address) => address,
+        Err(_) => return EarlyBootError::ConsoleDiscovery as isize,
+    };
     match console.kind {
-        ConsoleKind::MiniUart => debug_init(console.register_base),
+        ConsoleKind::MiniUart => debug_init(console_register_base),
     }
 
     println!(
@@ -100,7 +105,9 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
     }
     println!(
         "Console: {:?}, register_base={:#x}, register_size={:#x}",
-        console.kind, console.register_base, console.register_size
+        console.kind,
+        console.registers.start().value(),
+        console.registers.size()
     );
 
     let mut ret = 0_isize;
