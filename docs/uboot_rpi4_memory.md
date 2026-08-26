@@ -137,6 +137,44 @@ This snapshot is not a permanent ABI. Re-run `bdinfo` after changing the
 firmware, DTB, U-Boot build or configuration, or boot sequence. The most useful
 snapshot is taken immediately before launching tvisor.
 
+### Passing the live LMB list to tvisor
+
+The working DTB does not contain U-Boot's live allocator state. To refine the
+temporary pre-takeover safety map, the caller may copy reservations printed by
+the same boot session's `bdinfo` into repeatable arguments of this form:
+
+```text
+lmb=<hex-start>:<hex-size>
+```
+
+For the captured layout above, a `go` launch is conceptually:
+
+```text
+=> go ${tvisor_entry} fdt=${fdt_addr} \
+     bootmem=4000000:${filesize} \
+     lmb=0:1000 \
+     lmb=36b2b000:14d5000 \
+     lmb=3ef66280:3f0 \
+     lmb=40000000:bc000000
+```
+
+`bootelf` receives the same tagged arguments after its ELF address, with its
+staging buffer described as `bootmem=2000000:${filesize}`. `go` describes the
+downloaded container at its direct load address. Tvisor scans the bounded
+argument array, so it does not depend on the different `argv[0]` conventions
+of `go` and `bootelf`. Malformed region arguments are fatal, but absent
+arguments do not prevent construction of the permanent post-takeover map.
+
+These regions are printed as `HANDOFF` and excluded from `INITIAL`. They are
+not printed as permanent `RESERVED`, and they do not reduce post-takeover
+`USABLE` RAM. The transition code must use `INITIAL` until it has installed a
+tvisor-owned stack, page tables, vectors, and copied state and has crossed an
+explicit no-return boundary.
+
+Do not copy these sample values permanently to a different board or U-Boot
+configuration. The command must be updated whenever the immediately preceding
+`bdinfo` list changes.
+
 ### Current tvisor placement at `0x0400_0000`
 
 The current linker script places tvisor at `0x0400_0000`. The inspected debug

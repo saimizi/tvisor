@@ -430,9 +430,39 @@ Normalization must:
 - produce a separate `usable_ram` list;
 - fail explicitly if fixed capacities are insufficient.
 
+U-Boot ownership is temporary and must not be folded into the permanent SoC
+memory map. When a pre-takeover safety map is needed, both launch paths may
+pass every entry reported by the immediately preceding `bdinfo`, plus explicit
+load buffers, as repeatable tagged arguments:
+
+```text
+lmb=<hex-start>:<hex-size>
+bootmem=<hex-start>:<hex-size>
+```
+
+`lmb=` carries the live LMB list. `bootmem=` carries explicit boot allocations
+not necessarily represented by LMB, including the `go` download region or the
+`bootelf` staging ELF. Both inputs are optional metadata and are copied into
+`SystemInfo` as bootloader-owned, reclaim-after-takeover reservations. They
+refine `initial_usable`, but never reduce the post-takeover `usable_ram` map.
+The arguments are a per-boot snapshot and must not be treated as fixed
+Raspberry Pi addresses.
+
+Normalization therefore produces two allocation views:
+
+- `initial_usable`: excludes permanent reservations and all known U-Boot/DTB/
+  staging memory; use it to construct tvisor-owned stacks and page tables
+  before the no-return transition;
+- `usable_ram`: excludes only permanent SoC, firmware, device, policy, and
+  tvisor reservations; U-Boot-owned memory appears here because it becomes
+  reclaimable after takeover.
+
 Linux-policy reservations such as CMA/reusable pools remain reserved in the
 first implementation. Reclaiming them requires a later documented ownership
-policy.
+policy. For a dynamic reservation that has `alloc-ranges`, the initial policy
+conservatively excludes each complete allocation window because firmware has
+not selected a final address. A dynamic reservation without an allocation
+window makes the usable map unresolved and causes normalization to fail.
 
 ### Files and modules
 
