@@ -170,12 +170,16 @@ pub struct RamRegion {
 pub enum RamSource {
     DeviceTree,
     Firmware,
+    FirmwareCarveout,
 }
 ```
 
-`ram` means memory described as physical RAM by a trusted platform source. It
-does not mean that tvisor may allocate it. Reservations are not subtracted in
-Phase 1.
+`ram` describes the physical RAM layout, including firmware-owned carve-outs
+that explain gaps in the CPU-visible banks. `DeviceTree` and `Firmware`
+describe physical RAM learned from those sources. `FirmwareCarveout` marks an
+interval backed by installed RAM but withheld by firmware; it is never an
+allocation candidate. No `ram` entry by itself means that tvisor may allocate
+the interval. Reservations are not subtracted in Phase 1.
 
 ### 6.2 Reservations
 
@@ -236,6 +240,14 @@ Unknown reservation semantics must map to conservative values and an
 `Unknown` origin or owner. Reclaimability must never be inferred merely from
 an absent flag.
 
+On BCM2711, firmware can omit its VideoCore carve-out from `/memory` rather
+than describing it in `/reserved-memory`. The platform layer adds the omitted
+interval below the 1 GiB boundary as a `RamRegion` whose source is
+`FirmwareCarveout`. It is not added to `reserved`, because `reserved` tracks
+explicit regions handled by tvisor's reservation policy. This inference is
+narrowly conditioned on the BCM2711 root `compatible`; the generic discovery
+layer must not classify arbitrary gaps between RAM banks this way.
+
 Dynamic `/reserved-memory` requests that contain `size` but no resolved `reg`
 do not describe a physical interval. Store them separately rather than
 inventing an address or placing an empty `ReservedRegion`:
@@ -244,12 +256,15 @@ inventing an address or placing an empty `ReservedRegion`:
 pub struct DynamicReservation {
     pub size: u64,
     pub alignment: Option<u64>,
+    pub origin: ReservationOrigin,
+    pub owner: ReservationOwner,
     pub attributes: ReservationAttributes,
+    pub alloc_ranges: FixedList<PhysRegion, MAX_DYNAMIC_ALLOC_RANGES>,
 }
 ```
 
-The discovery phase can later extend this type with bounded allocation ranges
-or a numeric source identifier if required by the observed DTB.
+Allocation ranges are stored in another fixed-capacity list. A numeric source
+identifier can be added later if required by the observed DTB.
 
 ### 6.3 MMIO
 
@@ -269,6 +284,18 @@ pub enum MmioKind {
 }
 ```
 
+Bus translations retain both sides of a decoded `ranges` tuple for diagnostics:
+
+```rust
+pub struct BusTranslation {
+    child: PhysRegion,
+    parent: PhysRegion,
+}
+```
+
+The child region is in the bus address space and the parent region is in the
+CPU physical address space. Only the parent range is classified as MMIO.
+
 Every MMIO range stored in `SystemInfo` is a CPU physical range after all DT
 bus translations. A DT unit address or legacy peripheral bus address must not
 be stored here before translation.
@@ -284,6 +311,7 @@ pub struct CpuInfo {
     pub affinity: u64,
     pub status: CpuStatus,
     pub enable_method: CpuEnableMethod,
+    pub is_current: bool,
 }
 
 pub enum CpuStatus {
@@ -338,6 +366,7 @@ pub struct SystemInfo {
     pub dynamic_reserved:
         FixedList<DynamicReservation, MAX_DYNAMIC_RESERVATIONS>,
     pub mmio: FixedList<MmioRegion, MAX_MMIO_REGIONS>,
+    pub bus_translations: FixedList<BusTranslation, MAX_BUS_TRANSLATIONS>,
     pub cpus: FixedList<CpuInfo, MAX_CPUS>,
     pub console: Option<ConsoleInfo>,
 }
@@ -353,7 +382,9 @@ Suggested initial capacities are:
 pub const MAX_RAM_REGIONS: usize = 8;
 pub const MAX_RESERVED_REGIONS: usize = 64;
 pub const MAX_DYNAMIC_RESERVATIONS: usize = 16;
+pub const MAX_DYNAMIC_ALLOC_RANGES: usize = 4;
 pub const MAX_MMIO_REGIONS: usize = 64;
+pub const MAX_BUS_TRANSLATIONS: usize = 16;
 pub const MAX_CPUS: usize = 32;
 ```
 
@@ -387,6 +418,10 @@ Phase 1 does not enforce global map invariants. In particular, it does not:
 - decide that reusable memory is allocatable;
 - require all MMIO to be outside RAM; or
 - assign logical CPU identifiers.
+
+Phase 4 must exclude every `RamSource::FirmwareCarveout` entry before deriving
+usable RAM; it must not treat the entry as ordinary RAM and rely on reservation
+subtraction.
 
 Those decisions require a complete set of platform inputs and belong to the
 normalization and policy phases. Retaining raw records and provenance makes

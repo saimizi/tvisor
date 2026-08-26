@@ -3,7 +3,9 @@ use core::fmt;
 pub const MAX_RAM_REGIONS: usize = 8;
 pub const MAX_RESERVED_REGIONS: usize = 64;
 pub const MAX_DYNAMIC_RESERVATIONS: usize = 16;
+pub const MAX_DYNAMIC_ALLOC_RANGES: usize = 4;
 pub const MAX_MMIO_REGIONS: usize = 64;
+pub const MAX_BUS_TRANSLATIONS: usize = 16;
 pub const MAX_CPUS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -212,6 +214,17 @@ impl<'a, T: Copy, const N: usize> IntoIterator for &'a FixedList<T, N> {
 pub enum RamSource {
     DeviceTree,
     Firmware,
+    FirmwareCarveout,
+}
+
+impl fmt::Display for RamSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceTree => formatter.write_str("DeviceTree"),
+            Self::Firmware => formatter.write_str("Firmware"),
+            Self::FirmwareCarveout => formatter.write_str("Firmware Carve-out"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,13 +291,18 @@ impl fmt::Display for DynamicReservationError {
 pub struct DynamicReservation {
     size: u64,
     alignment: Option<u64>,
+    origin: ReservationOrigin,
+    owner: ReservationOwner,
     attributes: ReservationAttributes,
+    alloc_ranges: FixedList<PhysRegion, MAX_DYNAMIC_ALLOC_RANGES>,
 }
 
 impl DynamicReservation {
     pub const fn new(
         size: u64,
         alignment: Option<u64>,
+        origin: ReservationOrigin,
+        owner: ReservationOwner,
         attributes: ReservationAttributes,
     ) -> Result<Self, DynamicReservationError> {
         if size == 0 {
@@ -299,7 +317,10 @@ impl DynamicReservation {
         Ok(Self {
             size,
             alignment,
+            origin,
+            owner,
             attributes,
+            alloc_ranges: FixedList::new(),
         })
     }
 
@@ -311,8 +332,24 @@ impl DynamicReservation {
         self.alignment
     }
 
+    pub const fn origin(self) -> ReservationOrigin {
+        self.origin
+    }
+
+    pub const fn owner(self) -> ReservationOwner {
+        self.owner
+    }
+
     pub const fn attributes(self) -> ReservationAttributes {
         self.attributes
+    }
+
+    pub const fn alloc_ranges(&self) -> &FixedList<PhysRegion, MAX_DYNAMIC_ALLOC_RANGES> {
+        &self.alloc_ranges
+    }
+
+    pub fn add_alloc_range(&mut self, region: PhysRegion) -> Result<(), CapacityError> {
+        self.alloc_ranges.push(region)
     }
 }
 
@@ -330,6 +367,43 @@ pub enum MmioKind {
 pub struct MmioRegion {
     pub region: PhysRegion,
     pub kind: MmioKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusTranslation {
+    child: PhysRegion,
+    parent: PhysRegion,
+}
+
+impl BusTranslation {
+    pub const fn new(
+        child_start: PhysAddr,
+        parent_start: PhysAddr,
+        size: u64,
+    ) -> Result<Self, RegionError> {
+        Ok(Self {
+            child: match PhysRegion::new(child_start, size) {
+                Ok(region) => region,
+                Err(error) => return Err(error),
+            },
+            parent: match PhysRegion::new(parent_start, size) {
+                Ok(region) => region,
+                Err(error) => return Err(error),
+            },
+        })
+    }
+
+    pub const fn child(self) -> PhysRegion {
+        self.child
+    }
+
+    pub const fn parent(self) -> PhysRegion {
+        self.parent
+    }
+
+    pub const fn size(self) -> u64 {
+        self.child.size()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +425,7 @@ pub struct CpuInfo {
     pub affinity: u64,
     pub status: CpuStatus,
     pub enable_method: CpuEnableMethod,
+    pub is_current: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +445,7 @@ pub struct SystemInfo {
     reserved: FixedList<ReservedRegion, MAX_RESERVED_REGIONS>,
     dynamic_reserved: FixedList<DynamicReservation, MAX_DYNAMIC_RESERVATIONS>,
     mmio: FixedList<MmioRegion, MAX_MMIO_REGIONS>,
+    bus_translations: FixedList<BusTranslation, MAX_BUS_TRANSLATIONS>,
     cpus: FixedList<CpuInfo, MAX_CPUS>,
     console: Option<ConsoleInfo>,
 }
@@ -381,6 +457,7 @@ impl SystemInfo {
             reserved: FixedList::new(),
             dynamic_reserved: FixedList::new(),
             mmio: FixedList::new(),
+            bus_translations: FixedList::new(),
             cpus: FixedList::new(),
             console: None,
         }
@@ -402,6 +479,10 @@ impl SystemInfo {
 
     pub const fn mmio(&self) -> &FixedList<MmioRegion, MAX_MMIO_REGIONS> {
         &self.mmio
+    }
+
+    pub const fn bus_translations(&self) -> &FixedList<BusTranslation, MAX_BUS_TRANSLATIONS> {
+        &self.bus_translations
     }
 
     pub const fn cpus(&self) -> &FixedList<CpuInfo, MAX_CPUS> {
@@ -431,6 +512,13 @@ impl SystemInfo {
         self.mmio.push(region)
     }
 
+    pub fn add_bus_translation(
+        &mut self,
+        translation: BusTranslation,
+    ) -> Result<(), CapacityError> {
+        self.bus_translations.push(translation)
+    }
+
     pub fn add_cpu(&mut self, cpu: CpuInfo) -> Result<(), CapacityError> {
         self.cpus.push(cpu)
     }
@@ -443,6 +531,79 @@ impl SystemInfo {
 impl Default for SystemInfo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for SystemInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "System information:")?;
+        let mut printed_ram = [false; MAX_RAM_REGIONS];
+        for _ in 0..self.ram.len() {
+            let Some((index, ram)) = self
+                .ram
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !printed_ram[*index])
+                .min_by_key(|(_, ram)| ram.region.start())
+            else {
+                break;
+            };
+            printed_ram[index] = true;
+            writeln!(formatter, "  RAM        {} {}", ram.region, ram.source)?;
+        }
+        for reserved in &self.reserved {
+            writeln!(
+                formatter,
+                "  RESERVED   {} origin={:?} owner={:?} no_map={} reusable={}",
+                reserved.region,
+                reserved.origin,
+                reserved.owner,
+                reserved.attributes.no_map,
+                reserved.attributes.reusable
+            )?;
+        }
+        for reserved in &self.dynamic_reserved {
+            writeln!(
+                formatter,
+                "  DYNAMIC    size={:#x} alignment={:?} origin={:?} owner={:?} no_map={} reusable={}",
+                reserved.size(),
+                reserved.alignment(),
+                reserved.origin(),
+                reserved.owner(),
+                reserved.attributes().no_map,
+                reserved.attributes().reusable
+            )?;
+            for range in reserved.alloc_ranges() {
+                writeln!(formatter, "             alloc_range={}", range)?;
+            }
+        }
+        for mmio in &self.mmio {
+            writeln!(formatter, "  MMIO       {} {:?}", mmio.region, mmio.kind)?;
+        }
+        for translation in &self.bus_translations {
+            writeln!(
+                formatter,
+                "  SOC RANGE  child={} -> parent={} size={:#x}",
+                translation.child(),
+                translation.parent(),
+                translation.size()
+            )?;
+        }
+        for cpu in &self.cpus {
+            writeln!(
+                formatter,
+                "  CPU        affinity={:#x} status={:?} enable={:?} current={}",
+                cpu.affinity, cpu.status, cpu.enable_method, cpu.is_current
+            )?;
+        }
+        if let Some(console) = self.console {
+            writeln!(
+                formatter,
+                "  CONSOLE    {} {:?}",
+                console.registers, console.kind
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -560,21 +721,49 @@ mod tests {
             no_map: true,
             reusable: false,
         };
-        let reservation = DynamicReservation::new(0x4000, Some(0x1000), attributes).unwrap();
+        let reservation = DynamicReservation::new(
+            0x4000,
+            Some(0x1000),
+            ReservationOrigin::ReservedMemoryNode,
+            ReservationOwner::HostPolicy,
+            attributes,
+        )
+        .unwrap();
 
         assert_eq!(reservation.size(), 0x4000);
         assert_eq!(reservation.alignment(), Some(0x1000));
+        assert_eq!(reservation.origin(), ReservationOrigin::ReservedMemoryNode);
+        assert_eq!(reservation.owner(), ReservationOwner::HostPolicy);
         assert_eq!(reservation.attributes(), attributes);
+        assert!(reservation.alloc_ranges().is_empty());
         assert_eq!(
-            DynamicReservation::new(0, None, attributes),
+            DynamicReservation::new(
+                0,
+                None,
+                ReservationOrigin::Unknown,
+                ReservationOwner::Unknown,
+                attributes
+            ),
             Err(DynamicReservationError::Empty)
         );
         assert_eq!(
-            DynamicReservation::new(0x1000, Some(0), attributes),
+            DynamicReservation::new(
+                0x1000,
+                Some(0),
+                ReservationOrigin::Unknown,
+                ReservationOwner::Unknown,
+                attributes
+            ),
             Err(DynamicReservationError::InvalidAlignment)
         );
         assert_eq!(
-            DynamicReservation::new(0x1000, Some(3), attributes),
+            DynamicReservation::new(
+                0x1000,
+                Some(3),
+                ReservationOrigin::Unknown,
+                ReservationOwner::Unknown,
+                attributes
+            ),
             Err(DynamicReservationError::InvalidAlignment)
         );
     }
@@ -594,6 +783,8 @@ mod tests {
         let dynamic = DynamicReservation::new(
             0x2000,
             None,
+            ReservationOrigin::ReservedMemoryNode,
+            ReservationOwner::HostPolicy,
             ReservationAttributes {
                 no_map: false,
                 reusable: true,
@@ -604,10 +795,17 @@ mod tests {
             region: region(0xfe00_0000, 0x1000),
             kind: MmioKind::Device,
         };
+        let translation = BusTranslation::new(
+            PhysAddr::new(0x7e00_0000),
+            PhysAddr::new(0xfe00_0000),
+            0x0180_0000,
+        )
+        .unwrap();
         let cpu = CpuInfo {
             affinity: 0,
             status: CpuStatus::Enabled,
             enable_method: CpuEnableMethod::Psci,
+            is_current: true,
         };
         let console = ConsoleInfo {
             kind: ConsoleKind::MiniUart,
@@ -619,6 +817,7 @@ mod tests {
         info.add_reserved(reserved).unwrap();
         info.add_dynamic_reserved(dynamic).unwrap();
         info.add_mmio(mmio).unwrap();
+        info.add_bus_translation(translation).unwrap();
         info.add_cpu(cpu).unwrap();
         info.set_console(console);
 
@@ -626,6 +825,7 @@ mod tests {
         assert_eq!(info.reserved().get(0), Some(&reserved));
         assert_eq!(info.dynamic_reserved().get(0), Some(&dynamic));
         assert_eq!(info.mmio().get(0), Some(&mmio));
+        assert_eq!(info.bus_translations().get(0), Some(&translation));
         assert_eq!(info.cpus().get(0), Some(&cpu));
         assert_eq!(info.console(), Some(console));
     }

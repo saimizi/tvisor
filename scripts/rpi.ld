@@ -3,6 +3,7 @@ ENTRY(main)
 
 __ALIGN_SIZE = 0x1000;
 __LOAD_ADDR = 0x04000000;
+__image_start = __LOAD_ADDR;
 
 
 SECTIONS {
@@ -30,4 +31,7 @@ SECTIONS {
         . = ALIGN(16);
         __bss_end = .;
     }
+
+    . = ALIGN(__ALIGN_SIZE);
+    __image_end = .;
 }
