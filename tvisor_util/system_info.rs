@@ -184,6 +184,13 @@ impl<T: Copy, const N: usize> FixedList<T, N> {
         self.entries[index].as_ref()
     }
 
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[index].as_mut()
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &T> + DoubleEndedIterator {
         self.entries[..self.len]
             .iter()

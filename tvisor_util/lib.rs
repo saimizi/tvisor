@@ -8,5 +8,6 @@ pub mod diag;
 
 pub mod aarch64_reg;
 pub mod fdt;
+pub mod memory_map;
 pub mod platform;
 pub mod system_info;

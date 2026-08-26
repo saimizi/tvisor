@@ -57,6 +57,59 @@ U-Boot arguments and live DTB bytes
 must not contain `Fdt`, `Node`, `Property`, borrowed strings, or raw pointers.
 The platform layer converts parser-specific values into the owned types.
 
+Phase 4 implements the next layer in `tvisor_util/memory_map.rs`. It keeps the
+raw `SystemInfo` records unchanged for provenance and ownership diagnostics,
+then produces sorted and merged physical `RAM`, permanent `RESERVED`, temporary
+`HANDOFF`, `MMIO`, `INITIAL`, and post-takeover `USABLE` views. The normalized
+reservation unions intentionally have no owner: conflicting or overlapping
+ownership remains visible in the raw records.
+
+`INITIAL` excludes both permanent and handoff reservations and is the only map
+that may be used while execution still depends on U-Boot. `USABLE` excludes
+only permanent reservations and describes candidates after the explicit
+no-return takeover. Neither view itself transfers ownership or allocates
+pages.
+
+### 3.1 Reservation lifetimes and usable views
+
+`HANDOFF` and post-takeover `USABLE` are not disjoint classifications.
+`HANDOFF` records a temporary ownership constraint, whereas `USABLE` is the
+result obtained after that constraint expires. In set notation:
+
+```text
+INITIAL = RAM - RESERVED - HANDOFF
+
+USABLE_AFTER_TAKEOVER = RAM - RESERVED
+                      = INITIAL + reclaimable HANDOFF portions
+```
+
+Crossing the takeover boundary does not make every `HANDOFF` byte usable. A
+handoff region that also overlaps permanent `RESERVED` memory remains
+unavailable. Likewise, a handoff record outside a discovered RAM bank does not
+become allocatable RAM.
+
+On the current Raspberry Pi 4, the normalized map demonstrates the lifetime
+change:
+
+```text
+INITIAL
+  [0x30000000, 0x36b2b000)
+
+reclaimed from U-Boot after takeover
+  [0x36b2b000, 0x38000000)
+  [0x40000000, 0xfc000000)
+
+USABLE_AFTER_TAKEOVER
+  [0x30000000, 0x38000000)
+  [0x40000000, 0xfc000000)
+```
+
+The low `[0, 0x30000000)` interval is not absent because of U-Boot. The
+current conservative policy reserves the complete allocation window of an
+unplaced dynamic CMA request. It therefore remains outside `USABLE` even
+after takeover. Whether a standalone tvisor should retain that Linux-oriented
+CMA policy requires a separate ownership decision.
+
 The existing `ConsoleKind` and `ConsoleInfo` are platform facts rather than
 FDT parser mechanics. During Phase 1 they should move from `fdt.rs` to
 `system_info.rs`; `discover_console` can return the relocated type without

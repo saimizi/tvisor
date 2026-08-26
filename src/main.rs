@@ -6,10 +6,17 @@ use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
 use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
-use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
+use tvisor_util::fdt::{
+    discover_console, fdt_address_from_uboot_args, fdt_init, uboot_boot_allocations_from_args,
+    uboot_lmb_reservations_from_args,
+};
+use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::platform::discover_system_info;
 use tvisor_util::println;
-use tvisor_util::system_info::{ConsoleKind, PhysAddr, PhysRegion};
+use tvisor_util::system_info::{
+    ConsoleKind, PhysAddr, PhysRegion, ReservationAttributes, ReservationOrigin, ReservationOwner,
+    ReservedRegion,
+};
 
 unsafe extern "C" {
     static __image_start: u8;
@@ -175,7 +182,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
                     break 'diagnostic;
                 }
             };
-        let system_info = match discover_system_info(
+        let mut system_info = match discover_system_info(
             *fdt,
             PhysAddr::new(dtb_base as usize as u64),
             tvisor_image,
@@ -191,7 +198,50 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
             }
         };
 
+        let uboot_lmb = match unsafe { uboot_lmb_reservations_from_args(argc, argv) } {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                debug_mem_error(DebugMemError::PlatformDiscovery);
+                println!("Memory-map discovery failed: {}", error);
+                ret = 1;
+                break 'diagnostic;
+            }
+        };
+        let boot_allocations = match unsafe { uboot_boot_allocations_from_args(argc, argv) } {
+            Ok(allocations) => allocations,
+            Err(error) => {
+                debug_mem_error(DebugMemError::PlatformDiscovery);
+                println!("Memory-map discovery failed: {}", error);
+                ret = 1;
+                break 'diagnostic;
+            }
+        };
+        for region in uboot_lmb.iter().chain(boot_allocations.iter()) {
+            if let Err(error) = system_info.add_reserved(ReservedRegion {
+                region: *region,
+                origin: ReservationOrigin::Bootloader,
+                owner: ReservationOwner::Bootloader,
+                attributes: ReservationAttributes::default(),
+            }) {
+                debug_mem_error(DebugMemError::PlatformDiscovery);
+                println!("Memory-map discovery failed: {}", error);
+                ret = 1;
+                break 'diagnostic;
+            }
+        }
+
+        let memory_map = match MemoryMap::from_system_info(&system_info) {
+            Ok(map) => map,
+            Err(error) => {
+                debug_mem_error(DebugMemError::PlatformDiscovery);
+                println!("Memory-map normalization failed: {}", error);
+                ret = 1;
+                break 'diagnostic;
+            }
+        };
+
         println!("{}", system_info);
+        println!("{}", memory_map);
         println!("{}", diag_state);
     }
 
