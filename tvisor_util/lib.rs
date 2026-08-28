@@ -7,6 +7,7 @@ pub mod debug_util;
 pub mod diag;
 
 pub mod aarch64_reg;
+pub mod boot_mode;
 pub mod fdt;
 pub mod memory_map;
 pub mod platform;

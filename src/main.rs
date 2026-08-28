@@ -4,6 +4,7 @@
 use core::arch::global_asm;
 use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
+use tvisor_util::boot_mode::takeover_request_from_args;
 use tvisor_util::debug_util::{DebugMemError, debug_fini, debug_init, debug_mem_error};
 use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
 use tvisor_util::fdt::{
@@ -17,6 +18,9 @@ use tvisor_util::system_info::{
     ConsoleKind, PhysAddr, PhysRegion, ReservationAttributes, ReservationOrigin, ReservationOwner,
     ReservedRegion,
 };
+
+mod boot;
+mod exception;
 
 unsafe extern "C" {
     static __image_start: u8;
@@ -122,6 +126,15 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         console.registers.start().value(),
         console.registers.size()
     );
+
+    let takeover = match unsafe { takeover_request_from_args(argc, argv) } {
+        Ok(request) => request,
+        Err(error) => {
+            println!("Invalid boot mode: {}", error);
+            debug_fini();
+            return 1;
+        }
+    };
 
     let mut ret = 0_isize;
     'diagnostic: {
@@ -243,6 +256,15 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         println!("{}", system_info);
         println!("{}", memory_map);
         println!("{}", diag_state);
+    }
+
+    if ret == 0
+        && let Some(request) = takeover
+    {
+        println!("Entering Phase 6 no-return path...");
+        // SAFETY: The explicit takeover argument authorizes abandoning the
+        // U-Boot stack after all diagnostic validation has succeeded.
+        unsafe { boot::enter_private_el2(request.test_sync_fault) }
     }
 
     debug_fini();
