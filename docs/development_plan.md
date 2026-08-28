@@ -523,8 +523,7 @@ At minimum, the design must decide:
 
 ### Files and modules
 
-- Expand this design in a dedicated memory-map document or a reviewed section
-  of `docs/execution_environment.md` if that document is added.
+- Review and refine the draft in `docs/tvisor_memory_map.md`.
 - Update `docs/address_translation.md` only for architectural clarification,
   not board-specific layout constants.
 - Plan future `src/mm.rs`, `src/exception.rs`, and linker-script changes.
@@ -561,6 +560,8 @@ that preserves and restores U-Boot's stack and callee-saved state.
 
 ### Files and modules
 
+- Follow the reviewed foundation design in
+  `docs/private_el2_foundations.md`.
 - Add `src/boot.rs` for the assembly/Rust boundary and entry modes.
 - Add `src/exception.rs` and vector assembly.
 - Add stack and vector sections/symbols to `scripts/rpi.ld`.
@@ -606,6 +607,8 @@ valid under both the old and new regimes.
 
 ### Files and modules
 
+- Review the transition design in `docs/el2_page_table_transition.md` before
+  implementing any control-register writes.
 - Add `src/mm.rs` and, if useful, reusable descriptor helpers under
   `tvisor_util`.
 - Extend `src/boot.rs` with the synchronized table-switch routine.

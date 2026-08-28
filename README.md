@@ -155,6 +155,9 @@ another test.
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)
+- [Draft tvisor EL2 memory map](docs/tvisor_memory_map.md)
+- [Private EL2 foundations](docs/private_el2_foundations.md)
+- [EL2 page-table transition](docs/el2_page_table_transition.md)
 - [U-Boot handoff-state diagnostics](docs/check_handoff_state.md)
 - [Peripheral address translation](docs/peripheral_address_translation.md)
 
