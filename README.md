@@ -13,11 +13,11 @@ U-Boot and eventually run guest virtual machines. The current implementation:
 - initializes the DTB-selected mini UART for diagnostics;
 - records RAM, firmware reservations, MMIO windows, CPUs, and console data;
 - distinguishes permanent reservations from temporary U-Boot handoff memory;
-  and
-- derives pre-takeover and post-takeover usable-RAM maps without a heap.
+- derives pre-takeover and post-takeover usable-RAM maps without a heap; and
+- installs a private stack, exception vectors, and EL2 stage-1 page tables.
 
-Tvisor does not run a guest VM yet. It prints diagnostic information and
-currently returns to U-Boot after completing its checks.
+Tvisor does not run a guest VM yet. After validating the handoff, it takes
+ownership of EL2 and does not return to U-Boot.
 
 ## Requirements
 
@@ -131,6 +131,16 @@ prefix.
 `lmb=` and `bootmem=` describe temporary U-Boot ownership. They refine the
 `INITIAL` map but never reduce the final post-takeover `USABLE` map.
 
+Tvisor always installs its own EL2 stage-1 tables. An optional `fault=`
+argument selects a post-switch test:
+
+```text
+fault=none       no deliberate fault (default)
+fault=sync       execute BRK #0x600 and return through the EL2 handler
+fault=guard      write the unmapped stack guard and halt in the handler
+fault=unmapped   read an unmapped virtual address and halt in the handler
+```
+
 ### 5. Check the result
 
 A successful run should print:
@@ -139,15 +149,16 @@ A successful run should print:
 - discovered RAM, reservations, MMIO translations, CPUs, and console;
 - normalized `RESERVED`, `HANDOFF`, `INITIAL`, and `USABLE` regions;
 - inherited EL2 register state; and
-- U-Boot's successful return message:
+- the private-environment checkpoints:
 
 ```text
-## Application terminated, rc = 0x0
-U-Boot>
+Phase 7 checkpoint 2: tvisor EL2 page tables active
+Phase 7 checkpoint 3: register, stack, and image validation passed
+Phase 7 checkpoint complete; halting
 ```
 
-If the board stops responding, recover it by power-cycling before attempting
-another test.
+The final halt is intentional. Reset or power-cycle the board before another
+test; there is no return path to the U-Boot prompt.
 
 ## Documentation
 

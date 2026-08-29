@@ -5,14 +5,14 @@
 | `0x0000_0000–0x3800_0000` | `0x0000_0000–0x0000_1000` | 4 KiB | Reserved | DTB-reserved low page | `0x0000_0000` is the beginning of the first DTB RAM bank; this page is excluded permanently |
 |  | `0x0000_1000–0x0400_0000` | 65,532 KiB | RAM | Unassigned low RAM | Inside the dynamic reservation's allocation window, so the current conservative allocator does not use it |
 |  | `0x0400_0000–0x0400_1000` | 4 KiB | Tvisor image | ELF headers and alignment | Also contained in the raw ELF downloaded by U-Boot |
-|  | `0x0400_1000–0x0404_5000` | 272 KiB | Tvisor image | Executable `.text` | Read-only and executable under the Phase 7 table policy |
-|  | `0x0404_5000–0x0404_6000` | 4 KiB | Tvisor image | EL2 exception-vector page | First 2 KiB contains the 16 vector slots; `VBAR_EL2 = 0x0404_5000` |
-|  | `0x0404_6000–0x0406_1000` | 108 KiB | Tvisor image | `.rodata` and unwind data | Read-only and execute-never under the Phase 7 table policy |
-|  | `0x0406_1000–0x0406_2000` | 4 KiB | Tvisor image | `.data`, `.got`, and `.bss` | Read/write and execute-never under the Phase 7 table policy |
-|  | `0x0406_2000–0x0406_3000` | 4 KiB | Tvisor guard | Unmapped boot-stack guard | Deliberately has no Phase 7 descriptor |
-|  | `0x0406_3000–0x0407_3000` | 64 KiB | Tvisor stack | Private EL2 boot stack | Initial `SP` is `0x0407_3000`; the stack grows downward |
-|  | `0x0407_3000–0x0431_47e0` | ≈2.631 MiB | U-Boot handoff | Raw ELF staging bytes outside the tvisor runtime image | Reclaimable after no-return takeover; the end changes with `${filesize}` |
-|  | `0x0431_47e0–0x2eff_1000` | ≈684.861 MiB | RAM | Unassigned low RAM | The portion below `0x3000_0000` is currently excluded by the conservative dynamic-reservation policy |
+|  | `0x0400_1000–0x0404_4000` | 268 KiB | Tvisor image | Executable `.text` | Read-only and executable under the Phase 7 table policy |
+|  | `0x0404_4000–0x0404_5000` | 4 KiB | Tvisor image | EL2 exception-vector page | First 2 KiB contains the 16 vector slots; `VBAR_EL2 = 0x0404_4000` |
+|  | `0x0404_5000–0x0405_f000` | 104 KiB | Tvisor image | `.rodata` and unwind data | Read-only and execute-never under the Phase 7 table policy |
+|  | `0x0405_f000–0x0406_0000` | 4 KiB | Tvisor image | `.data`, `.got`, and `.bss` | Read/write and execute-never under the Phase 7 table policy |
+|  | `0x0406_0000–0x0406_1000` | 4 KiB | Tvisor guard | Unmapped boot-stack guard | Deliberately has no Phase 7 descriptor |
+|  | `0x0406_1000–0x0407_1000` | 64 KiB | Tvisor stack | Private EL2 boot stack | Initial `SP` is `0x0407_1000`; the stack grows downward |
+|  | `0x0407_1000–0x0430_f690` | ≈2.619 MiB | U-Boot handoff | Raw ELF staging bytes outside the tvisor runtime image | Reclaimable after no-return takeover; the end changes with `${filesize}` |
+|  | `0x0430_f690–0x2eff_1000` | ≈684.882 MiB | RAM | Unassigned low RAM | The portion below `0x3000_0000` is currently excluded by the conservative dynamic-reservation policy |
 |  | `0x2eff_1000–0x2f00_0000` | 60 KiB | U-Boot handoff | Pages containing the live DTB | DTB blob begins at `0x2eff_1f00`; reclaimable after required information is copied |
 |  | `0x2f00_0000–0x3000_0000` | 16 MiB | RAM | Unassigned low RAM | Currently excluded by the conservative dynamic-reservation policy |
 |  | `0x3000_0000–0x3001_0000` | 64 KiB | Tvisor page tables | Phase 7 bootstrap table arena | Permanently reserved; the builder records the number of pages actually used |

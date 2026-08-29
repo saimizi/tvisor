@@ -41,8 +41,7 @@ __enter_private_el2:
 
 unsafe extern "C" {
     fn __enter_private_el2(
-        test_sync_fault: u64,
-        switch_page_tables: u64,
+        fault_test: u64,
         mair_el2: u64,
         tcr_el2: u64,
         ttbr0_el2: u64,
@@ -50,16 +49,11 @@ unsafe extern "C" {
     ) -> !;
 }
 
-pub unsafe fn enter_private_el2(
-    fault_test: FaultTest,
-    switch_page_tables: bool,
-    registers: El2RegisterValues,
-) -> ! {
+pub unsafe fn enter_private_el2(fault_test: FaultTest, registers: El2RegisterValues) -> ! {
     // SAFETY: The caller accepts the documented no-return state transition.
     unsafe {
         __enter_private_el2(
             fault_test as u64,
-            u64::from(switch_page_tables),
             registers.mair_el2,
             registers.tcr_el2,
             registers.ttbr0_el2,
@@ -70,8 +64,7 @@ pub unsafe fn enter_private_el2(
 
 #[unsafe(no_mangle)]
 extern "C" fn private_el2_main(
-    test_sync_fault: u64,
-    switch_page_tables: u64,
+    fault_test: u64,
     mair_el2: u64,
     tcr_el2: u64,
     ttbr0_el2: u64,
@@ -85,23 +78,10 @@ extern "C" fn private_el2_main(
     if let Some(vbar) = VbarEl2::dump() {
         println!("VBAR_EL2: {:#018x}", vbar.value);
     }
-    if switch_page_tables != 0 {
-        println!("Phase 7 checkpoint 1: switching EL2 page tables");
-        // SAFETY: All values were validated before takeover, table stores were
-        // published, and this routine never returns to the inherited regime.
-        unsafe {
-            __switch_el2_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2, test_sync_fault)
-        }
-    }
-    if test_sync_fault == FaultTest::Sync as u64 {
-        println!("Triggering deliberate synchronous exception...");
-        unsafe { asm!("brk #0x600") };
-        println!("Returned from deliberate synchronous exception");
-    }
-    println!("Phase 6 checkpoint complete; halting");
-    loop {
-        unsafe { asm!("wfe", options(nomem, nostack)) };
-    }
+    println!("Phase 7 checkpoint 1: switching EL2 page tables");
+    // SAFETY: All values were validated before takeover, table stores were
+    // published, and this routine never returns to the inherited regime.
+    unsafe { __switch_el2_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2, fault_test) }
 }
 
 global_asm!(

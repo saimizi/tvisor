@@ -34,8 +34,8 @@ U-Boot's old tables and tvisor's new tables.
 
 ## 3. Preconditions checked before takeover
 
-The returnable diagnostic path prepares the transition and rejects it before
-the no-return boundary unless:
+The U-Boot handoff path prepares the transition and halts before the no-return
+boundary unless:
 
 - `CurrentEL` is EL2;
 - execution is little-endian;
@@ -47,8 +47,9 @@ the no-return boundary unless:
 - a 64 KiB bootstrap table arena fits in normalized `INITIAL` RAM; and
 - every mandatory mapping passes the software table walker.
 
-Failure here prints an error and may still return to U-Boot. Once the private
-EL2 entry is taken, failure is fatal and requires a reset or power cycle.
+Failure here prints an error when UART is available and halts. Once the private
+EL2 entry is taken, failure is likewise fatal and requires a reset or power
+cycle. Tvisor has no path back to U-Boot.
 
 ## 4. Translation geometry
 
@@ -179,19 +180,17 @@ Success ends in a `WFE` loop. There is intentionally no path back to U-Boot.
 
 ## 10. Runtime test arguments
 
-The takeover parser keeps table installation explicit:
+Tvisor always takes over EL2 and installs its page tables. The parser accepts
+only an optional post-switch fault test:
 
 | Argument | Meaning |
 | --- | --- |
-| `mode=takeover mmu=inherit` | Use the private Phase 6 stack/vectors but retain U-Boot's tables |
-| `mode=takeover mmu=switch` | Install tvisor's EL2 stage-1 tables |
 | `fault=none` | Do not trigger a deliberate fault |
 | `fault=sync` | Execute `BRK #0x600`; the handler advances `ELR_EL2` and returns with `eret` |
 | `fault=guard` | Write to the unmapped stack-guard page; report and halt |
 | `fault=unmapped` | Read VA `0x2000_0000`; report and halt |
 
-`fault=guard` and `fault=unmapped` are rejected unless `mmu=switch` is also
-selected. Each no-return or deliberate-fault test must begin from a fresh
+Each run, including a run without a deliberate fault, must begin from a fresh
 board boot.
 
 ## 11. Hardware results
