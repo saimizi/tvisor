@@ -330,37 +330,17 @@ The stack must be 16-byte aligned at an AArch64 public interface. Because this
 milestone returns to `bootelf`, it continues using U-Boot's current stack and
 does not change `SP`, `SP_EL0`, `SP_EL2`, or `SPSel`.
 
-## 6. Debug error stack
+## 6. Error reporting
 
-The byte-oriented error stack is private tvisor runtime state stored in the
-linker-owned .bss section:
+The original returnable diagnostic stored byte-sized error codes in a private
+`.bss` stack for later inspection from U-Boot. Tvisor now performs an
+unconditional no-return takeover, and no consumer reads that private state, so
+the error stack has been removed.
 
-~~~
-Entry size:  1 byte
-Capacity:    256 error entries
-Ordering:    chronological
-Terminator:  first 0x00 byte
-Overflow:    retain the first 256 entries; do not wrap
-~~~
-
-The assembly entry clears .bss before Rust starts. After DTB parsing and
-console discovery, debug_init() resets the cursor and clears the entries.
-No diagnostic write targets a fixed physical address such as 0x1000.
-
-Pre-UART failures cannot be appended or printed. They are returned directly to
-U-Boot as distinct status codes:
-
-| Value | Meaning |
-| --- | --- |
-| 0x10 | Invalid or missing U-Boot fdt= argument |
-| 0x11 | DTB validation failed |
-| 0x12 | Console discovery or address translation failed |
-
-After UART initialization, the error stack records diagnostic events such as
-invalid EL2 state or UART timeouts. It is not an external memory ABI and is not
-inspected with U-Boot md.b. A future exported diagnostic record should receive
-an explicit linker symbol and documented lifetime instead of relying on an
-unrelated low-memory address.
+After UART initialization, failures are reported directly through the serial
+console and tvisor halts. Failures before UART discovery halt silently. A
+future persistent crash record, if needed, should use an explicitly reserved
+region with a documented format and lifetime.
 
 ## 7. Ownership by milestone
 

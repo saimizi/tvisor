@@ -110,7 +110,7 @@ impl core::fmt::Display for DiagState {
         if let Some(v) = self.hcr_el2.as_ref() {
             writeln!(
                 f,
-                "  HCR_EL2: {:#018x} VM={} PTW={} FMO={} IMO={} AMO={} VF={} VI={} VSE={} TWI={} TWE={} TTLB={} TVM={} TGE={} HCD={} TRVM={} RW={}",
+                "  HCR_EL2: {:#018x} VM={} PTW={} FMO={} IMO={} AMO={} VF={} VI={} VSE={} TWI={} TWE={} TTLB={} TVM={} TGE={} HCD={} TRVM={} RW={} E2H={}",
                 v.value,
                 v.bit_vm(),
                 v.bit_ptw(),
@@ -128,6 +128,7 @@ impl core::fmt::Display for DiagState {
                 v.bit_hcd(),
                 v.bit_trvm(),
                 v.bit_rw(),
+                v.bit_e2h(),
             )?;
         }
 

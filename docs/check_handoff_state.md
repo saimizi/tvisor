@@ -29,7 +29,7 @@ During this phase tvisor may:
 - read architectural system registers available at EL2;
 - copy their values into an ordinary Rust snapshot on the current stack;
 - decode and print the values through the inherited mini UART;
-- append invariant failures to the debug error stack;
+- report invariant failures through the inherited mini UART;
 - read the current SP and check its alignment.
 
 It must not:
@@ -46,8 +46,7 @@ It must not:
 - retain pointers into the U-Boot stack after returning.
 
 The only intentionally modified external state is bytes transmitted through
-the DTB-selected UART. The diagnostic error stack is stored inside tvisor's
-linker-owned .bss; it does not write to an unrelated fixed physical address.
+the DTB-selected UART.
 
 The UART must be drained before returning to U-Boot.
 
@@ -63,7 +62,7 @@ The implementation order is fixed:
 5. Print DTB identity and the resolved console information.
 6. Capture the readable handoff registers into a local snapshot.
 7. Validate the invariants defined as errors in this document.
-8. Append failed post-console invariants to the linker-owned error stack.
+8. Print failed post-console invariants through UART.
 9. Print all raw values and selected decoded fields through UART.
 10. Drain UART output and return the diagnostic status.
 
@@ -75,8 +74,7 @@ range is readable.
 
 ## 4. Snapshot model
 
-The snapshot is a temporary Rust value. The byte error stack is private runtime
-state stored in tvisor's linker-owned .bss; it is not a fixed low-memory ABI.
+The snapshot is a temporary Rust value.
 
 The conceptual snapshot is:
 
@@ -1086,13 +1084,11 @@ tvisor handoff diagnostic
   CNTVOFF_EL2     0x................
   ID_AA64PFR0_EL1 0x................  EL2=. FP=. AdvSIMD=. GIC=.
   ID_AA64MMFR0_EL1 0x...............  PARange=. ASIDBits=. TG4=. TG16=. TG64=.
-  fatal_errors    <count>
   state_unchanged <yes|no>
 ```
 
 Formatting must not allocate. Existing `core::fmt` UART output is sufficient.
-If a transmit timeout occurs, `UartTxTimeout` remains available in the memory
-error stack even though the text report is incomplete.
+If UART transmission fails, the text report may be incomplete.
 
 ## 10. Return policy
 
@@ -1105,11 +1101,9 @@ Return zero only when:
 - the processor reports EL2 support;
 - no stable inherited register changed.
 
-UART failures remain recorded in the error stack. A UART drain failure occurs
-during finalization, so the implementation must decide the return code after
-`debug_fini()` or have `debug_fini()` return a result. The design treats UART
-TX and drain failures as diagnostic failures and therefore expects a nonzero
-return status.
+The old returnable milestone treated UART TX and drain failures as diagnostic
+failures. The current no-return implementation performs a best-effort drain
+before halting and does not maintain a separate memory error stack.
 
 ## 11. Validation on Raspberry Pi 4
 

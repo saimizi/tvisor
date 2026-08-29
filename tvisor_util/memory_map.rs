@@ -34,12 +34,45 @@ impl fmt::Display for MemoryMapError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// Normalized physical-address classification derived from [`SystemInfo`].
+///
+/// Every list is sorted and has overlapping or adjacent regions merged. The
+/// two usable-RAM views describe different ownership points in the boot
+/// transition: `initial_usable_ram` is safe while U-Boot resources are still
+/// live, whereas `usable_ram` is the candidate RAM after no-return takeover.
 pub struct MemoryMap {
+    /// Physical RAM reported by the platform, excluding firmware carve-outs.
+    ///
+    /// This is the containing RAM inventory, not an allocation list; regions
+    /// in either reservation list must still be excluded before use.
     ram: FixedList<PhysRegion, MAX_RAM_REGIONS>,
+    /// RAM that remains unavailable after tvisor takes ownership.
+    ///
+    /// This includes permanent DTB/firmware reservations and the possible
+    /// placement windows of dynamic reservations whose placement tvisor does
+    /// not yet control. These regions are subtracted from both usable views.
     permanent_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
+    /// Handoff-time reservations owned by U-Boot or containing the source DTB.
+    ///
+    /// They must not be overwritten while tvisor might return to U-Boot or
+    /// still borrow handoff data. They become reclaimable only after the
+    /// explicit no-return boundary and after all required data is owned.
     transition_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
+    /// CPU physical-address windows classified as MMIO rather than RAM.
+    ///
+    /// These regions are never allocator input and must be mapped with Device
+    /// attributes when tvisor needs to access them.
     mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS>,
+    /// RAM safe for bootstrap allocations before the no-return takeover.
+    ///
+    /// It is `ram` minus both permanent and transition reservations. Phase 7
+    /// obtains its bootstrap page-table arena from this conservative view.
     initial_usable_ram: FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS>,
+    /// RAM potentially allocatable after tvisor has completed takeover.
+    ///
+    /// It is `ram` minus permanent reservations only. Transition-reserved
+    /// ranges appear here because they can eventually be reclaimed, but a
+    /// future allocator must wait for their individual lifetime conditions.
     usable_ram: FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS>,
 }
 

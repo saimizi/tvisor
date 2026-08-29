@@ -6,8 +6,9 @@ Phase 7 replaces U-Boot's active EL2 stage-1 translation regime with tables
 owned by tvisor. It consumes the reviewed Phase 5 identity map and the private
 stack/vector foundations from Phase 6.
 
-This path is explicitly no-return. The diagnostic path does not build, install,
-or test these tables. Guest stage 2 remains disabled throughout Phase 7.
+This path is explicitly no-return. Tvisor always builds and installs these
+tables after validating the U-Boot handoff. Guest stage 2 remains disabled
+throughout Phase 7.
 
 The work is split into independently testable parts:
 
@@ -34,8 +35,7 @@ The takeover path must stop before writing registers unless all of these hold:
 - all mandatory identity mappings pass a software table walk.
 
 Failure before the no-return boundary uses the diagnostic error path and
-returns to U-Boot. Failure after it enters the private exception handler and
-halts.
+halts. Failure after it enters the private exception handler and also halts.
 
 ## 3. Bootstrap table storage
 
@@ -117,8 +117,9 @@ Leaf descriptors set:
 - `SH = Inner Shareable` for Normal memory;
 - `AttrIdx = 0` for Normal WB/WA or `1` for Device-nGnRE;
 - EL2 read-only or read/write access as requested;
-- `UXN = 1`; and
-- `PXN = 1` except for executable text and vectors.
+- `XN = 1` for non-executable mappings and `XN = 0` only for executable text
+  and vectors. In the EL2 translation regime this is descriptor bit 54; the
+  EL0/EL1 regime's `PXN` interpretation must not be used by the EL2 walker.
 
 Table descriptors contain only a validated next-table PA and required table
 type bits. Software-owned or reserved bits remain zero. Descriptor creation
@@ -135,6 +136,7 @@ MAIR_EL2
   Attr1 = 0x04  Device-nGnRE
 
 TCR_EL2
+  RES1  = bits 31 and 23
   T0SZ  = 25    39-bit VA
   TG0   = 0b00  4 KiB
   SH0   = 0b11  Inner Shareable
@@ -300,14 +302,12 @@ boot layer, never in the layout calculator.
 
 ### Raspberry Pi 4
 
-1. Re-run the diagnostic-return path after a fresh reset.
-2. Run a table-build/dump mode that still returns to U-Boot.
-3. Run takeover mode and verify the fixed post-switch checkpoint.
-4. Read back and print the active registers and stack pointer.
-5. On separate fresh boots, verify guard-page and unmapped-VA faults.
+1. Boot from a fresh reset and verify the fixed post-switch checkpoint.
+2. Read back and print the active registers and stack pointer.
+3. On separate fresh boots, verify guard-page and unmapped-VA faults.
 
-Every takeover test is opt-in, no-return, and performed only while verified
-power recovery is available.
+Every test is no-return and performed only while verified power recovery is
+available.
 
 ## 14. Open review questions
 
@@ -326,4 +326,3 @@ power recovery is available.
 
 - Arm, [Learn the Architecture: Memory Management](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf).
 - Arm, [Arm Architecture Reference Manual for A-profile architecture](https://developer.arm.com/documentation/ddi0487/latest/).
-
