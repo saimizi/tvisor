@@ -222,6 +222,17 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         println!("{}", memory_map);
         println!("{}", diag_state);
 
+        let live_dtb = match PhysRegion::new(
+            PhysAddr::new(dtb_base as usize as u64),
+            fdt.data().len() as u64,
+        ) {
+            Ok(region) => region,
+            Err(error) => {
+                println!("Phase 8 allocator preparation failed: invalid DTB region: {error}");
+                stop();
+            }
+        };
+
         // Check whether 4 KiB translation granules are supported.
         let Some(mmfr0) = diag_state.id_aa64mmfr0_el1 else {
             println!("Phase 7 table preparation failed: PARange is unavailable");
@@ -250,6 +261,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
             &memory_map,
             console.registers.start().value(),
             mmfr0.parange(),
+            live_dtb,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -270,6 +282,10 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     println!(
         " TTBR0_EL2={:#018x} SCTLR_EL2={:#018x}",
         prepared.registers.ttbr0_el2, prepared.registers.sctlr_el2
+    );
+    println!(
+        "Phase 8 allocator prepared: regions={} pages={} reclaimed_test={:?}",
+        prepared.allocator_regions, prepared.allocator_pages, prepared.reclaimed_test_page
     );
     println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to

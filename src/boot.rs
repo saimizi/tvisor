@@ -5,8 +5,9 @@ use core::{
 
 use tvisor_util::aarch64_reg::{MairEl2, SctlrEl2, Sp, SpSel, TcrEl2, Ttbr0El2, VbarEl2};
 use tvisor_util::boot_mode::FaultTest;
-use tvisor_util::el2_translation::El2RegisterValues;
+use tvisor_util::el2_translation::{El2RegisterValues, PAGE_SIZE};
 use tvisor_util::println;
+use tvisor_util::system_info::PhysRegion;
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
@@ -177,6 +178,7 @@ extern "C" fn phase7_post_switch(
         0x5037_7772_6974_6162
     );
     println!("Phase 7 checkpoint 3: register, stack, and image validation passed");
+    phase8_allocator_test();
     if fault_test == FaultTest::Sync as u64 {
         println!("Triggering deliberate synchronous exception under tvisor tables...");
         unsafe { asm!("brk #0x600") };
@@ -206,4 +208,61 @@ extern "C" fn phase7_post_switch(
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
+}
+
+fn phase8_allocator_test() {
+    let initial = crate::mm::phase8_initialize().expect("Phase 8 allocator initialization");
+    println!(
+        "Phase 8 allocator active: total={} allocated={} free={}",
+        initial.total_pages, initial.allocated_pages, initial.free_pages
+    );
+
+    let low_region = crate::mm::allocator_region(0).expect("Phase 8 low allocator region");
+    let mut last_index = 0;
+    while crate::mm::allocator_region(last_index + 1).is_some() {
+        last_index += 1;
+    }
+    let high_region =
+        crate::mm::allocator_region(last_index).expect("Phase 8 high allocator region");
+    let low = crate::mm::allocate_page_in(low_region).expect("allocate low test page");
+    let high = crate::mm::allocate_page_in(high_region).expect("allocate high test page");
+    assert_ne!(low, high);
+
+    let reclaimed_base = crate::mm::reclaimed_test_page().expect("reclaimed U-Boot test page");
+    let reclaimed_region =
+        PhysRegion::new(reclaimed_base, PAGE_SIZE).expect("reclaimed page region");
+    let reclaimed =
+        crate::mm::allocate_page_in(reclaimed_region).expect("allocate reclaimed U-Boot page");
+    assert_ne!(reclaimed, low);
+    assert_ne!(reclaimed, high);
+
+    for (page, pattern) in [
+        (low, 0x5038_4c4f_5750_4147_u64),
+        (high, 0x5038_4849_4748_5047_u64),
+        (reclaimed, 0x5038_5245_434c_4149_u64),
+    ] {
+        let pointer = page.value() as *mut u64;
+        // SAFETY: the allocator returned a mapped, exclusively owned Normal
+        // RAM page. Volatile accesses force the hardware validation traffic.
+        unsafe {
+            core::ptr::write_volatile(pointer, pattern);
+            assert_eq!(core::ptr::read_volatile(pointer), pattern);
+        }
+    }
+    println!(
+        "Phase 8 page test: low={} high={} reclaimed={}",
+        low, high, reclaimed
+    );
+
+    crate::mm::free_page(low).expect("free low test page");
+    crate::mm::free_page(high).expect("free high test page");
+    crate::mm::free_page(reclaimed).expect("free reclaimed test page");
+    let reused = crate::mm::allocate_page().expect("reallocate first-fit page");
+    assert_eq!(reused, low);
+    crate::mm::free_page(reused).expect("free reused page");
+
+    let final_stats = crate::mm::allocator_stats().expect("Phase 8 allocator statistics");
+    assert_eq!(final_stats.allocated_pages, 0);
+    assert_eq!(final_stats.free_pages, final_stats.total_pages);
+    println!("Phase 8 checkpoint complete: allocator validation passed");
 }
