@@ -5,7 +5,18 @@ const MAX_ARG_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TakeoverRequest {
-    pub test_sync_fault: bool,
+    pub fault_test: FaultTest,
+    pub switch_page_tables: bool,
+}
+
+#[repr(u64)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FaultTest {
+    #[default]
+    None = 0,
+    Sync = 1,
+    Guard = 2,
+    Unmapped = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +30,10 @@ pub enum BootModeError {
     DuplicateFault,
     UnknownFault,
     FaultWithoutTakeover,
+    DuplicateMmu,
+    UnknownMmu,
+    MmuWithoutTakeover,
+    TranslationFaultWithoutMmuSwitch,
 }
 
 impl fmt::Display for BootModeError {
@@ -31,7 +46,8 @@ pub fn parse_mode<'a>(
     arguments: impl IntoIterator<Item = &'a [u8]>,
 ) -> Result<Option<TakeoverRequest>, BootModeError> {
     let mut takeover = None;
-    let mut sync_fault = None;
+    let mut fault_test = None;
+    let mut switch_page_tables = None;
     for argument in arguments {
         if let Some(value) = argument.strip_prefix(b"mode=") {
             if takeover.is_some() {
@@ -44,20 +60,45 @@ pub fn parse_mode<'a>(
             });
         }
         if let Some(value) = argument.strip_prefix(b"fault=") {
-            if sync_fault.is_some() {
+            if fault_test.is_some() {
                 return Err(BootModeError::DuplicateFault);
             }
-            sync_fault = Some(match value {
-                b"none" => false,
-                b"sync" => true,
+            fault_test = Some(match value {
+                b"none" => FaultTest::None,
+                b"sync" => FaultTest::Sync,
+                b"guard" => FaultTest::Guard,
+                b"unmapped" => FaultTest::Unmapped,
                 _ => return Err(BootModeError::UnknownFault),
             });
         }
+        if let Some(value) = argument.strip_prefix(b"mmu=") {
+            if switch_page_tables.is_some() {
+                return Err(BootModeError::DuplicateMmu);
+            }
+            switch_page_tables = Some(match value {
+                b"inherit" => false,
+                b"switch" => true,
+                _ => return Err(BootModeError::UnknownMmu),
+            });
+        }
     }
-    match (takeover.unwrap_or(false), sync_fault.unwrap_or(false)) {
-        (false, true) => Err(BootModeError::FaultWithoutTakeover),
-        (false, false) => Ok(None),
-        (true, test_sync_fault) => Ok(Some(TakeoverRequest { test_sync_fault })),
+    match (
+        takeover.unwrap_or(false),
+        fault_test.unwrap_or_default(),
+        switch_page_tables.unwrap_or(false),
+    ) {
+        (false, FaultTest::Sync | FaultTest::Guard | FaultTest::Unmapped, _) => {
+            Err(BootModeError::FaultWithoutTakeover)
+        }
+        (false, FaultTest::None, true) => Err(BootModeError::MmuWithoutTakeover),
+        (false, FaultTest::None, false) => Ok(None),
+        (true, FaultTest::Guard | FaultTest::Unmapped, false) => {
+            Err(BootModeError::TranslationFaultWithoutMmuSwitch)
+        }
+        (true, fault_test, switch_page_tables) => Ok(Some(TakeoverRequest {
+            fault_test,
+            switch_page_tables,
+        })),
     }
 }
 
@@ -68,7 +109,12 @@ pub fn parse_mode<'a>(
 ///     takeover: execute takeover mode which doesn't return to u-boot
 /// fault: only usable for `takeover` mode
 ///     sync: execute exception handler test by executing brk#0x600
+///     guard: deliberately write the unmapped private-stack guard page
+///     unmapped: deliberately read a representative unmapped VA
 ///     none: do nothing
+/// mmu: only usable for `takeover` mode
+///     inherit: retain U-Boot's active EL2 stage-1 tables
+///     switch: install tvisor's EL2 stage-1 tables
 ///
 /// # Safety
 ///
@@ -116,7 +162,15 @@ mod tests {
         assert_eq!(
             parse_mode([b"mode=takeover".as_slice(), b"fault=sync".as_slice()]),
             Ok(Some(TakeoverRequest {
-                test_sync_fault: true
+                fault_test: FaultTest::Sync,
+                switch_page_tables: false,
+            }))
+        );
+        assert_eq!(
+            parse_mode([b"mode=takeover".as_slice(), b"mmu=switch".as_slice()]),
+            Ok(Some(TakeoverRequest {
+                fault_test: FaultTest::None,
+                switch_page_tables: true,
             }))
         );
     }
@@ -130,6 +184,14 @@ mod tests {
         assert_eq!(
             parse_mode([b"mode=takeover".as_slice(), b"mode=diagnostic".as_slice()]),
             Err(BootModeError::DuplicateMode)
+        );
+        assert_eq!(
+            parse_mode([b"mmu=switch".as_slice()]),
+            Err(BootModeError::MmuWithoutTakeover)
+        );
+        assert_eq!(
+            parse_mode([b"mode=takeover".as_slice(), b"fault=guard".as_slice()]),
+            Err(BootModeError::TranslationFaultWithoutMmuSwitch)
         );
     }
 }

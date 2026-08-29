@@ -21,6 +21,7 @@ use tvisor_util::system_info::{
 
 mod boot;
 mod exception;
+mod mm;
 
 unsafe extern "C" {
     static __image_start: u8;
@@ -137,6 +138,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
     };
 
     let mut ret = 0_isize;
+    let mut phase7_tables = None;
     'diagnostic: {
         // Validate the execution level before reading any trap-sensitive
         // registers. In particular, ID-group register reads performed at EL1
@@ -256,15 +258,81 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> isize {
         println!("{}", system_info);
         println!("{}", memory_map);
         println!("{}", diag_state);
+
+        if takeover.is_some() {
+            // Check whether support 4KiB page table
+            let Some(mmfr0) = diag_state.id_aa64mmfr0_el1 else {
+                println!("Phase 7 table preparation failed: PARange is unavailable");
+                ret = 1;
+                break 'diagnostic;
+            };
+            if mmfr0.tgran4() != 0 {
+                println!("Phase 7 requires 4 KiB translation-granule support");
+                ret = 1;
+                break 'diagnostic;
+            }
+            if takeover.is_some_and(|request| request.switch_page_tables) {
+                let Some(hcr) = diag_state.hcr_el2 else {
+                    println!("Phase 7 cannot validate HCR_EL2");
+                    ret = 1;
+                    break 'diagnostic;
+                };
+                // Make sure
+                // * stage-2 translation is disabled (HCR_EL2.VM=0).
+                // * VHE is disabled (HCR_EL2.E2H = 0)
+                if hcr.bit_vm() || hcr.bit_e2h() {
+                    println!(
+                        "Phase 7 requires HCR_EL2.VM=0 and E2H=0 (VM={} E2H={})",
+                        hcr.bit_vm(),
+                        hcr.bit_e2h()
+                    );
+                    ret = 1;
+                    break 'diagnostic;
+                }
+            }
+            match mm::prepare(
+                &memory_map,
+                console.registers.start().value(),
+                mmfr0.parange(),
+            ) {
+                Ok(prepared) => {
+                    println!(
+                        "Phase 7 tables prepared: arena=[{:#018x}, {:#018x}) pages={}",
+                        prepared.arena_start, prepared.arena_end, prepared.used_pages
+                    );
+                    println!(
+                        "  MAIR_EL2={:#018x} TCR_EL2={:#018x}",
+                        prepared.registers.mair_el2, prepared.registers.tcr_el2
+                    );
+                    println!(
+                        " TTBR0_EL2={:#018x} SCTLR_EL2={:#018x}",
+                        prepared.registers.ttbr0_el2, prepared.registers.sctlr_el2
+                    );
+                    phase7_tables = Some(prepared);
+                }
+                Err(error) => {
+                    println!("Phase 7 table preparation failed: {}", error);
+                    ret = 1;
+                    break 'diagnostic;
+                }
+            }
+        }
     }
 
     if ret == 0
         && let Some(request) = takeover
     {
-        println!("Entering Phase 6 no-return path...");
+        let prepared = phase7_tables.expect("takeover tables were prepared");
+        println!("Entering private EL2 no-return path...");
         // SAFETY: The explicit takeover argument authorizes abandoning the
         // U-Boot stack after all diagnostic validation has succeeded.
-        unsafe { boot::enter_private_el2(request.test_sync_fault) }
+        unsafe {
+            boot::enter_private_el2(
+                request.fault_test,
+                request.switch_page_tables,
+                prepared.registers,
+            )
+        }
     }
 
     debug_fini();

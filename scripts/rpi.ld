@@ -10,7 +10,10 @@ SECTIONS {
     . = __LOAD_ADDR + SIZEOF_HEADERS;
 
     .text : ALIGN(__ALIGN_SIZE) {
+        __text_start = .;
         *(.text .text.*)
+        . = ALIGN(__ALIGN_SIZE);
+        __text_end = .;
     }
 
     /*
@@ -25,23 +28,25 @@ SECTIONS {
         __vectors_end = .;
     }
 
-    .data : ALIGN(__ALIGN_SIZE) {
-        *(.data .data.*)
-    }
-
     .rodata : ALIGN(__ALIGN_SIZE) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        *(.eh_frame_hdr)
+        *(.eh_frame)
+        . = ALIGN(__ALIGN_SIZE);
+        __rodata_end = .;
     }
 
-    .got : ALIGN(__ALIGN_SIZE) {
+    .data : ALIGN(__ALIGN_SIZE) {
+        __writable_start = .;
+        *(.data .data.*)
         *(.got .got.*)
-    }
-
-    .bss : ALIGN(__ALIGN_SIZE) {
         __bss_start = .;
         *(.bss .bss.*)
         . = ALIGN(16);
         __bss_end = .;
+        . = ALIGN(__ALIGN_SIZE);
+        __writable_end = .;
     }
 
     /*

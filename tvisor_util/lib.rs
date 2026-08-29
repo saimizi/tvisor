@@ -8,6 +8,7 @@ pub mod diag;
 
 pub mod aarch64_reg;
 pub mod boot_mode;
+pub mod el2_translation;
 pub mod fdt;
 pub mod memory_map;
 pub mod platform;

@@ -329,6 +329,9 @@ impl HcrEl2 {
     pub fn bit_rw(&self) -> bool {
         bit_check(self.value, 31)
     }
+    pub fn bit_e2h(&self) -> bool {
+        bit_check(self.value, 34)
+    }
 }
 
 #[derive(Debug, Default, Copy, Clone)]

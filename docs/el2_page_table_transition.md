@@ -117,8 +117,9 @@ Leaf descriptors set:
 - `SH = Inner Shareable` for Normal memory;
 - `AttrIdx = 0` for Normal WB/WA or `1` for Device-nGnRE;
 - EL2 read-only or read/write access as requested;
-- `UXN = 1`; and
-- `PXN = 1` except for executable text and vectors.
+- `XN = 1` for non-executable mappings and `XN = 0` only for executable text
+  and vectors. In the EL2 translation regime this is descriptor bit 54; the
+  EL0/EL1 regime's `PXN` interpretation must not be used by the EL2 walker.
 
 Table descriptors contain only a validated next-table PA and required table
 type bits. Software-owned or reserved bits remain zero. Descriptor creation
@@ -135,6 +136,7 @@ MAIR_EL2
   Attr1 = 0x04  Device-nGnRE
 
 TCR_EL2
+  RES1  = bits 31 and 23
   T0SZ  = 25    39-bit VA
   TG0   = 0b00  4 KiB
   SH0   = 0b11  Inner Shareable
@@ -326,4 +328,3 @@ power recovery is available.
 
 - Arm, [Learn the Architecture: Memory Management](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf).
 - Arm, [Arm Architecture Reference Manual for A-profile architecture](https://developer.arm.com/documentation/ddi0487/latest/).
-
