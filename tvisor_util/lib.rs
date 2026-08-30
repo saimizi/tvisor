@@ -11,5 +11,6 @@ pub mod boot_mode;
 pub mod el2_translation;
 pub mod fdt;
 pub mod memory_map;
+pub mod page_allocator;
 pub mod platform;
 pub mod system_info;

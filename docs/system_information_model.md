@@ -6,10 +6,11 @@ This document defines the Phase 1 system-information model described in
 `docs/development_plan.md`. The model is the owned boundary between platform
 discovery and the later memory-map and execution-environment code.
 
-Phase 0 provides a validated, borrowed view of the U-Boot working DTB. Later
-phases will decode that view and other live inputs into `SystemInfo`. Once all
-required information has been copied, `SystemInfo` must remain valid without
-accessing the original DTB.
+Phase 0 provides a validated, borrowed view of the U-Boot working DTB. Platform
+discovery decodes that view and other live inputs into a temporary
+`SystemInfoBuilder`. Once discovery is complete, `finalize()` normalizes the
+memory records and creates `SystemInfo`, which remains valid without accessing
+the original DTB. Raw RAM and reservation records are then dropped.
 
 Phase 1 defines and tests the data model only. It does not yet populate the
 model from the DTB, choose allocatable memory, reclaim U-Boot memory, or change
@@ -23,7 +24,7 @@ The model must:
 - own every stored value and have no lifetime tied to the FDT parser;
 - store CPU physical addresses as checked 64-bit values;
 - use half-open address ranges `[start, end)`;
-- preserve the source and meaning of reservations;
+- preserve the source and meaning of reservations until finalization;
 - distinguish described RAM from RAM later proven usable;
 - report fixed-capacity exhaustion instead of dropping entries;
 - support deterministic iteration and allocation-free formatting;
@@ -47,22 +48,24 @@ U-Boot arguments and live DTB bytes
  binding and platform interpretation           tvisor_util/platform.rs
                |
                v
- owned SystemInfo values                       tvisor_util/system_info.rs
+ temporary owned SystemInfoBuilder records     tvisor_util/system_info.rs
                |
                v
- normalization and allocation policy           tvisor_util/memory_map.rs
+ normalization into MemoryMap                   tvisor_util/memory_map.rs
+               |
+               v
+ final owned SystemInfo                         tvisor_util/system_info.rs
 ```
 
 `system_info.rs` must not import `dtoolkit`. In particular, its public types
 must not contain `Fdt`, `Node`, `Property`, borrowed strings, or raw pointers.
 The platform layer converts parser-specific values into the owned types.
 
-Phase 4 implements the next layer in `tvisor_util/memory_map.rs`. It keeps the
-raw `SystemInfo` records unchanged for provenance and ownership diagnostics,
-then produces sorted and merged physical `RAM`, permanent `RESERVED`, temporary
-`HANDOFF`, `MMIO`, `INITIAL`, and post-takeover `USABLE` views. The normalized
-reservation unions intentionally have no owner: conflicting or overlapping
-ownership remains visible in the raw records.
+Phase 4 implements the next layer in `tvisor_util/memory_map.rs`. It consumes
+the temporary discovery records to produce sorted and merged physical `RAM`,
+permanent `RESERVED`, temporary `HANDOFF`, `MMIO`, `INITIAL`, and
+post-takeover `USABLE` views. The final `SystemInfo` retains this normalized
+`MemoryMap`; duplicate raw RAM and reservation records are discarded.
 
 `INITIAL` excludes both permanent and handoff reservations and is the only map
 that may be used while execution still depends on U-Boot. `USABLE` excludes
@@ -349,9 +352,9 @@ pub struct BusTranslation {
 The child region is in the bus address space and the parent region is in the
 CPU physical address space. Only the parent range is classified as MMIO.
 
-Every MMIO range stored in `SystemInfo` is a CPU physical range after all DT
-bus translations. A DT unit address or legacy peripheral bus address must not
-be stored here before translation.
+Every MMIO range collected in `SystemInfoBuilder` and retained in `MemoryMap`
+is a CPU physical range after all DT bus translations. A DT unit address or
+legacy peripheral bus address must not be stored here before translation.
 
 Overlapping device windows and parent bus windows are allowed in the raw
 database. They carry different descriptive granularity and are evaluated by
@@ -408,12 +411,12 @@ The console range may also appear in `mmio`. `console` identifies the active
 debug device, while the MMIO entry participates in memory-map validation.
 This is intentional semantic cross-reference, not accidental duplication.
 
-## 7. SystemInfo structure
+## 7. Builder and final SystemInfo structures
 
-The initial owned database is:
+The temporary discovery database is:
 
 ```rust
-pub struct SystemInfo {
+pub struct SystemInfoBuilder {
     pub ram: FixedList<RamRegion, MAX_RAM_REGIONS>,
     pub reserved: FixedList<ReservedRegion, MAX_RESERVED_REGIONS>,
     pub dynamic_reserved:
@@ -424,6 +427,22 @@ pub struct SystemInfo {
     pub console: Option<ConsoleInfo>,
 }
 ```
+
+After all DTB and U-Boot records have been collected, `finalize()` validates
+and normalizes them into the retained dataset:
+
+```rust
+pub struct SystemInfo {
+    memory: MemoryMap,
+    bus_translations: FixedList<BusTranslation, MAX_BUS_TRANSLATIONS>,
+    cpus: FixedList<CpuInfo, MAX_CPUS>,
+    console: Option<ConsoleInfo>,
+}
+```
+
+The builder is consumed by finalization. Its raw RAM, fixed reservations,
+dynamic reservations, and MMIO records are therefore not duplicated in the
+runtime `SystemInfo`.
 
 The fields may initially have private storage with read-only accessors and
 controlled insertion methods. This is preferable if it helps keep capacity
@@ -446,11 +465,9 @@ committed, Phase 1 should count the entries in the captured Raspberry Pi 4 DTB
 and leave documented headroom. Later discovery must fail visibly if a limit
 is exceeded. Increasing a capacity should require no parser or policy change.
 
-`SystemInfo::new()` creates an empty database. Phase 1 should not define a
-global mutable instance. The boot sequence should eventually construct one in
-tvisor-owned storage and pass a shared reference to later initialization
-steps. The lifetime and publication mechanism can be selected when Phase 2
-integrates discovery.
+`SystemInfoBuilder::new()` creates an empty discovery database. The boot
+sequence adds DTB and U-Boot records, calls `finalize()`, and passes a shared
+reference to the resulting `SystemInfo` to later initialization steps.
 
 ## 8. Invariants and validation boundaries
 
@@ -477,8 +494,9 @@ usable RAM; it must not treat the entry as ordinary RAM and rely on reservation
 subtraction.
 
 Those decisions require a complete set of platform inputs and belong to the
-normalization and policy phases. Retaining raw records and provenance makes
-conflicts diagnosable instead of hiding them during parsing.
+normalization and policy phases. The builder retains raw records until
+finalization so conflicts can be diagnosed. After successful finalization,
+only the normalized result is retained.
 
 ## 9. Formatting and diagnostics
 
@@ -521,8 +539,8 @@ replace an earlier record when full.
 2. Add and test `FixedList<T, N>` using safe initialized storage.
 3. Add the RAM, reservation, dynamic-reservation, MMIO, CPU, and console
    records and enums.
-4. Add `SystemInfo`, initial capacities, construction, accessors, and
-   insertion methods.
+4. Add `SystemInfoBuilder`, final `SystemInfo`, initial capacities,
+   construction, accessors, finalization, and insertion methods.
 5. Move `ConsoleKind` and `ConsoleInfo` from `fdt.rs` into the new module and
    adapt `discover_console` and `main.rs` without changing runtime behavior.
 6. Export `system_info` from `tvisor_util/lib.rs`.

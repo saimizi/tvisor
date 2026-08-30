@@ -2,14 +2,14 @@
 
 ## 1. Purpose
 
-Tvisor currently enters at EL2 through U-Boot, diagnoses the inherited CPU
-state, prints the result through the debug UART, and returns to U-Boot. It does
-not yet own the stack, exception vectors, physical-memory allocator, or EL2
-stage-1 translation tables.
+Tvisor enters at EL2 through U-Boot, validates the inherited CPU and platform
+state, and then performs an irreversible takeover. It installs its own stack,
+exception vectors, EL2 stage-1 translation tables, and physical-page allocator.
+After the switch, it reclaims eligible U-Boot RAM while retaining the original
+DTB pages used by the global FDT handle.
 
-The next objective is to discover the live platform, convert that information
-into a tvisor-owned system-information database, and use the database to design
-and construct tvisor's execution environment. The dependency order is:
+The completed discovery and execution-environment work follows this dependency
+order:
 
 ```text
 live U-Boot DTB and handoff information
@@ -18,13 +18,16 @@ live U-Boot DTB and handoff information
         validated generic FDT parser
                  |
                  v
-       platform discovery and policy
+          platform discovery
                  |
                  v
-         owned SystemInfo database
+      temporary SystemInfoBuilder
                  |
                  v
-    normalized usable physical-memory map
+    normalized MemoryMap finalization
+                 |
+                 v
+         final owned SystemInfo
                  |
                  v
      tvisor virtual-memory-map design
@@ -33,23 +36,27 @@ live U-Boot DTB and handoff information
  private stack, vectors, allocator, and EL2 page tables
 ```
 
-This document is an implementation plan. It does not define a final guest
-memory layout or implement any of the phases below.
+This document records the phased implementation plan through the completed
+physical-page allocator and U-Boot-memory reclamation work. It does not define
+a final guest memory layout.
 
 ## 2. Current codebase and constraints
 
-The plan is grounded in the following current behavior:
+The current implementation has these properties:
 
-- `src/main.rs` provides an assembly `main`, saves the U-Boot callee-saved
-  register state, calls `rust_main`, and returns to U-Boot.
-- `rust_main` verifies `CurrentEL`, collects `DiagState`, reports invalid
-  handoff conditions, and prints diagnostics.
+- `src/main.rs` provides an assembly `main` that clears `.bss` and enters the
+  no-return Rust boot sequence.
+- `rust_main` validates the DTB and EL2 handoff state, builds `SystemInfo`,
+  prepares the allocator-owned translation tables, and enters private EL2.
 - `tvisor_util/aarch64_reg.rs` contains typed AArch64 register accessors.
 - `tvisor_util/diag.rs` collects the read-only handoff state.
 - `tvisor_util/debug_util.rs` supplies the early mini-UART debug path.
-- `scripts/rpi.ld` links tvisor at physical address `0x0400_0000`, but does
-  not yet export explicit image-section or image-end symbols for memory
-  discovery.
+- `src/boot.rs` installs tvisor's private stack, vectors, and EL2 translation
+  regime, then completes U-Boot-memory reclamation.
+- `src/mm.rs` owns the global physical-page allocator, page-table preparation,
+  retained-DTB mapping, and one-shot reclamation metadata.
+- `scripts/rpi.ld` links tvisor at physical address `0x0400_0000` and exports
+  page-aligned image, section, guard, and stack symbols.
 - `docs/address_translation.md` describes EL2 stage 1 and guest stage 2.
 - `docs/check_handoff_state.md` defines the diagnostic phase and the observed
   U-Boot handoff register state.
@@ -58,9 +65,10 @@ The plan is grounded in the following current behavior:
 - `docs/peripheral_address_translation.md` explains how DT `ranges` converts
   bus addresses into ARM physical addresses.
 
-The first milestones must remain compatible with returning to U-Boot. While
-that is possible, tvisor must not overwrite or reclaim U-Boot's image, stack,
-heap, translation tables, control/working DTB, or other live allocations.
+Phases before the no-return transition remained compatible with returning to
+U-Boot and therefore preserved all U-Boot-owned memory. The current takeover
+path does not return. It reclaims only explicitly described handoff RAM after
+tvisor's private environment is active, and it retains the live DTB pages.
 
 No code may assume that the development board's captured `bdinfo` layout is a
 stable ABI. Installed RAM, reservations, the DTB address, and U-Boot relocation
@@ -82,8 +90,10 @@ memory manager must not depend on raw FDT byte slices.
 
 ### 3.2 Use owned, physical-address-based system information
 
-`SystemInfo` must contain decoded values rather than pointers into the source
-DTB. All region boundaries use CPU physical addresses and half-open intervals:
+`SystemInfoBuilder` temporarily contains decoded discovery values rather than
+pointers into the source DTB. It is consumed to create a final `SystemInfo`
+containing the normalized `MemoryMap` and retained runtime platform data. All
+region boundaries use CPU physical addresses and half-open intervals:
 
 ```text
 [start, end)
@@ -119,8 +129,8 @@ responsibilities are:
 ```text
 tvisor_util/
   fdt.rs              FDT format validation and read-only traversal
-  system_info.rs      owned region types and fixed-capacity database
-  platform.rs         generic DT-to-SystemInfo discovery
+  system_info.rs      temporary builder, final SystemInfo, and region types
+  platform.rs         generic DT-to-SystemInfoBuilder discovery
   bcm2711.rs          BCM2711-compatible details when bindings are insufficient
   memory_map.rs       normalization, reservation subtraction, and validation
   aarch64_reg.rs      architectural register accessors
@@ -147,7 +157,7 @@ Define exactly how tvisor receives the live working DTB from both U-Boot
 read-only FDT parser.
 
 Implementing the parser in this first phase lets the handoff be verified using
-the actual DTB header and contents. It also gives the following `SystemInfo`
+the actual DTB header and contents. It also gives the following platform-model
 phase concrete parser output on which to base its owned data model.
 
 ### Registers, memory structures, and exception levels
@@ -281,10 +291,10 @@ borrowed node/property types.
   `reusable`.
 - No new system registers; pure data handling works on host and at EL2.
 
-An initial conceptual model is:
+The discovery model is temporary:
 
 ```rust
-pub struct SystemInfo {
+pub struct SystemInfoBuilder {
     pub ram: RegionList<RamRegion, MAX_RAM_REGIONS>,
     pub reserved: RegionList<ReservedRegion, MAX_RESERVED_REGIONS>,
     pub mmio: RegionList<MmioRegion, MAX_MMIO_REGIONS>,
@@ -292,6 +302,10 @@ pub struct SystemInfo {
     pub console: Option<ConsoleInfo>,
 }
 ```
+
+After discovery, the builder is consumed to create the final `SystemInfo`,
+which retains the normalized `MemoryMap`, CPU information, bus translations,
+and console information rather than duplicate raw memory records.
 
 `ReservedRegion` should identify at least firmware, device, bootloader, DTB,
 tvisor, Linux policy, and unknown origins. The design must distinguish raw RAM
@@ -316,8 +330,8 @@ from RAM that remains usable after reservations are subtracted.
 
 ### Goal
 
-Populate the RAM and reserved portions of `SystemInfo` from the live DTB while
-keeping the original blob and U-Boot memory intact.
+Populate the RAM and reserved portions of `SystemInfoBuilder` from the live DTB
+while keeping the original blob and U-Boot memory intact.
 
 ### Registers, memory structures, and exception levels
 
@@ -385,7 +399,7 @@ assume that a DT unit address is already an ARM physical address.
 - Refactor `tvisor_util/debug_util.rs` so UART MMIO remains disabled until the DTB-selected console has been translated to a
   CPU physical register base.
 - Reuse `tvisor_util/aarch64_reg.rs` for `MPIDR_EL1`; do not specialize the
-  generic register wrapper for `SystemInfo`.
+  generic register wrapper for platform discovery.
 
 ### Acceptance criteria and verification
 
@@ -443,8 +457,8 @@ bootmem=<hex-start>:<hex-size>
 `lmb=` carries the live LMB list. `bootmem=` carries explicit boot allocations
 not necessarily represented by LMB, including the `go` download region or the
 `bootelf` staging ELF. Both inputs are optional metadata and are copied into
-`SystemInfo` as bootloader-owned, reclaim-after-takeover reservations. They
-refine `initial_usable`, but never reduce the post-takeover `usable_ram` map.
+`SystemInfoBuilder` as bootloader-owned, reclaim-after-takeover reservations.
+They refine `initial_usable`, but never reduce the post-takeover `usable_ram` map.
 The arguments are a per-boot snapshot and must not be treated as fixed
 Raspberry Pi addresses.
 
@@ -643,21 +657,24 @@ boot resources at explicitly defined lifetime boundaries.
 - Physical-page allocator metadata.
 - Permanent reservations: tvisor image, stacks, vectors, tables, allocator
   metadata, firmware/no-map regions, and active devices.
-- Temporary reservations: original U-Boot working DTB, ELF staging buffer,
-  U-Boot runtime region, and other handoff-only storage.
-- A private DTB copy, if retained for later device discovery or diagnostics.
+- Temporary reservations: ELF staging buffer, U-Boot runtime region, and other
+  handoff-only storage.
+- The original U-Boot working DTB, retained because the global FDT handle
+  continues to borrow it.
 - EL2 stage-1 mappings for allocator-managed RAM.
 
 Reclaim U-Boot memory only after all of these are true:
 
 1. the takeover path cannot return to U-Boot;
 2. tvisor uses its own stack, vectors, UART setup, and translation tables;
-3. all required handoff data has been copied into owned storage;
-4. no current code or pointer refers into U-Boot or the original DTB;
+3. all required handoff data has been copied into owned storage or explicitly
+   retained;
+4. no current code or pointer refers into the U-Boot regions being reclaimed;
 5. page-rounded sharing at reservation boundaries has been resolved.
 
-The original DTB can then be reclaimed after complete parsing, or after a
-private copy is made. The hardware does not consume the blob after boot.
+The global FDT handle still borrows the original DTB. Its page-rounded region
+is therefore retained `InUse` and identity-mapped read-only/XN. A later design
+may copy the blob into tvisor-owned storage and then release the original pages.
 
 ### Files and modules
 
@@ -676,9 +693,9 @@ private copy is made. The hardware does not consume the blob after boot.
   and until the allocator intentionally provides one.
 - **Raspberry Pi 4:** Allocate, write, verify, and free test pages from every
   eligible bank. Confirm no allocation intersects permanent reservations.
-  After the explicit no-return point, mark U-Boot/original-DTB pages usable and
-  demonstrate controlled allocation from reclaimed pages while UART and
-  exception handling remain operational.
+  After the explicit no-return point, mark eligible U-Boot pages usable and
+  demonstrate controlled allocation from reclaimed pages while the original
+  DTB remains retained and UART and exception handling remain operational.
 
 ## 14. Phase 9: prepare for guest execution
 
@@ -740,7 +757,8 @@ The first development iteration should stop after discovery and validation:
 2. Evaluate an existing `no_std` FDT crate versus a local parser.
 3. Implement/wrap the generic FDT parser and test it on fixtures and the live
    Raspberry Pi 4 DTB.
-4. Define `SystemInfo`, region types, capacity behavior, and host tests using
+4. Define `SystemInfoBuilder`, final `SystemInfo`, region types, capacity
+   behavior, and host tests using
    the parser API and observed DTB structure as design inputs.
 5. Discover RAM and all reservation sources.
 6. Discover the console MMIO and CPU information.

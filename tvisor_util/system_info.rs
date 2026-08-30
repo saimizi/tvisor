@@ -1,5 +1,7 @@
 use core::fmt;
 
+use crate::memory_map::{MemoryMap, MemoryMapError};
+
 pub const MAX_RAM_REGIONS: usize = 8;
 pub const MAX_RESERVED_REGIONS: usize = 64;
 pub const MAX_DYNAMIC_RESERVATIONS: usize = 16;
@@ -446,8 +448,13 @@ pub struct ConsoleInfo {
     pub registers: PhysRegion,
 }
 
+/// Temporary platform records collected from the DTB and U-Boot handoff.
+///
+/// Call `finalize()` after discovery is complete. Finalization normalizes the
+/// memory records into `MemoryMap`, moves runtime platform data into
+/// `SystemInfo`, and drops these raw records.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SystemInfo {
+pub struct SystemInfoBuilder {
     ram: FixedList<RamRegion, MAX_RAM_REGIONS>,
     reserved: FixedList<ReservedRegion, MAX_RESERVED_REGIONS>,
     dynamic_reserved: FixedList<DynamicReservation, MAX_DYNAMIC_RESERVATIONS>,
@@ -457,7 +464,7 @@ pub struct SystemInfo {
     console: Option<ConsoleInfo>,
 }
 
-impl SystemInfo {
+impl SystemInfoBuilder {
     pub const fn new() -> Self {
         Self {
             ram: FixedList::new(),
@@ -533,60 +540,58 @@ impl SystemInfo {
     pub fn set_console(&mut self, console: ConsoleInfo) {
         self.console = Some(console);
     }
+
+    pub fn finalize(self) -> Result<SystemInfo, MemoryMapError> {
+        let memory = MemoryMap::from_builder(&self)?;
+        Ok(SystemInfo {
+            memory,
+            bus_translations: self.bus_translations,
+            cpus: self.cpus,
+            console: self.console,
+        })
+    }
 }
 
-impl Default for SystemInfo {
+impl Default for SystemInfoBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Final owned platform information retained by tvisor after discovery.
+///
+/// Raw RAM and reservation records are not retained: `memory` contains their
+/// normalized physical-address classification.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SystemInfo {
+    memory: MemoryMap,
+    bus_translations: FixedList<BusTranslation, MAX_BUS_TRANSLATIONS>,
+    cpus: FixedList<CpuInfo, MAX_CPUS>,
+    console: Option<ConsoleInfo>,
+}
+
+impl SystemInfo {
+    pub const fn memory(&self) -> &MemoryMap {
+        &self.memory
+    }
+
+    pub const fn bus_translations(&self) -> &FixedList<BusTranslation, MAX_BUS_TRANSLATIONS> {
+        &self.bus_translations
+    }
+
+    pub const fn cpus(&self) -> &FixedList<CpuInfo, MAX_CPUS> {
+        &self.cpus
+    }
+
+    pub const fn console(&self) -> Option<ConsoleInfo> {
+        self.console
     }
 }
 
 impl fmt::Display for SystemInfo {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(formatter, "System information:")?;
-        let mut printed_ram = [false; MAX_RAM_REGIONS];
-        for _ in 0..self.ram.len() {
-            let Some((index, ram)) = self
-                .ram
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !printed_ram[*index])
-                .min_by_key(|(_, ram)| ram.region.start())
-            else {
-                break;
-            };
-            printed_ram[index] = true;
-            writeln!(formatter, "  RAM        {} {}", ram.region, ram.source)?;
-        }
-        for reserved in &self.reserved {
-            writeln!(
-                formatter,
-                "  RESERVED   {} origin={:?} owner={:?} no_map={} reusable={}",
-                reserved.region,
-                reserved.origin,
-                reserved.owner,
-                reserved.attributes.no_map,
-                reserved.attributes.reusable
-            )?;
-        }
-        for reserved in &self.dynamic_reserved {
-            writeln!(
-                formatter,
-                "  DYNAMIC    size={:#x} alignment={:?} origin={:?} owner={:?} no_map={} reusable={}",
-                reserved.size(),
-                reserved.alignment(),
-                reserved.origin(),
-                reserved.owner(),
-                reserved.attributes().no_map,
-                reserved.attributes().reusable
-            )?;
-            for range in reserved.alloc_ranges() {
-                writeln!(formatter, "             alloc_range={}", range)?;
-            }
-        }
-        for mmio in &self.mmio {
-            writeln!(formatter, "  MMIO       {} {:?}", mmio.region, mmio.kind)?;
-        }
+        write!(formatter, "{}", self.memory)?;
         for translation in &self.bus_translations {
             writeln!(
                 formatter,
@@ -776,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn constructs_all_record_kinds_and_system_info() {
+    fn constructs_builder_records_and_final_system_info() {
         let ram = RamRegion {
             region: region(0, 0x1000),
             source: RamSource::DeviceTree,
@@ -787,7 +792,7 @@ mod tests {
             owner: ReservationOwner::Bootloader,
             attributes: ReservationAttributes::default(),
         };
-        let dynamic = DynamicReservation::new(
+        let mut dynamic = DynamicReservation::new(
             0x2000,
             None,
             ReservationOrigin::ReservedMemoryNode,
@@ -798,6 +803,7 @@ mod tests {
             },
         )
         .unwrap();
+        dynamic.add_alloc_range(region(0x4000, 0x2000)).unwrap();
         let mmio = MmioRegion {
             region: region(0xfe00_0000, 0x1000),
             kind: MmioKind::Device,
@@ -819,7 +825,7 @@ mod tests {
             registers: region(0xfe21_5040, 0x40),
         };
 
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(ram).unwrap();
         info.add_reserved(reserved).unwrap();
         info.add_dynamic_reserved(dynamic).unwrap();
@@ -832,6 +838,13 @@ mod tests {
         assert_eq!(info.reserved().get(0), Some(&reserved));
         assert_eq!(info.dynamic_reserved().get(0), Some(&dynamic));
         assert_eq!(info.mmio().get(0), Some(&mmio));
+        assert_eq!(info.bus_translations().get(0), Some(&translation));
+        assert_eq!(info.cpus().get(0), Some(&cpu));
+        assert_eq!(info.console(), Some(console));
+
+        let info = info.finalize().unwrap();
+        assert_eq!(info.memory().ram().len(), 1);
+        assert_eq!(info.memory().mmio().get(0), Some(&mmio.region));
         assert_eq!(info.bus_translations().get(0), Some(&translation));
         assert_eq!(info.cpus().get(0), Some(&cpu));
         assert_eq!(info.console(), Some(console));

@@ -182,8 +182,9 @@ ELF has this layout:
 
 ```text
 ELF base:       0x0400_0000
-entry point:    0x0400_1010
-loaded extent:  [0x0400_0000, 0x0400_2320)
+entry point:    0x0400_68e8
+loaded extent:  [0x0400_0000, 0x040b_a000)
+ELF file size:  0x0037_5bb8
 ```
 
 This range is in DRAM bank 0 and does not overlap any LMB reservation in the
