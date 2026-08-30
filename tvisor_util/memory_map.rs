@@ -3,11 +3,11 @@ use core::fmt;
 use crate::system_info::{
     FixedList, MAX_DYNAMIC_ALLOC_RANGES, MAX_DYNAMIC_RESERVATIONS, MAX_MMIO_REGIONS,
     MAX_RAM_REGIONS, MAX_RESERVED_REGIONS, PhysRegion, RamSource, RegionError, ReservationOrigin,
-    ReservationOwner, ReservedRegion, SystemInfo,
+    ReservationOwner, ReservedRegion, SystemInfoBuilder,
 };
 
 pub const MAX_NORMALIZED_RESERVED_REGIONS: usize =
-    MAX_RESERVED_REGIONS + MAX_DYNAMIC_RESERVATIONS * MAX_DYNAMIC_ALLOC_RANGES;
+    MAX_RESERVED_REGIONS + MAX_DYNAMIC_RESERVATIONS * MAX_DYNAMIC_ALLOC_RANGES + MAX_RAM_REGIONS;
 pub const MAX_USABLE_RAM_REGIONS: usize = MAX_RAM_REGIONS + MAX_NORMALIZED_RESERVED_REGIONS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +34,15 @@ impl fmt::Display for MemoryMapError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-/// Normalized physical-address classification derived from [`SystemInfo`].
+/// Normalized physical-address classification derived from temporary platform
+/// discovery records.
 ///
 /// Every list is sorted and has overlapping or adjacent regions merged. The
 /// two usable-RAM views describe different ownership points in the boot
 /// transition: `initial_usable_ram` is safe while U-Boot resources are still
 /// live, whereas `usable_ram` is the candidate RAM after no-return takeover.
 pub struct MemoryMap {
-    /// Physical RAM reported by the platform, excluding firmware carve-outs.
+    /// Physical RAM reported by the platform, including firmware carve-outs.
     ///
     /// This is the containing RAM inventory, not an allocation list; regions
     /// in either reservation list must still be excluded before use.
@@ -77,14 +78,12 @@ pub struct MemoryMap {
 }
 
 impl MemoryMap {
-    pub fn from_system_info(info: &SystemInfo) -> Result<Self, MemoryMapError> {
+    pub(crate) fn from_builder(info: &SystemInfoBuilder) -> Result<Self, MemoryMapError> {
         let mut raw_ram: FixedList<PhysRegion, MAX_RAM_REGIONS> = FixedList::new();
         for ram in info.ram() {
-            if ram.source != RamSource::FirmwareCarveout {
-                raw_ram
-                    .push(ram.region)
-                    .map_err(|_| MemoryMapError::Capacity)?;
-            }
+            raw_ram
+                .push(ram.region)
+                .map_err(|_| MemoryMapError::Capacity)?;
         }
         let ram: FixedList<PhysRegion, MAX_RAM_REGIONS> = normalize(&raw_ram)?;
 
@@ -92,6 +91,13 @@ impl MemoryMap {
             FixedList::new();
         let mut raw_transition: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
             FixedList::new();
+        for ram in info.ram() {
+            if ram.source == RamSource::FirmwareCarveout {
+                raw_permanent
+                    .push(ram.region)
+                    .map_err(|_| MemoryMapError::Capacity)?;
+            }
+        }
         for reserved in info.reserved() {
             let target = if is_transition_reservation(reserved) {
                 &mut raw_transition
@@ -271,19 +277,19 @@ impl fmt::Display for MemoryMap {
             writeln!(formatter, "  RAM        {region}")?;
         }
         for region in &self.permanent_reserved {
-            writeln!(formatter, "  RESERVED   {region}")?;
+            writeln!(formatter, "    RESERVED   {region}")?;
         }
         for region in &self.transition_reserved {
-            writeln!(formatter, "  HANDOFF    {region} reclaim-after-takeover")?;
+            writeln!(formatter, "    HANDOFF    {region} reclaim-after-takeover")?;
+        }
+        for region in &self.initial_usable_ram {
+            writeln!(formatter, "    INITIAL    {region}")?;
+        }
+        for region in &self.usable_ram {
+            writeln!(formatter, "    USABLE     {region} after-takeover")?;
         }
         for region in &self.mmio {
             writeln!(formatter, "  MMIO       {region}")?;
-        }
-        for region in &self.initial_usable_ram {
-            writeln!(formatter, "  INITIAL    {region}")?;
-        }
-        for region in &self.usable_ram {
-            writeln!(formatter, "  USABLE     {region} after-takeover")?;
         }
         Ok(())
     }
@@ -301,7 +307,7 @@ mod tests {
         PhysRegion::new(PhysAddr::new(start), size).unwrap()
     }
 
-    fn reserve(info: &mut SystemInfo, start: u64, size: u64) {
+    fn reserve(info: &mut SystemInfoBuilder, start: u64, size: u64) {
         info.add_reserved(ReservedRegion {
             region: region(start, size),
             origin: ReservationOrigin::Unknown,
@@ -313,7 +319,7 @@ mod tests {
 
     #[test]
     fn sorts_merges_and_subtracts_all_overlap_shapes() {
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0x1000, 0x9000),
             source: RamSource::DeviceTree,
@@ -324,7 +330,7 @@ mod tests {
         reserve(&mut info, 0x3800, 0x1800);
         reserve(&mut info, 0x9000, 0x2000);
 
-        let map = MemoryMap::from_system_info(&info).unwrap();
+        let map = MemoryMap::from_builder(&info).unwrap();
         assert_eq!(map.reserved().len(), 3);
         assert_eq!(
             map.usable_ram()
@@ -340,8 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn excludes_dynamic_allocation_window_and_firmware_carveout() {
-        let mut info = SystemInfo::new();
+    fn inventories_firmware_carveout_but_excludes_it_from_usable_ram() {
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0, 0x8000),
             source: RamSource::DeviceTree,
@@ -365,7 +371,15 @@ mod tests {
         .unwrap();
         dynamic.add_alloc_range(region(0x2000, 0x3000)).unwrap();
         info.add_dynamic_reserved(dynamic).unwrap();
-        let map = MemoryMap::from_system_info(&info).unwrap();
+        let map = MemoryMap::from_builder(&info).unwrap();
+        assert_eq!(
+            map.ram().iter().copied().collect::<std::vec::Vec<_>>(),
+            [region(0, 0x9000)]
+        );
+        assert_eq!(
+            map.reserved().iter().copied().collect::<std::vec::Vec<_>>(),
+            [region(0x2000, 0x3000), region(0x8000, 0x1000)]
+        );
         assert_eq!(
             map.usable_ram()
                 .iter()
@@ -377,7 +391,7 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_dynamic_reservation_and_ram_mmio_conflict() {
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0x1_0000_0000, 0x4000),
             source: RamSource::DeviceTree,
@@ -393,11 +407,11 @@ mod tests {
         .unwrap();
         info.add_dynamic_reserved(dynamic).unwrap();
         assert_eq!(
-            MemoryMap::from_system_info(&info),
+            MemoryMap::from_builder(&info),
             Err(MemoryMapError::UnboundedDynamicReservation)
         );
 
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0x1_0000_0000, 0x4000),
             source: RamSource::DeviceTree,
@@ -409,14 +423,14 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            MemoryMap::from_system_info(&info),
+            MemoryMap::from_builder(&info),
             Err(MemoryMapError::RamMmioConflict { .. })
         ));
     }
 
     #[test]
     fn bootloader_memory_is_only_excluded_before_takeover() {
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0, 0x10_000),
             source: RamSource::DeviceTree,
@@ -431,7 +445,7 @@ mod tests {
         })
         .unwrap();
 
-        let map = MemoryMap::from_system_info(&info).unwrap();
+        let map = MemoryMap::from_builder(&info).unwrap();
         assert_eq!(
             map.reserved().iter().copied().collect::<std::vec::Vec<_>>(),
             [region(0x2000, 0x1000)]

@@ -8,7 +8,7 @@ use crate::system_info::{
     BusTranslation, CapacityError, ConsoleInfo, CpuEnableMethod, CpuInfo, CpuStatus,
     DynamicReservation, DynamicReservationError, MmioKind, MmioRegion, PhysAddr, PhysRegion,
     RamRegion, RamSource, RegionError, ReservationAttributes, ReservationOrigin, ReservationOwner,
-    ReservedRegion, SystemInfo,
+    ReservedRegion, SystemInfoBuilder,
 };
 
 const PAGE_SIZE: u64 = 0x1000;
@@ -75,19 +75,18 @@ impl fmt::Display for PlatformError {
     }
 }
 
-/// Builds an owned host-platform description from a validated live FDT.
+/// Collects temporary host-platform records from a validated live FDT.
 ///
-/// The returned value contains no references into `fdt`. Addresses decoded
-/// from device-tree bus properties are stored only after translation into the
-/// CPU physical address space.
-pub fn discover_system_info(
+/// The builder contains no references into `fdt`. The caller may add U-Boot
+/// handoff records before finalizing it into `SystemInfo`.
+pub fn discover_system_info_builder(
     fdt: Fdt<'_>,
     dtb_address: PhysAddr,
     tvisor_image: PhysRegion,
     console: ConsoleInfo,
     mpidr_el1: u64,
-) -> Result<SystemInfo, PlatformError> {
-    let mut info = SystemInfo::new();
+) -> Result<SystemInfoBuilder, PlatformError> {
+    let mut info = SystemInfoBuilder::new();
 
     discover_ram(fdt, &mut info)?;
     discover_reservations(fdt, dtb_address, tvisor_image, &mut info)?;
@@ -101,7 +100,7 @@ pub fn discover_system_info(
 
 fn discover_bcm2711_firmware_carveout(
     fdt: Fdt<'_>,
-    info: &mut SystemInfo,
+    info: &mut SystemInfoBuilder,
 ) -> Result<(), PlatformError> {
     if !fdt.root().is_compatible(BCM2711_COMPATIBLE) {
         return Ok(());
@@ -130,7 +129,7 @@ fn discover_bcm2711_firmware_carveout(
     .map_err(|error| capacity(CapacityKind::Ram, error))
 }
 
-fn discover_ram(fdt: Fdt<'_>, info: &mut SystemInfo) -> Result<(), PlatformError> {
+fn discover_ram(fdt: Fdt<'_>, info: &mut SystemInfoBuilder) -> Result<(), PlatformError> {
     let mut found = false;
     for node in fdt.root().children() {
         let Some(device_type) = node.property("device_type") else {
@@ -180,7 +179,7 @@ fn discover_reservations(
     fdt: Fdt<'_>,
     dtb_address: PhysAddr,
     tvisor_image: PhysRegion,
-    info: &mut SystemInfo,
+    info: &mut SystemInfoBuilder,
 ) -> Result<(), PlatformError> {
     for reservation in fdt.memory_reservations() {
         let region = PhysRegion::new(PhysAddr::new(reservation.address()), reservation.size())
@@ -310,7 +309,7 @@ fn discover_reservations(
 fn discover_mmio(
     fdt: Fdt<'_>,
     console: ConsoleInfo,
-    info: &mut SystemInfo,
+    info: &mut SystemInfoBuilder,
 ) -> Result<(), PlatformError> {
     info.add_mmio(MmioRegion {
         region: console.registers,
@@ -354,7 +353,11 @@ fn discover_mmio(
     Ok(())
 }
 
-fn discover_cpus(fdt: Fdt<'_>, mpidr_el1: u64, info: &mut SystemInfo) -> Result<(), PlatformError> {
+fn discover_cpus(
+    fdt: Fdt<'_>,
+    mpidr_el1: u64,
+    info: &mut SystemInfoBuilder,
+) -> Result<(), PlatformError> {
     let cpus = fdt.cpus().map_err(|_| PlatformError::MissingCpus)?;
     let current_affinity = mpidr_el1 & MPIDR_AFFINITY_MASK;
     let mut found_cpu = false;
@@ -409,7 +412,7 @@ fn discover_cpus(fdt: Fdt<'_>, mpidr_el1: u64, info: &mut SystemInfo) -> Result<
 }
 
 fn add_reserved(
-    info: &mut SystemInfo,
+    info: &mut SystemInfoBuilder,
     region: PhysRegion,
     origin: ReservationOrigin,
     owner: ReservationOwner,
@@ -462,12 +465,13 @@ mod tests {
     }
 
     #[test]
-    fn discovers_owned_ram_reservations_cpus_and_console() {
+    fn discovers_temporary_ram_reservations_and_runtime_platform_data() {
         let fdt = Fdt::new(TEST_DTB).unwrap();
         let image = PhysRegion::new(PhysAddr::new(0x0400_0000), 0x20_0000).unwrap();
 
-        let info = discover_system_info(fdt, PhysAddr::new(0x0300_0123), image, test_console(), 0)
-            .unwrap();
+        let info =
+            discover_system_info_builder(fdt, PhysAddr::new(0x0300_0123), image, test_console(), 0)
+                .unwrap();
 
         assert_eq!(info.ram().len(), 1);
         assert_eq!(
@@ -499,8 +503,9 @@ mod tests {
         let fdt = Fdt::new(TEST_DTB).unwrap();
         let image = PhysRegion::new(PhysAddr::new(0x0400_0000), 0x20_0000).unwrap();
 
-        let error = discover_system_info(fdt, PhysAddr::new(0x0300_0000), image, test_console(), 1)
-            .unwrap_err();
+        let error =
+            discover_system_info_builder(fdt, PhysAddr::new(0x0300_0000), image, test_console(), 1)
+                .unwrap_err();
 
         assert_eq!(error, PlatformError::CurrentCpuMissing);
     }
@@ -509,7 +514,7 @@ mod tests {
     fn discovers_fdt_memory_reservation_block() {
         let fdt = Fdt::new(MEMRESERVE_DTB).unwrap();
         let image = PhysRegion::new(PhysAddr::new(0x0400_0000), 0x20_0000).unwrap();
-        let mut info = SystemInfo::new();
+        let mut info = SystemInfoBuilder::new();
 
         discover_reservations(fdt, PhysAddr::new(0x0300_0000), image, &mut info).unwrap();
 

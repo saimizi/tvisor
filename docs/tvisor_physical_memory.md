@@ -8,14 +8,14 @@
 |  | `0x0400_1000–0x0404_a000` | 292 KiB | Tvisor image | Executable `.text` | Read-only and executable under the EL2 table policy |
 |  | `0x0404_a000–0x0404_b000` | 4 KiB | Tvisor image | EL2 exception-vector page | First 2 KiB contains the 16 vector slots; `VBAR_EL2 = 0x0404_a000` |
 |  | `0x0404_b000–0x0406_8000` | 116 KiB | Tvisor image | `.rodata` and unwind data | Read-only and execute-never under the EL2 table policy |
-|  | `0x0406_8000–0x0408_9000` | 132 KiB | Tvisor image | `.data`, `.got`, and `.bss` | Includes the 128 KiB physical-page bitmap; read/write and execute-never |
-|  | `0x0408_9000–0x0408_a000` | 4 KiB | Tvisor guard | Unmapped boot-stack guard | Deliberately has no EL2 descriptor |
-|  | `0x0408_a000–0x0409_a000` | 64 KiB | Tvisor stack | Private EL2 boot stack | Initial `SP` is `0x0409_a000`; the stack grows downward |
-|  | `0x0409_a000–0x0436_2ca8` | ≈2.784 MiB | U-Boot handoff | Raw ELF staging bytes outside the tvisor runtime image | Reclaimable after no-return takeover; the end changes with `${filesize}` |
-|  | `0x0436_2ca8–0x2eff_1000` | ≈684.556 MiB | RAM | Unassigned low RAM | The portion below `0x3000_0000` is currently excluded by the conservative dynamic-reservation policy |
-|  | `0x2eff_1000–0x2f00_0000` | 60 KiB | Reserved handoff data | Pages containing the live DTB | DTB blob begins at `0x2eff_1f00`; retained because the current global FDT handle still borrows it |
+|  | `0x0406_8000–0x040a_9000` | 260 KiB | Tvisor image | `.data`, `.got`, and `.bss` | Includes the two 128 KiB allocator bitmaps; read/write and execute-never |
+|  | `0x040a_9000–0x040a_a000` | 4 KiB | Tvisor guard | Unmapped boot-stack guard | Deliberately has no EL2 descriptor |
+|  | `0x040a_a000–0x040b_a000` | 64 KiB | Tvisor stack | Private EL2 boot stack | Initial `SP` is `0x040b_a000`; the stack grows downward |
+|  | `0x040b_a000–0x0437_5bb8` | ≈2.733 MiB | U-Boot handoff | Raw ELF staging bytes outside the tvisor runtime image | Reclaimable after no-return takeover; the end changes with `${filesize}` |
+|  | `0x0437_5bb8–0x2eff_1000` | ≈684.482 MiB | RAM | Unassigned low RAM | The portion below `0x3000_0000` is currently excluded by the conservative dynamic-reservation policy |
+|  | `0x2eff_1000–0x2f00_0000` | 60 KiB | Retained handoff data | Pages containing the live DTB | Identity-mapped read-only/XN before takeover and retained afterward without copying |
 |  | `0x2f00_0000–0x3000_0000` | 16 MiB | RAM | Unassigned low RAM | Currently excluded by the conservative dynamic-reservation policy |
-|  | `0x3000_0000–0x3001_0000` | 64 KiB | Tvisor page tables | Phase 7 bootstrap table arena | Permanently reserved; the builder records the number of pages actually used |
+|  | `0x3000_0000–0x3001_0000` | 64 KiB | Tvisor page tables | Allocator-owned EL2 table store | Allocated contiguously from initial `Unused` RAM and retained `InUse` |
 |  | `0x3001_0000–0x36b2_b000` | 109,676 KiB | Allocator-managed RAM | Low-bank physical pages | First-fit allocation begins at `0x3001_0000` |
 |  | `0x36b2_b000–0x3800_0000` | 21,332 KiB | Reclaimed allocator RAM | Former U-Boot runtime arena | Reclaimed only after the no-return takeover; Phase 8 hardware testing allocates `0x36b2_b000` |
 | `0x3800_0000–0x4000_0000` | `0x3800_0000–0x3ef6_6280` | ≈111.399 MiB | Firmware carve-out | Firmware/GPU-owned memory | Not allocatable ARM RAM |
