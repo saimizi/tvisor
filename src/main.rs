@@ -20,7 +20,9 @@ use tvisor_util::system_info::{
 
 mod boot;
 mod exception;
+mod guest;
 mod mm;
+mod vcpu;
 
 unsafe extern "C" {
     static __image_start: u8;

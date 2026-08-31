@@ -16,6 +16,13 @@ SECTIONS {
         __text_end = .;
     }
 
+    .payload : ALIGN(__ALIGN_SIZE) {
+        __payload_start = .;
+        KEEP(*(.payload .payload.*))
+        . = ALIGN(__ALIGN_SIZE);
+        __payload_end = .;
+    }
+
     /*
      * AArch64 has 16 exception-vector slots of 128 bytes, so VBAR_EL2 must
      * point to a 2 KiB-aligned table.  Use the stricter 4 KiB page alignment

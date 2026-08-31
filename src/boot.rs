@@ -194,6 +194,8 @@ extern "C" fn phase7_post_switch(
     );
 
     phase8_allocator_test(&takeover);
+    crate::guest::run_phase9_guest_test();
+
     if fault_test == FaultTest::Sync as u64 {
         println!("Triggering deliberate synchronous exception under tvisor tables...");
         unsafe { asm!("brk #0x600") };
@@ -219,7 +221,7 @@ extern "C" fn phase7_post_switch(
         // returns; the private EL2 handler reports the translation fault.
         let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
     }
-    println!("Phase 7 checkpoint complete; halting");
+    println!("Phase 9 checkpoint complete; halting");
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }

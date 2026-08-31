@@ -199,6 +199,10 @@ impl TablePage {
     pub const fn entries(&self) -> &[u64; ENTRIES_PER_TABLE] {
         &self.entries
     }
+
+    pub fn entries_mut(&mut self) -> &mut [u64; ENTRIES_PER_TABLE] {
+        &mut self.entries
+    }
 }
 
 #[repr(C, align(4096))]
@@ -211,6 +215,14 @@ impl<const N: usize> TableStorage<N> {
         Self {
             pages: [const { TablePage::zeroed() }; N],
         }
+    }
+
+    pub const fn pages(&self) -> &[TablePage; N] {
+        &self.pages
+    }
+
+    pub fn pages_mut(&mut self) -> &mut [TablePage; N] {
+        &mut self.pages
     }
 }
 

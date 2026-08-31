@@ -284,6 +284,9 @@ impl HcrEl2 {
     pub fn bit_vm(&self) -> bool {
         bit_check(self.value, 0)
     }
+    pub fn bit_swio(&self) -> bool {
+        bit_check(self.value, 1)
+    }
     pub fn bit_ptw(&self) -> bool {
         bit_check(self.value, 2)
     }
@@ -310,6 +313,9 @@ impl HcrEl2 {
     }
     pub fn bit_twe(&self) -> bool {
         bit_check(self.value, 14)
+    }
+    pub fn bit_tsc(&self) -> bool {
+        bit_check(self.value, 19)
     }
     pub fn bit_ttlb(&self) -> bool {
         bit_check(self.value, 25)
@@ -836,6 +842,77 @@ impl IdAa64Mmfr0El1 {
     }
 }
 
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct HpfarEl2 {
+    pub value: u64,
+}
+
+impl HpfarEl2 {
+    #[cfg(target_arch = "aarch64")]
+    pub fn dump() -> Option<Self> {
+        let el: ExceptionLevel = CurrentEL::dump().into();
+        if el >= ExceptionLevel::EL2 {
+            let value;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {value}, HPFAR_EL2",
+                    value = out(reg) value,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            Some(Self { value })
+        } else {
+            None
+        }
+    }
+
+    /// Fault IPA page base (bits [47:12]) held in HPFAR_EL2[47:4].
+    pub fn fipa_page(&self) -> u64 {
+        ((self.value >> 4) & 0x0000_0fff_ffff_ffff) << 12
+    }
+
+    /// Reconstructs the full faulting IPA using low 12 bits from FAR_EL2.
+    pub fn fault_ipa(&self, far_el2: u64) -> u64 {
+        self.fipa_page() | (far_el2 & 0xfff)
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct VmpidrEl2 {
+    pub value: u64,
+}
+
+impl VmpidrEl2 {
+    #[cfg(target_arch = "aarch64")]
+    pub fn dump() -> Option<Self> {
+        let el: ExceptionLevel = CurrentEL::dump().into();
+        if el >= ExceptionLevel::EL2 {
+            let value;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {value}, VMPIDR_EL2",
+                    value = out(reg) value,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            Some(Self { value })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn write(&self) {
+        unsafe {
+            core::arch::asm!(
+                "msr VMPIDR_EL2, {value}",
+                value = in(reg) self.value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, VtcrEl2, VttbrEl2};
@@ -1006,5 +1083,27 @@ mod tests {
         assert_eq!(r.tgran16(), 0xf);
         assert_eq!(r.tgran64(), 0xf);
         assert_eq!(r.tgran4(), 0xf);
+    }
+
+    #[test]
+    fn hpfar_el2_reconstructs_fault_ipa() {
+        // IPA 0x4000_1234 -> FIPA page 0x4000_1000 in bits [47:4] is (0x4000_1000 >> 12) << 4 = 0x400010
+        let hpfar = super::HpfarEl2 {
+            value: (0x4000_1000_u64 >> 12) << 4,
+        };
+        assert_eq!(hpfar.fipa_page(), 0x4000_1000);
+        assert_eq!(hpfar.fault_ipa(0x0000_0234), 0x4000_1234);
+    }
+
+    #[test]
+    fn hcr_el2_decodes_virtualization_bits() {
+        let hcr = super::HcrEl2 {
+            value: (1 << 31) | (1 << 19) | (1 << 1) | (1 << 0),
+        };
+        assert!(hcr.bit_rw());
+        assert!(hcr.bit_tsc());
+        assert!(hcr.bit_swio());
+        assert!(hcr.bit_vm());
+        assert!(!hcr.bit_fmo());
     }
 }
