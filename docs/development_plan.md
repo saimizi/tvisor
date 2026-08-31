@@ -705,6 +705,11 @@ Use the owned host database and allocator as the foundation for a separately
 defined guest physical environment. Guest launch itself should be planned and
 implemented as a subsequent project milestone.
 
+Phase 9 runs only on the boot physical CPU and creates exactly one guest vCPU.
+It must not start secondary physical CPUs. Guest and trap state should have
+clear ownership boundaries so it can later become per-vCPU state, but the
+initial implementation does not add synchronization for inactive CPUs.
+
 ### Registers, memory structures, and exception levels
 
 - Guest IPA layout and assigned PA pages.
@@ -732,7 +737,169 @@ implemented as a subsequent project milestone.
   access assigned RAM/UART and produces a diagnosed stage-2 fault for an
   unassigned IPA.
 
-## 15. Test and review policy
+## 15. Phase 10: boot a real single-vCPU guest
+
+### Goal
+
+Boot one real guest operating system while tvisor and the guest both remain on
+the boot physical CPU. Establish image loading, guest boot data, interrupts,
+timers, trap handling, and a guest console before introducing physical
+concurrency. The first console is an emulated PL011 whose output is forwarded
+through tvisor's physical Mini UART; Linux never owns the physical debug UART.
+
+### Registers, memory structures, and exception levels
+
+- Guest kernel, optional initrd, and generated-DTB placement in guest IPA
+  space, backed by allocator-owned physical pages.
+- One persistent vCPU context containing the guest-visible EL1 registers and
+  the EL2 return state required by `ERET`.
+- `HCR_EL2`, `CPTR_EL2`, `CNTHCTL_EL2`, `CNTVOFF_EL2`, `VTCR_EL2`, and
+  `VTTBR_EL2` policies for a single guest.
+- Physical and virtual interrupt-controller state required by the selected
+  guest boot milestone.
+- Guest timer state and EL2 handling for trapped or virtualized timer access.
+- A guest-visible PL011 register page at a fixed IPA. It remains absent from
+  the stage-2 map so accesses trap to EL2 for emulation.
+- Stage-2 MMIO-abort state, including `ESR_EL2`, `FAR_EL2`, `HPFAR_EL2`,
+  `ELR_EL2`, and the guest general-purpose register named by the syndrome.
+- Virtual PL011 transmit, status, configuration, and peripheral-identification
+  registers, followed later by interrupt/receive state. Tvisor retains
+  exclusive control of the physical Mini UART.
+- Stage-2 mappings for guest RAM and intentionally assigned or emulated
+  devices; host-only RAM and MMIO remain inaccessible.
+
+Bring up the console in two steps:
+
+1. Implement TX-only, polled early-console support. Emulate `UARTDR` writes by
+   forwarding the low byte to the Mini UART, report a ready transmitter through
+   `UARTFR`, and accept or ignore configuration writes without exposing the
+   physical UART. No guest UART interrupt or RX path is required for this
+   checkpoint.
+2. After early Linux output is stable, implement enough PL011 state for the
+   normal AMBA probe and `ttyAMA0` console, including the PL011 peripheral and
+   PrimeCell identification registers. Add receive buffering and virtual-GIC
+   interrupt injection only when an interactive guest console is required.
+
+VirtIO console and the general VirtIO device framework are deferred until
+after the physical and guest SMP phases.
+
+### Files and modules
+
+- Add a guest-image loader and explicit guest boot-configuration structures.
+- Add a single-vCPU context module and guest entry/resume loop.
+- Add a generic trapped-MMIO dispatcher and a virtual-PL011 device module.
+- Decode supported stage-2 MMIO accesses, update the referenced guest register
+  for reads, and advance `ELR_EL2` only after successful emulation.
+- Add the minimal interrupt, timer, and device policy required by the chosen
+  guest.
+- Extend the guest-DTB builder with `/chosen`, memory, CPU, interrupt, timer,
+  fixed-clock, and emulated-PL011 descriptions that match the implemented
+  virtual platform. Give the PL011 node its virtual IPA, compatible strings,
+  clock references, and—when implemented—virtual interrupt. Set `stdout-path`
+  and an appropriate `earlycon=pl011,mmio32,<ipa>` boot argument without
+  copying the host UART node or its physical address.
+- Document the supported guest image format and boot protocol.
+
+### Acceptance criteria and verification
+
+- **Host:** Image placement, DTB generation, IPA-to-PA mappings, and guest boot
+  arguments agree at every boundary. Malformed or overlapping images fail
+  without modifying allocator state. MMIO tests cover supported access widths,
+  read/write direction, guest-register updates, transmitter status, ignored or
+  retained configuration state, peripheral-identification values, unsupported
+  offsets, and correct PC advance.
+- **AArch64 build:** Guest entry/resume code and interrupt/timer register
+  encodings build without relying on physical SMP support. The stage-2 abort
+  path can distinguish the virtual PL011 IPA from invalid guest accesses and
+  resume an emulated access without corrupting the vCPU context.
+- **Raspberry Pi 4:** A single-vCPU guest reaches a defined boot checkpoint or
+  userspace console. Linux early-console bytes appear through the physical Mini
+  UART while tvisor retains its own diagnostic output. Deliberate stage-2 and
+  trapped-register tests return to the EL2 handler with decoded diagnostics;
+  an unsupported UART access fails visibly instead of being silently accepted.
+
+## 16. Phase 11: add tvisor physical SMP
+
+### Goal
+
+Start and manage the Raspberry Pi 4's secondary physical CPUs after the
+single-vCPU guest path is stable. Make tvisor's runtime state and EL2 execution
+safe under physical concurrency without yet exposing additional vCPUs to the
+guest.
+
+### Registers, memory structures, and exception levels
+
+- DT CPU topology, `MPIDR_EL1` affinity, and each CPU node's `enable-method`.
+- The firmware interface selected by discovery, such as PSCI, or the supported
+  platform-specific secondary-entry mechanism.
+- Per-CPU EL2 stacks with guard pages, exception state, current-task/vCPU
+  pointers, and a `TPIDR_EL2`-based per-CPU lookup policy.
+- Shared EL2 stage-1 tables and synchronization for page-table changes.
+- Locks or other serialization for the page allocator, UART, guest state, and
+  any other mutable global object currently protected only by the single-core
+  and DAIF-masked policy.
+- Cross-core barriers, cache visibility, interrupt-controller SGIs, and EL2 TLB
+  shootdowns.
+- CPU online, parked, and failed states.
+
+### Files and modules
+
+- Add `docs/tvisor_smp.md` before enabling a secondary CPU.
+- Add per-CPU storage and physical-CPU lifecycle modules.
+- Add the minimal synchronization primitives required by audited shared state.
+- Extend linker and memory-map support for one guarded EL2 stack per physical
+  CPU.
+- Update allocator, UART, exception, and translation-table code to remove
+  their documented single-core assumptions.
+
+### Acceptance criteria and verification
+
+- **Host:** Logical CPU-ID assignment, per-CPU indexing, startup-state
+  transitions, locks, and simulated TLB-shootdown coordination are tested.
+- **AArch64 build:** Every secondary entry path selects a valid private stack
+  before using Rust, establishes per-CPU state, and joins shared EL2 mappings
+  with the required barriers.
+- **Raspberry Pi 4:** All discovered cores enter tvisor, report unique MPIDR and
+  per-CPU stack values, safely exercise shared allocation and UART paths, and
+  can be parked without disturbing the single-vCPU guest.
+
+## 17. Phase 12: add guest SMP
+
+### Goal
+
+Expose multiple virtual CPUs to a guest after tvisor itself is safe on multiple
+physical CPUs. Keep vCPU identity and lifecycle independent of the physical CPU
+on which each vCPU currently executes.
+
+### Registers, memory structures, and exception levels
+
+- One complete EL1 and EL2-return context per vCPU.
+- vCPU lifecycle states and a scheduler or explicit vCPU-to-physical-CPU
+  assignment policy.
+- Virtual GIC state, virtual SGIs/IPIs, and per-vCPU virtual timers.
+- A guest-visible PSCI-compatible CPU on/off interface.
+- Shared stage-2 tables, VMID rules, and cross-core stage-2 TLB invalidation.
+- Guest DTB CPU topology, enable method, interrupt-controller, and timer nodes.
+
+### Files and modules
+
+- Add vCPU lifecycle, scheduling, and guest-PSCI modules.
+- Extend interrupt and timer virtualization with per-vCPU state.
+- Extend the guest-DTB builder to describe the selected virtual topology.
+- Add synchronization around shared VM and stage-2 state.
+
+### Acceptance criteria and verification
+
+- **Host:** vCPU state transitions, virtual CPU startup, IPI routing, timer
+  ownership, scheduling, and stage-2 shootdown targeting are tested.
+- **AArch64 build:** Context-switch and virtual-interrupt paths preserve every
+  architecturally required guest register.
+- **Raspberry Pi 4:** A controlled multi-vCPU payload exchanges virtual IPIs
+  and observes independent timers before an SMP guest OS is allowed to boot.
+  The final milestone is a guest that discovers and successfully uses the
+  intended number of virtual CPUs.
+
+## 18. Test and review policy
 
 Each phase should be a small reviewable change and must pass, in order:
 
@@ -749,26 +916,27 @@ checkpoints and one new risk at a time. Do not combine initial private-stack,
 vector-table, allocator, and translation-table switching into one hardware
 experiment.
 
-## 16. Immediate implementation order
+## 19. Current implementation order
 
-The first development iteration should stop after discovery and validation:
+Phases 0 through 8 are complete. Continue in this order:
 
-1. Define and test the common `fdt=` handoff for both `bootelf` and `go`.
-2. Evaluate an existing `no_std` FDT crate versus a local parser.
-3. Implement/wrap the generic FDT parser and test it on fixtures and the live
-   Raspberry Pi 4 DTB.
-4. Define `SystemInfoBuilder`, final `SystemInfo`, region types, capacity
-   behavior, and host tests using
-   the parser API and observed DTB structure as design inputs.
-5. Discover RAM and all reservation sources.
-6. Discover the console MMIO and CPU information.
-7. Normalize and print the physical database on the Raspberry Pi 4.
-8. Review the observed database before choosing tvisor's virtual-memory map.
+1. Design the Phase 9 guest IPA map, device policy, and guest-memory ownership
+   model.
+2. Implement and host-test stage-2 tables, register encodings, and a single
+   vCPU context.
+3. Run a controlled EL1 payload on the boot physical CPU and validate normal
+   accesses, traps, resume, and stage-2 faults.
+4. Define and boot the Phase 10 real single-vCPU guest.
+5. Design and implement Phase 11 tvisor physical SMP; do not start a secondary
+   CPU while any global mutable state still relies on single-core safety.
+6. Add Phase 12 guest SMP only after physical SMP, interrupts, timers, and TLB
+   shootdowns are stable.
 
-No allocator, U-Boot reclamation, page-table switch, or guest stage-2 setup is
-part of this first iteration.
+Each step must preserve a working checkpoint. Do not combine first guest entry,
+first secondary-CPU entry, and first multi-vCPU guest execution in one hardware
+change.
 
-## 17. Completion criteria for platform discovery
+## 20. Completion criteria for platform discovery
 
 The discovery milestone is complete when a Raspberry Pi 4 boot produces a
 stable, sorted report containing:
