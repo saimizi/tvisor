@@ -1,3 +1,4 @@
+use alloc::{boxed::Box, format, vec::Vec};
 use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
@@ -14,7 +15,10 @@ use tvisor_util::platform::discover_memory_map;
 use tvisor_util::println;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 
-use crate::mm;
+use crate::{
+    heap::{self, InitializedHeap, stats},
+    mm,
+};
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
@@ -269,6 +273,35 @@ extern "C" fn post_switch_page_tables(
             initialized.live_dtb,
         );
 
+        // Initialize heap allocator.
+        let heap = match heap::initialize(None) {
+            Ok(heap) => heap,
+            Err(error) => {
+                println!("Heap initialization failed: {}", error);
+                break 'wait;
+            }
+        };
+
+        let initialize_heap_state = format!(
+            "Rust heap initialized: arena=[{}, {}) bytes={} free={}",
+            heap.arena_start, heap.arena_end, heap.stats.arena_bytes, heap.stats.free_bytes,
+        );
+        println!("{}", initialize_heap_state);
+
+        let Ok(current_heap) = stats() else {
+            println!("Failed to get current heap stats");
+            break 'wait;
+        };
+
+        let current_heap_state = format!(
+            "Rust heap now: arena=[{:#018x}, {:#018x}) bytes={} free={}",
+            current_heap.arena_start,
+            current_heap.arena_start + current_heap.arena_bytes,
+            current_heap.arena_bytes,
+            current_heap.free_bytes
+        );
+        println!("{}", current_heap_state);
+
         crate::guest::run_guest();
 
         println!("Phase 9 checkpoint complete; halting");
@@ -277,6 +310,43 @@ extern "C" fn post_switch_page_tables(
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
+}
+
+#[allow(dead_code)]
+fn phase_heap_allocator_test(heap: InitializedHeap) {
+    let boxed = Box::new(0x4845_4150_424f_5831_u64);
+    assert_eq!(*boxed, 0x4845_4150_424f_5831);
+    let boxed_address = (&*boxed as *const u64) as usize;
+    assert!(boxed_address >= heap.stats.arena_start);
+    assert!(boxed_address < heap.stats.arena_start + heap.stats.arena_bytes);
+
+    let mut values = Vec::<u64>::new();
+    values
+        .try_reserve_exact(128)
+        .expect("reserve heap test vector");
+    for value in 0..128_u64 {
+        values.push(value ^ 0x5456_4953_4f52_4845);
+    }
+    assert_eq!(values.len(), 128);
+    assert_eq!(values[0], 0x5456_4953_4f52_4845);
+    assert_eq!(values[127], 127 ^ 0x5456_4953_4f52_4845);
+    let vector_address = values.as_ptr() as usize;
+    assert!(vector_address >= heap.stats.arena_start);
+    assert!(vector_address < heap.stats.arena_start + heap.stats.arena_bytes);
+
+    let active = crate::heap::stats().expect("active heap statistics");
+    assert_eq!(active.live_allocations, 2);
+    assert!(active.used_bytes >= core::mem::size_of::<u64>() + 128 * core::mem::size_of::<u64>());
+    drop(values);
+    drop(boxed);
+
+    let final_stats = crate::heap::stats().expect("final heap statistics");
+    assert_eq!(final_stats.live_allocations, 0);
+    assert_eq!(final_stats.used_bytes, 0);
+    println!(
+        "Rust heap checkpoint complete: Box/Vec passed used={} free={} failures={}",
+        final_stats.used_bytes, final_stats.free_bytes, final_stats.failed_allocations
+    );
 }
 
 #[allow(dead_code)]

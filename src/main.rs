@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::global_asm;
 use dtoolkit::fdt::Fdt;
 use tvisor_util::aarch64_reg::*;
@@ -13,6 +15,7 @@ use tvisor_util::{halt, println};
 mod boot;
 mod exception;
 mod guest;
+mod heap;
 mod mm;
 mod vcpu;
 

@@ -12,9 +12,13 @@ U-Boot and eventually run guest virtual machines. The current implementation:
   (DTB);
 - initializes the DTB-selected mini UART for diagnostics;
 - records RAM, firmware reservations, MMIO windows, CPUs, and console data;
-- derives permanent reservations and post-takeover usable RAM without a heap;
+- derives permanent reservations and post-takeover usable RAM before heap
+  initialization;
 - installs a private stack, exception vectors, and linker-owned EL2 stage-1
-  page tables; and
+  page tables;
+- initializes a global physical-page allocator to reclaim eligible U-Boot RAM
+  after takeover;
+- initializes a wrapped, fixed-size Rust heap after takeover; and
 - runs a controlled single-vCPU EL1 payload under stage-2 translation.
 
 After validating the handoff, tvisor takes ownership of EL2 and does not
@@ -40,7 +44,7 @@ at EL2 and provides a working DTB through the `fdt_addr` environment variable.
 
 ## Build and host tests
 
-Run the allocation-free host unit tests:
+Run the host unit tests:
 
 ```sh
 cargo test-host

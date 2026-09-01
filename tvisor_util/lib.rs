@@ -12,6 +12,7 @@ pub mod aarch64_reg;
 pub mod el2_translation;
 pub mod fdt;
 pub mod guest_fdt;
+pub mod heap_allocator;
 pub mod memory_map;
 pub mod page_allocator;
 pub mod platform;
