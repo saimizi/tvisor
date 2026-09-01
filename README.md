@@ -14,7 +14,9 @@ U-Boot and eventually run guest virtual machines. The current implementation:
 - records RAM, firmware reservations, MMIO windows, CPUs, and console data;
 - distinguishes permanent reservations from temporary U-Boot handoff memory;
 - derives pre-takeover and post-takeover usable-RAM maps without a heap; and
-- installs a private stack, exception vectors, and EL2 stage-1 page tables.
+- installs a private stack, exception vectors, and EL2 stage-1 page tables;
+- reclaims eligible U-Boot RAM through a global physical-page allocator; and
+- initializes a wrapped, fixed-size Rust heap after takeover.
 
 Tvisor does not run a guest VM yet. After validating the handoff, it takes
 ownership of EL2 and does not return to U-Boot.
@@ -39,7 +41,7 @@ at EL2 and provides a working DTB through the `fdt_addr` environment variable.
 
 ## Build and host tests
 
-Run the allocation-free host unit tests:
+Run the host unit tests:
 
 ```sh
 cargo test-host

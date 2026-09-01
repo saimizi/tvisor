@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::{asm, global_asm};
 use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
@@ -20,6 +22,7 @@ use tvisor_util::system_info::{
 
 mod boot;
 mod exception;
+mod heap;
 mod mm;
 
 unsafe extern "C" {
