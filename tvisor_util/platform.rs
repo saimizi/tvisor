@@ -77,8 +77,8 @@ impl fmt::Display for PlatformError {
 
 /// Collects temporary host-platform records from a validated live FDT.
 ///
-/// The builder contains no references into `fdt`. The caller may add U-Boot
-/// handoff records before finalizing it into `SystemInfo`.
+/// The builder contains no references into `fdt` and can be finalized directly
+/// into `SystemInfo` after discovery.
 pub fn discover_system_info_builder(
     fdt: Fdt<'_>,
     dtb_address: PhysAddr,
@@ -294,7 +294,7 @@ fn discover_reservations(
         info,
         dtb_region,
         ReservationOrigin::Dtb,
-        ReservationOwner::Bootloader,
+        ReservationOwner::Tvisor,
         ReservationAttributes::default(),
     )?;
     add_reserved(
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_temporary_ram_reservations_and_runtime_platform_data() {
+    fn discovers_permanent_runtime_reservations_and_platform_data() {
         let fdt = Fdt::new(TEST_DTB).unwrap();
         let image = PhysRegion::new(PhysAddr::new(0x0400_0000), 0x20_0000).unwrap();
 
@@ -491,6 +491,7 @@ mod tests {
         }));
         assert!(info.reserved().iter().any(|entry| {
             entry.origin == ReservationOrigin::Dtb
+                && entry.owner == ReservationOwner::Tvisor
                 && entry.region.start() == PhysAddr::new(0x0300_0000)
         }));
         assert!(info.reserved().iter().any(|entry| {

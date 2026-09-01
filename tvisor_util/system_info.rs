@@ -448,7 +448,7 @@ pub struct ConsoleInfo {
     pub registers: PhysRegion,
 }
 
-/// Temporary platform records collected from the DTB and U-Boot handoff.
+/// Temporary platform records collected from the DTB and fixed tvisor runtime.
 ///
 /// Call `finalize()` after discovery is complete. Finalization normalizes the
 /// memory records into `MemoryMap`, moves runtime platform data into
@@ -573,6 +573,12 @@ pub struct SystemInfo {
 impl SystemInfo {
     pub const fn memory(&self) -> &MemoryMap {
         &self.memory
+    }
+
+    /// Consume the platform record and transfer ownership of its normalized
+    /// memory map to the post-takeover allocator initialization path.
+    pub fn into_memory(self) -> MemoryMap {
+        self.memory
     }
 
     pub const fn bus_translations(&self) -> &FixedList<BusTranslation, MAX_BUS_TRANSLATIONS> {

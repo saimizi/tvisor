@@ -9,35 +9,32 @@ use tvisor_util::el2_translation::{
     El2RegisterValues, Mapping, MemoryType, PAGE_SIZE, TableSet, TableStorage, TranslationError,
     pa_bits_from_parange, register_values,
 };
-use tvisor_util::memory_map::{MAX_NORMALIZED_RESERVED_REGIONS, MemoryMap};
+use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
-    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, PageState,
-    page_covering,
+    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
 };
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = MAX_TABLE_PAGES as u64 * PAGE_SIZE;
 
-#[derive(Clone, Copy)]
-struct ReclaimMemoryInfo {
-    /// U-Boot handoff regions eligible for reclamation after takeover.
-    reclaimable_regions: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
-    /// Exact live DTB byte range used for post-takeover validation.
+struct PendingAllocatorInfo {
+    /// Final normalized platform memory map moved into tvisor-owned storage
+    /// before leaving U-Boot's stack and translation regime.
+    memory_map: MemoryMap,
+    /// Exact live DTB byte range retained by the permanent reservation map.
     live_dtb: PhysRegion,
-    /// Page-rounded DTB range that must remain allocated during reclamation.
-    retained_dtb_pages: PhysRegion,
 }
 
-struct GlobalReclaimMemoryInfo {
-    value: UnsafeCell<Option<ReclaimMemoryInfo>>,
+struct GlobalPendingAllocatorInfo {
+    value: UnsafeCell<Option<PendingAllocatorInfo>>,
 }
 
-// Phase 8 remains single-core with DAIF masked. The value is installed before
-// allocator initialization is published and consumed exactly once afterward.
-unsafe impl Sync for GlobalReclaimMemoryInfo {}
+// The value is installed on the boot CPU before the no-return switch and
+// consumed exactly once afterward while DAIF remains masked.
+unsafe impl Sync for GlobalPendingAllocatorInfo {}
 
-impl GlobalReclaimMemoryInfo {
+impl GlobalPendingAllocatorInfo {
     const fn empty() -> Self {
         Self {
             value: UnsafeCell::new(None),
@@ -69,7 +66,7 @@ impl GlobalPageAllocator {
 }
 
 static PAGE_ALLOCATOR: GlobalPageAllocator = GlobalPageAllocator::new();
-static RECLAIM_MEMORY_INFO: GlobalReclaimMemoryInfo = GlobalReclaimMemoryInfo::empty();
+static PENDING_ALLOCATOR_INFO: GlobalPendingAllocatorInfo = GlobalPendingAllocatorInfo::empty();
 
 unsafe extern "C" {
     static __text_start: u8;
@@ -86,6 +83,8 @@ unsafe extern "C" {
     static __boot_stack_guard_end: u8;
     static __boot_stack_bottom: u8;
     static __boot_stack_top: u8;
+    static __bootstrap_tables_start: u8;
+    static __bootstrap_tables_end: u8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +119,6 @@ pub struct PreparedTables {
     pub arena_start: u64,
     pub arena_end: u64,
     pub used_pages: usize,
-    pub allocator_stats: AllocatorStats,
     pub live_dtb_pages: PhysRegion,
 }
 
@@ -131,22 +129,24 @@ macro_rules! link_addr {
 }
 
 pub fn prepare(
-    memory_map: &MemoryMap,
+    memory_map: MemoryMap,
     uart_register_base: u64,
     parange: u8,
     live_dtb: PhysRegion,
 ) -> Result<PreparedTables, PrepareError> {
     let pa_bits = pa_bits_from_parange(parange)?;
-    initialize_allocator(memory_map, live_dtb)?;
-    let arena_start =
-        with_allocator(|allocator| allocator.allocate_contiguous(MAX_TABLE_PAGES))?.value();
-    let arena_end = arena_start
-        .checked_add(TABLE_ARENA_SIZE)
-        .ok_or(PrepareError::AddressOverflow)?;
+    let arena_start = link_addr!(__bootstrap_tables_start);
+    let arena_end = link_addr!(__bootstrap_tables_end);
+    if arena_start & (PAGE_SIZE - 1) != 0
+        || arena_end & (PAGE_SIZE - 1) != 0
+        || arena_end.checked_sub(arena_start) != Some(TABLE_ARENA_SIZE)
+    {
+        return Err(PrepareError::Validation);
+    }
 
-    // SAFETY: the global allocator returned MAX_TABLE_PAGES contiguous pages
-    // from INITIAL RAM and marked all of them InUse. U-Boot identity-maps this
-    // RAM, and TableSet has exclusive access to the allocation.
+    // SAFETY: the linker reserves exactly MAX_TABLE_PAGES writable, aligned
+    // pages inside tvisor's runtime footprint. No other object aliases the
+    // section, and explicit clearing is required because it is NOLOAD.
     let storage = unsafe {
         core::ptr::write_bytes(arena_start as *mut u8, 0, TABLE_ARENA_SIZE as usize);
         &mut *(arena_start as *mut TableStorage<MAX_TABLE_PAGES>)
@@ -201,6 +201,7 @@ pub fn prepare(
         true,
         false,
     )?;
+    map_identity(&mut tables, arena_start, arena_end, true, false)?;
     map_identity_regions_excluding(
         &mut tables,
         memory_map.usable_ram(),
@@ -235,6 +236,15 @@ pub fn prepare(
     )?;
     let used_pages = tables.used_pages();
     let registers = register_values(tables.root_pa(), parange)?;
+    // Move the final platform memory map out of the inherited U-Boot stack
+    // before switching stacks. Allocator initialization consumes it only
+    // after tvisor's EL2 translation regime is active.
+    unsafe {
+        *PENDING_ALLOCATOR_INFO.value.get() = Some(PendingAllocatorInfo {
+            memory_map,
+            live_dtb,
+        });
+    }
     // Publish every descriptor store before TTBR0_EL2 can expose the tables to
     // the hardware walker. The initial implementation uses coherent Normal
     // WB/WA memory and identity mappings under both translation regimes.
@@ -247,110 +257,76 @@ pub fn prepare(
         arena_start,
         arena_end,
         used_pages,
-        allocator_stats: allocator_stats()?,
         live_dtb_pages,
     })
 }
 
-fn initialize_allocator(
-    memory_map: &MemoryMap,
-    live_dtb: PhysRegion,
-) -> Result<(), AllocatorError> {
-    if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let live_dtb_pages = page_covering(live_dtb)?;
-    // SAFETY: initialization runs once on the boot CPU before any allocator
-    // client or asynchronous exception can access this static state.
-    let allocator = unsafe {
-        PageAllocator::new(
-            memory_map.ram(),
-            memory_map.usable_ram(),
-            memory_map.initial_usable_ram(),
-            &mut *PAGE_ALLOCATOR.managed.get(),
-            &mut *PAGE_ALLOCATOR.in_use.get(),
-        )?
-    };
-    let stats = allocator.stats();
-    // SAFETY: reclamation information is installed before allocator
-    // initialization is published and is consumed only after takeover.
-    unsafe {
-        *RECLAIM_MEMORY_INFO.value.get() = Some(ReclaimMemoryInfo {
-            reclaimable_regions: *memory_map.transition_reserved(),
-            live_dtb,
-            retained_dtb_pages: live_dtb_pages,
-        });
-    }
-    PAGE_ALLOCATOR
-        .ram_pages
-        .store(stats.ram_pages, Ordering::Relaxed);
-    PAGE_ALLOCATOR.initialized.store(true, Ordering::Release);
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TakeoverResult {
-    pub released_pages: usize,
+pub struct AllocatorInitResult {
     pub stats: AllocatorStats,
     pub live_dtb: PhysRegion,
-    /// An unused page from reclaimed U-Boot memory for hardware validation.
-    pub reclaimed_test_page: Option<PhysAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TakeoverError {
+pub enum AllocatorInitError {
     Allocator(AllocatorError),
-    ReclaimMemoryInfoUnavailable,
+    PendingInfoUnavailable,
     InvalidDtb,
+    DtbAllocatable,
 }
 
-impl From<AllocatorError> for TakeoverError {
+impl From<AllocatorError> for AllocatorInitError {
     fn from(error: AllocatorError) -> Self {
         Self::Allocator(error)
     }
 }
 
-/// Reclaim U-Boot handoff RAM while retaining the page-rounded live DTB.
-/// This is valid only after tvisor has crossed its no-return boundary.
-pub fn complete_takeover() -> Result<TakeoverResult, TakeoverError> {
-    let info = take_reclaim_memory_info()?;
-    let live_dtb = info.live_dtb;
-    let live_dtb_pages = info.retained_dtb_pages;
-    let mut released_pages = 0;
-    for region in &info.reclaimable_regions {
-        if region.overlaps(live_dtb_pages) {
-            if region.start() < live_dtb_pages.start() {
-                let before = PhysRegion::from_bounds(region.start(), live_dtb_pages.start())
-                    .map_err(AllocatorError::InvalidRegion)?;
-                released_pages += with_allocator(|allocator| allocator.release(before))?;
-            }
-            if region.end() > live_dtb_pages.end() {
-                let after = PhysRegion::from_bounds(live_dtb_pages.end(), region.end())
-                    .map_err(AllocatorError::InvalidRegion)?;
-                released_pages += with_allocator(|allocator| allocator.release(after))?;
-            }
-        } else {
-            released_pages += with_allocator(|allocator| allocator.release(*region))?;
-        }
+/// Initialize the global physical-page allocator after tvisor has installed
+/// its private stack, vectors, and EL2 stage-1 translation regime.
+///
+/// All `usable_ram` pages start unused. U-Boot runtime allocations require no
+/// explicit reclamation because they are absent from the permanent platform
+/// reservation map. The tvisor image and live DTB remain reserved.
+pub fn initialize_allocator_after_takeover() -> Result<AllocatorInitResult, AllocatorInitError> {
+    if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
+        return Err(AllocatorError::DoubleFree.into());
     }
+    // SAFETY: the boot CPU installed this value before the no-return switch.
+    // Phase 8 is single-core with DAIF masked, and taking it is a one-shot
+    // ownership transfer into allocator initialization.
+    let info = unsafe { (*PENDING_ALLOCATOR_INFO.value.get()).take() }
+        .ok_or(AllocatorInitError::PendingInfoUnavailable)?;
+    let live_dtb = info.live_dtb;
+    validate_live_dtb(live_dtb)?;
+    let live_dtb_pages = page_covering(live_dtb)?;
+
+    // SAFETY: initialization runs once after takeover on the boot CPU before
+    // any allocator client or asynchronous exception can access this state.
+    let allocator = unsafe {
+        PageAllocator::new(
+            info.memory_map.ram(),
+            info.memory_map.usable_ram(),
+            info.memory_map.usable_ram(),
+            &mut *PAGE_ALLOCATOR.managed.get(),
+            &mut *PAGE_ALLOCATOR.in_use.get(),
+        )?
+    };
     let mut page = live_dtb_pages.start().value();
     while page < live_dtb_pages.end().value() {
-        let state = with_allocator(|allocator| allocator.state(PhysAddr::new(page)))?;
-        if state == PageState::Unused {
-            return Err(AllocatorError::DoubleFree.into());
+        if allocator.state(PhysAddr::new(page))? != tvisor_util::page_allocator::PageState::Reserved
+        {
+            return Err(AllocatorInitError::DtbAllocatable);
         }
         page = page
             .checked_add(PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
     }
-    validate_live_dtb(live_dtb)?;
-    let reclaimed_test_page = first_unused_page_in(&info.reclaimable_regions, live_dtb_pages);
-    Ok(TakeoverResult {
-        released_pages,
-        stats: allocator_stats()?,
-        live_dtb,
-        reclaimed_test_page,
-    })
+    let stats = allocator.stats();
+    PAGE_ALLOCATOR
+        .ram_pages
+        .store(stats.ram_pages, Ordering::Relaxed);
+    PAGE_ALLOCATOR.initialized.store(true, Ordering::Release);
+    Ok(AllocatorInitResult { stats, live_dtb })
 }
 
 /// Allocate the lowest-addressed unused managed 4 KiB physical page.
@@ -369,43 +345,12 @@ pub fn allocate_high_page() -> Result<PhysAddr, AllocatorError> {
     with_allocator(|allocator| allocator.allocate_high())
 }
 
-/// Allocate the lowest-addressed unused managed 4 KiB page inside `region`.
-///
-/// The search uses only complete pages covered by `region`: its start is
-/// rounded up and its end is rounded down to page boundaries. The region does
-/// not grant allocator ownership; reserved and already-in-use pages within it
-/// are skipped. The returned page is changed to `InUse`.
-pub fn allocate_page_in(region: PhysRegion) -> Result<PhysAddr, AllocatorError> {
-    with_allocator(|allocator| allocator.allocate_in(region))
-}
-
 pub fn free_page(page: PhysAddr) -> Result<(), AllocatorError> {
     with_allocator(|allocator| allocator.free(page))
 }
 
 pub fn allocator_stats() -> Result<AllocatorStats, AllocatorError> {
     with_allocator(|allocator| Ok(allocator.stats()))
-}
-
-fn first_unused_page_in<const N: usize>(
-    regions: &FixedList<PhysRegion, N>,
-    retained_pages: PhysRegion,
-) -> Option<PhysAddr> {
-    for region in regions {
-        let start = align_up(region.start().value(), PAGE_SIZE)?;
-        let end = region.end().value() & !(PAGE_SIZE - 1);
-        let mut page = start;
-        while page < end {
-            let address = PhysAddr::new(page);
-            if !retained_pages.contains_address(address)
-                && with_allocator(|allocator| allocator.state(address)).ok()? == PageState::Unused
-            {
-                return Some(address);
-            }
-            page = page.checked_add(PAGE_SIZE)?;
-        }
-    }
-    None
 }
 
 fn with_allocator<T>(
@@ -427,24 +372,14 @@ fn with_allocator<T>(
     operation(&mut allocator)
 }
 
-fn take_reclaim_memory_info() -> Result<ReclaimMemoryInfo, TakeoverError> {
-    if !PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
-        return Err(AllocatorError::NotInitialized.into());
-    }
-    // SAFETY: Phase 8 is single-core with asynchronous exceptions masked.
-    // Initialization published Some(info), and taking it makes reclamation a
-    // one-shot operation.
-    unsafe { (*RECLAIM_MEMORY_INFO.value.get()).take() }
-        .ok_or(TakeoverError::ReclaimMemoryInfoUnavailable)
-}
-
-fn validate_live_dtb(region: PhysRegion) -> Result<(), TakeoverError> {
+fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {
     if region.size() < 8 {
-        return Err(TakeoverError::InvalidDtb);
+        return Err(AllocatorInitError::InvalidDtb);
     }
     let base = region.start().value() as *const u8;
     // SAFETY: prepare mapped the validated live-DTB region read-only before
-    // switching tables, and complete_takeover retained all covering pages.
+    // switching tables, and the permanent reservation keeps all covering
+    // pages outside the allocator.
     let read_be32 = |offset: usize| unsafe {
         u32::from_be_bytes([
             core::ptr::read_volatile(base.add(offset)),
@@ -454,7 +389,7 @@ fn validate_live_dtb(region: PhysRegion) -> Result<(), TakeoverError> {
         ])
     };
     if read_be32(0) != 0xd00d_feed || u64::from(read_be32(4)) != region.size() {
-        return Err(TakeoverError::InvalidDtb);
+        return Err(AllocatorInitError::InvalidDtb);
     }
     Ok(())
 }

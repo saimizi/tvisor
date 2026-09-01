@@ -73,6 +73,25 @@ SECTIONS {
         __boot_stack_top = .;
     }
 
+    /*
+     * Linker-owned storage for the initial EL2 stage-1 tables.  Keeping this
+     * arena inside tvisor's runtime footprint removes any need to allocate
+     * physical pages while U-Boot's translation regime is still active.
+     * NOLOAD means startup code must explicitly zero it before use.
+     */
+    .bootstrap_tables (NOLOAD) : ALIGN(__ALIGN_SIZE) {
+        __bootstrap_tables_start = .;
+        . += 0x10000;
+        __bootstrap_tables_end = .;
+    }
+
     . = ALIGN(__ALIGN_SIZE);
     __image_end = .;
+
+    ASSERT((__bootstrap_tables_start & 0xfff) == 0,
+           "bootstrap table arena must be 4 KiB aligned")
+    ASSERT((__bootstrap_tables_end & 0xfff) == 0,
+           "bootstrap table arena end must be 4 KiB aligned")
+    ASSERT((__bootstrap_tables_end - __bootstrap_tables_start) == 0x10000,
+           "bootstrap table arena must contain exactly 16 pages")
 }

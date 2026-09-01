@@ -2,17 +2,16 @@
 
 ## 1. Status and scope
 
-This document proposes a future simplification of tvisor's U-Boot handoff and
-EL2 takeover design. It is a design note only. The change must not be
-implemented while Phase 9 guest bring-up is in progress.
+This document records the Phase 9 simplification of tvisor's U-Boot handoff
+and EL2 takeover design. The work is included in Phase 9 so the first supported
+guest execution environment does not depend on U-Boot's internal runtime
+allocator state.
 
-The proposed work is intentionally deferred until the current Phase 9 behavior
-has been completed and recorded. It changes the boot contract, early page-table
-storage, memory-map normalization, and allocator initialization, so combining
-it with guest-entry work would make failures unnecessarily difficult to
-isolate.
+The implementation remains split into reviewable checkpoints: first adding
+the linker-owned table arena, then moving allocator initialization after the
+EL2 switch and removing the runtime-region arguments.
 
-The proposal removes these runtime arguments:
+The Phase 9 change removes these runtime arguments:
 
 ```text
 lmb=<start>:<size>
@@ -25,7 +24,7 @@ and transferring execution to tvisor's entry point.
 
 ## 2. Problem statement
 
-The current implementation constructs two physical-memory views:
+The former implementation constructed two physical-memory views:
 
 ```text
 INITIAL_USABLE = RAM - permanent reservations - U-Boot handoff reservations
@@ -77,7 +76,7 @@ TVISOR_RUNTIME = [__image_start, __image_end)
 The complete interval, rather than only the downloaded file bytes, must be
 safe before U-Boot transfers control.
 
-## 4. Proposed design
+## 4. Design
 
 ### 4.1 Linker-owned bootstrap table arena
 
@@ -135,10 +134,10 @@ runtime footprint, apart from intentional MMIO writes to the discovered UART.
 
 ### 4.3 Post-switch allocator initialization
 
-The general physical-page allocator should be initialized after tvisor has
+The general physical-page allocator is initialized after tvisor has
 activated its private stack, vectors, and EL2 stage-1 translation regime.
 
-Its managed memory should be derived from stable platform and ownership data:
+Its managed memory is derived from stable platform and ownership data:
 
 ```text
 ALLOCATABLE_RAM = DTB RAM - permanent reservations
@@ -189,8 +188,8 @@ symbol-derived size must expose the required footprint to the boot procedure.
 
 ## 5. Why this removes the LMB dependency
 
-Today, LMB information protects a dynamically selected table arena while
-U-Boot's translation tables may still be active:
+Previously, LMB information protected a dynamically selected table arena while
+U-Boot's translation tables could still be active:
 
 ```text
 LMB arguments
@@ -229,7 +228,7 @@ runtime footprint = __image_end - __image_start
 The runtime footprint includes `.bss`, stack storage, guards, and bootstrap
 tables even if they occupy no bytes in the ELF or raw binary payload.
 
-Before adopting the design, the build and boot documentation should record:
+The build and boot documentation records:
 
 - `__image_start`;
 - `__image_end`;
@@ -238,13 +237,13 @@ Before adopting the design, the build and boot documentation should record:
 - the maximum permitted runtime footprint inside the validated Pi 4 load
   window.
 
-A build-time assertion should fail if the arena has the wrong alignment or
-size. A deployment-time check should fail if the complete runtime footprint no
-longer fits the region validated for the board and U-Boot configuration.
+Build-time assertions fail if the arena has the wrong alignment or size. The
+deployment procedure must reject a complete runtime footprint that no longer
+fits the region validated for the board and U-Boot configuration.
 
-## 7. Expected code changes after Phase 9
+## 7. Phase 9 code changes
 
-The later implementation is expected to affect these areas.
+The implementation affects these areas.
 
 ### `scripts/rpi.ld`
 
@@ -291,15 +290,14 @@ The later implementation is expected to affect these areas.
 - Update the memory-map and phase recap documents.
 - Retain historical notes where they explain the reason for the former design.
 
-These are expected changes, not an instruction to remove types mechanically.
-Before deletion, each use must be audited for a non-U-Boot lifetime purpose.
+Types are removed only after auditing their uses for a non-U-Boot lifetime
+purpose.
 
 ## 8. Migration sequence
 
-Implementation should occur as a separate post-Phase 9 change with small,
-reviewable checkpoints:
+Implementation occurs within Phase 9 using small, reviewable checkpoints:
 
-1. Record the known-good Phase 9 build and Raspberry Pi serial output.
+1. Record the known-good pre-refactor Phase 9 build and Raspberry Pi output.
 2. Add the linker arena without changing the table-allocation path; verify
    symbols and runtime footprint.
 3. Make table construction use the embedded arena and verify the existing
@@ -343,7 +341,7 @@ placement distinguishable from regressions in memory-map simplification.
 
 ## 10. Non-goals
 
-This proposal does not:
+This change does not:
 
 - make tvisor position independent;
 - allow U-Boot to choose an arbitrary load address;
@@ -354,19 +352,18 @@ This proposal does not:
 - alter Phase 9 while it is under active development.
 
 Supporting arbitrary placement would require a separate relocatable or
-self-relocating image design. This proposal instead makes the existing fixed
+self-relocating image design. This change instead makes the existing fixed
 Raspberry Pi 4 boot contract smaller, explicit, and testable.
 
 ## 11. Decision summary
 
-After Phase 9 is complete, tvisor should embed its initial 64-KiB EL2
-page-table arena in a dedicated linker section within the complete tvisor
-runtime footprint. It should perform no general physical-memory allocation
-before installing its private EL2 translation regime. Once takeover is
-complete, it should initialize the allocator directly from DTB-described RAM
-minus permanent reservations.
+Phase 9 embeds the initial 64-KiB EL2 page-table arena in a dedicated linker
+section within the complete tvisor runtime footprint. It performs no general
+physical-memory allocation before installing its private EL2 translation
+regime. After takeover, it initializes the allocator directly from
+DTB-described RAM minus permanent reservations.
 
-The `lmb=` and `bootmem=` arguments should then be removed from the runtime
-interface. U-Boot LMB and `bdinfo` remain useful for validating the fixed load
-window during development and deployment, but they no longer participate in
-tvisor's memory-map construction or takeover correctness.
+The `lmb=` and `bootmem=` arguments are absent from the runtime interface.
+U-Boot LMB and `bdinfo` remain useful for validating the fixed load window
+during development and deployment, but they no longer participate in tvisor's
+memory-map construction or takeover correctness.

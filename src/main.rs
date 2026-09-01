@@ -7,16 +7,10 @@ use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::boot_mode::fault_test_from_args;
 use tvisor_util::debug_util::{debug_fini, debug_init};
 use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
-use tvisor_util::fdt::{
-    discover_console, fdt_address_from_uboot_args, fdt_init, uboot_boot_allocations_from_args,
-    uboot_lmb_reservations_from_args,
-};
+use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::platform::discover_system_info_builder;
 use tvisor_util::println;
-use tvisor_util::system_info::{
-    ConsoleKind, PhysAddr, PhysRegion, ReservationAttributes, ReservationOrigin, ReservationOwner,
-    ReservedRegion,
-};
+use tvisor_util::system_info::{ConsoleKind, PhysAddr, PhysRegion};
 
 mod boot;
 mod exception;
@@ -170,7 +164,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
                 stop();
             }
         };
-    let mut system_info_builder = match discover_system_info_builder(
+    let system_info_builder = match discover_system_info_builder(
         *fdt,
         PhysAddr::new(dtb_base as usize as u64),
         tvisor_image,
@@ -183,32 +177,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
             stop();
         }
     };
-
-    let uboot_lmb = match unsafe { uboot_lmb_reservations_from_args(argc, argv) } {
-        Ok(reservations) => reservations,
-        Err(error) => {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    };
-    let boot_allocations = match unsafe { uboot_boot_allocations_from_args(argc, argv) } {
-        Ok(allocations) => allocations,
-        Err(error) => {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    };
-    for region in uboot_lmb.iter().chain(boot_allocations.iter()) {
-        if let Err(error) = system_info_builder.add_reserved(ReservedRegion {
-            region: *region,
-            origin: ReservationOrigin::Bootloader,
-            owner: ReservationOwner::Bootloader,
-            attributes: ReservationAttributes::default(),
-        }) {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    }
 
     let system_info = match system_info_builder.finalize() {
         Ok(info) => info,
@@ -257,7 +225,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     }
 
     let prepared = match mm::prepare(
-        system_info.memory(),
+        system_info.into_memory(),
         console.registers.start().value(),
         mmfr0.parange(),
         live_dtb,
@@ -268,8 +236,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
             stop();
         }
     };
-
-    drop(system_info);
 
     println!(
         "Phase 7 tables prepared: arena=[{:#018x}, {:#018x}) pages={}",
@@ -283,14 +249,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         " TTBR0_EL2={:#018x} SCTLR_EL2={:#018x}",
         prepared.registers.ttbr0_el2, prepared.registers.sctlr_el2
     );
-    println!(
-        "Phase 8 allocator prepared: RAM={} reserved={} in-use={} unused={} DTB={}",
-        prepared.allocator_stats.ram_pages,
-        prepared.allocator_stats.reserved_pages,
-        prepared.allocator_stats.in_use_pages,
-        prepared.allocator_stats.unused_pages,
-        prepared.live_dtb_pages,
-    );
+    println!("  Live DTB pages retained: {}", prepared.live_dtb_pages);
     println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.

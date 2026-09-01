@@ -5,14 +5,15 @@
 Tvisor enters at EL2 through U-Boot, validates the inherited CPU and platform
 state, and then performs an irreversible takeover. It installs its own stack,
 exception vectors, EL2 stage-1 translation tables, and physical-page allocator.
-After the switch, it reclaims eligible U-Boot RAM while retaining the original
+The tables come from its fixed runtime footprint; after the switch, it
+initializes the allocator directly from usable RAM while retaining the original
 DTB pages used by the global FDT handle.
 
 The completed discovery and execution-environment work follows this dependency
 order:
 
 ```text
-live U-Boot DTB and handoff information
+         live U-Boot DTB
                  |
                  v
         validated generic FDT parser
@@ -36,9 +37,8 @@ live U-Boot DTB and handoff information
  private stack, vectors, allocator, and EL2 page tables
 ```
 
-This document records the phased implementation plan through the completed
-physical-page allocator and U-Boot-memory reclamation work. It does not define
-a final guest memory layout.
+This document records the phased implementation plan through the physical-page
+allocator, initial single-vCPU guest, and later SMP milestones.
 
 ## 2. Current codebase and constraints
 
@@ -47,16 +47,16 @@ The current implementation has these properties:
 - `src/main.rs` provides an assembly `main` that clears `.bss` and enters the
   no-return Rust boot sequence.
 - `rust_main` validates the DTB and EL2 handoff state, builds `SystemInfo`,
-  prepares the allocator-owned translation tables, and enters private EL2.
+  prepares linker-owned translation tables, and enters private EL2.
 - `tvisor_util/aarch64_reg.rs` contains typed AArch64 register accessors.
 - `tvisor_util/diag.rs` collects the read-only handoff state.
 - `tvisor_util/debug_util.rs` supplies the early mini-UART debug path.
 - `src/boot.rs` installs tvisor's private stack, vectors, and EL2 translation
-  regime, then completes U-Boot-memory reclamation.
+  regime, then initializes the physical allocator.
 - `src/mm.rs` owns the global physical-page allocator, page-table preparation,
-  retained-DTB mapping, and one-shot reclamation metadata.
+  retained-DTB mapping, and one-shot post-switch memory-map storage.
 - `scripts/rpi.ld` links tvisor at physical address `0x0400_0000` and exports
-  page-aligned image, section, guard, and stack symbols.
+  page-aligned image, section, guard, stack, and bootstrap-table symbols.
 - `docs/address_translation.md` describes EL2 stage 1 and guest stage 2.
 - `docs/check_handoff_state.md` defines the diagnostic phase and the observed
   U-Boot handoff register state.
@@ -65,10 +65,10 @@ The current implementation has these properties:
 - `docs/peripheral_address_translation.md` explains how DT `ranges` converts
   bus addresses into ARM physical addresses.
 
-Phases before the no-return transition remained compatible with returning to
-U-Boot and therefore preserved all U-Boot-owned memory. The current takeover
-path does not return. It reclaims only explicitly described handoff RAM after
-tvisor's private environment is active, and it retains the live DTB pages.
+The takeover path does not return. Before the switch, every write remains
+inside tvisor's validated fixed runtime footprint. After the switch, U-Boot
+runtime memory needs no explicit reservation or reclamation input; the live
+DTB pages remain permanently excluded while borrowed.
 
 No code may assume that the development board's captured `bdinfo` layout is a
 stable ABI. Installed RAM, reservations, the DTB address, and U-Boot relocation
@@ -426,9 +426,8 @@ from it.
 - Tvisor image sections from linker symbols.
 - Current stack extent, once its bounds can be established.
 - Live DTB extent.
-- U-Boot runtime/LMB regions while returning to U-Boot remains possible.
-- ELF staging buffer, loaded guest images, initrds, future page-table pools,
-  and other explicit boot allocations.
+- Loaded guest images, initrds, future page-table pools, and other explicit
+  tvisor-owned allocations.
 - BCM2711 MMIO windows and discovered device MMIO.
 - No register writes; EL2 remains in the inherited environment.
 
@@ -444,32 +443,15 @@ Normalization must:
 - produce a separate `usable_ram` list;
 - fail explicitly if fixed capacities are insufficient.
 
-U-Boot ownership is temporary and must not be folded into the permanent SoC
-memory map. When a pre-takeover safety map is needed, both launch paths may
-pass every entry reported by the immediately preceding `bdinfo`, plus explicit
-load buffers, as repeatable tagged arguments:
+U-Boot ownership is temporary and is not part of the normalized runtime map.
+Before takeover, tvisor writes only its linker-defined runtime footprint; the
+initial stack, vectors, and page tables are statically reserved there. U-Boot
+`bdinfo` and LMB output remain deployment evidence used to validate that fixed
+window, not runtime arguments or a handoff ABI.
 
-```text
-lmb=<hex-start>:<hex-size>
-bootmem=<hex-start>:<hex-size>
-```
-
-`lmb=` carries the live LMB list. `bootmem=` carries explicit boot allocations
-not necessarily represented by LMB, including the `go` download region or the
-`bootelf` staging ELF. Both inputs are optional metadata and are copied into
-`SystemInfoBuilder` as bootloader-owned, reclaim-after-takeover reservations.
-They refine `initial_usable`, but never reduce the post-takeover `usable_ram` map.
-The arguments are a per-boot snapshot and must not be treated as fixed
-Raspberry Pi addresses.
-
-Normalization therefore produces two allocation views:
-
-- `initial_usable`: excludes permanent reservations and all known U-Boot/DTB/
-  staging memory; use it to construct tvisor-owned stacks and page tables
-  before the no-return transition;
-- `usable_ram`: excludes only permanent SoC, firmware, device, policy, and
-  tvisor reservations; U-Boot-owned memory appears here because it becomes
-  reclaimable after takeover.
+Normalization produces one `usable_ram` allocation view. It excludes
+permanent SoC, firmware, device, policy, live-DTB, and tvisor reservations and
+is consumed only after the no-return transition.
 
 Linux-policy reservations such as CMA/reusable pools remain reserved in the
 first implementation. Reclaiming them requires a later documented ownership
@@ -645,43 +627,41 @@ valid under both the old and new regimes.
 
 The takeover path does not return to U-Boot after this point.
 
-## 13. Phase 8: add the physical-page allocator and reclaim boot memory
+## 13. Phase 8: add the post-takeover physical-page allocator
 
 ### Goal
 
-Allocate pages only from the validated usable-RAM map and reclaim transient
-boot resources at explicitly defined lifetime boundaries.
+Allocate pages only from the validated usable-RAM map after tvisor has
+installed its private EL2 execution environment.
 
 ### Registers, memory structures, and exception levels
 
 - Physical-page allocator metadata.
 - Permanent reservations: tvisor image, stacks, vectors, tables, allocator
   metadata, firmware/no-map regions, and active devices.
-- Temporary reservations: ELF staging buffer, U-Boot runtime region, and other
-  handoff-only storage.
 - The original U-Boot working DTB, retained because the global FDT handle
   continues to borrow it.
 - EL2 stage-1 mappings for allocator-managed RAM.
 
-Reclaim U-Boot memory only after all of these are true:
+Initialize the allocator only after all of these are true:
 
 1. the takeover path cannot return to U-Boot;
 2. tvisor uses its own stack, vectors, UART setup, and translation tables;
 3. all required handoff data has been copied into owned storage or explicitly
    retained;
-4. no current code or pointer refers into the U-Boot regions being reclaimed;
-5. page-rounded sharing at reservation boundaries has been resolved.
+4. the finalized memory map has been moved into tvisor-owned storage; and
+5. page-rounded permanent reservation boundaries have been resolved.
 
 The global FDT handle still borrows the original DTB. Its page-rounded region
-is therefore retained `InUse` and identity-mapped read-only/XN. A later design
+is therefore permanently excluded and identity-mapped read-only/XN. A later design
 may copy the blob into tvisor-owned storage and then release the original pages.
 
 ### Files and modules
 
 - Extend `src/mm.rs` with the allocator.
-- Add explicit reservation lifetime/state support to
-  `tvisor_util/system_info.rs` or the runtime memory manager.
-- Update `src/boot.rs` with the no-return reclamation boundary.
+- Reserve the initial table arena in `scripts/rpi.ld` so no allocator is
+  required before takeover.
+- Update `src/boot.rs` with post-switch allocator initialization.
 - Add diagnostic allocator statistics and reservation dumps.
 
 ### Acceptance criteria and verification
@@ -693,9 +673,9 @@ may copy the blob into tvisor-owned storage and then release the original pages.
   and until the allocator intentionally provides one.
 - **Raspberry Pi 4:** Allocate, write, verify, and free test pages from every
   eligible bank. Confirm no allocation intersects permanent reservations.
-  After the explicit no-return point, mark eligible U-Boot pages usable and
-  demonstrate controlled allocation from reclaimed pages while the original
-  DTB remains retained and UART and exception handling remain operational.
+  Confirm former U-Boot RAM requires no runtime reclamation input while the
+  original DTB remains retained and UART and exception handling remain
+  operational.
 
 ## 14. Phase 9: prepare for guest execution
 
@@ -945,7 +925,7 @@ stable, sorted report containing:
 - the FDT reservation block;
 - supported `/reserved-memory` entries and their attributes;
 - the live DTB and tvisor image extents;
-- all still-live U-Boot/handoff reservations known to tvisor;
+- the live DTB and tvisor runtime reservations;
 - BCM2711 MMIO windows and the active UART's translated CPU physical range;
 - detected CPUs and the current `MPIDR_EL1` affinity;
 - usable RAM after conservative reservation subtraction;

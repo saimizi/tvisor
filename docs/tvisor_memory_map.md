@@ -22,8 +22,6 @@ The map is derived from `MemoryMap`, not from fixed Raspberry Pi RAM sizes:
 
 - `RAM` describes CPU-visible physical RAM;
 - `RESERVED` is unavailable for allocation after takeover;
-- `HANDOFF` is temporarily owned by U-Boot or the live DTB;
-- `INITIAL` can be used while U-Boot is still live;
 - `USABLE` can be allocated after the no-return takeover; and
 - `MMIO` contains CPU physical peripheral windows.
 
@@ -71,19 +69,19 @@ The initial VA equals the PA for every valid mapping:
 EL2 virtual address                         CPU physical address
 
 0x00000000_04000000  tvisor image     ---> 0x00000000_04000000
-0x00000000_30000000  bootstrap arena  ---> 0x00000000_30000000
+0x00000000_040c2000  bootstrap arena  ---> 0x00000000_040c2000
 0x00000000_FE215000  mini UART page   ---> 0x00000000_FE215000
 ```
 
 Exact image and bootstrap ends are derived rather than hard-coded:
 
 - the image uses linker section symbols;
-- the bootstrap arena is selected from normalized `INITIAL` RAM;
+- the bootstrap arena uses linker symbols within the tvisor runtime image;
 - the UART page is derived from the DTB-selected console register range.
 
-The current board's first `INITIAL` range begins at `0x3000_0000`. The draft
-bootstrap policy selects the first suitably aligned interval from `INITIAL`;
-it does not make `0x3000_0000` a BCM2711 constant.
+The address above is from the current debug build and is not an ABI. Code uses
+`__bootstrap_tables_start` and `__bootstrap_tables_end`; source changes may
+move both symbols.
 
 ### 4.1 Mandatory takeover mappings
 
@@ -107,9 +105,8 @@ The live DTB mapping is omitted if discovery has already copied every required
 value before the switch. If retained, it is removed after takeover and after
 all borrowed references have disappeared.
 
-No generic `HANDOFF` region is mapped merely because U-Boot owns it. In
-particular, tvisor does not map U-Boot's code, heap, old stack, or translation
-tables into its steady-state address space.
+Tvisor does not map U-Boot's code, heap, old stack, or translation tables into
+its steady-state address space.
 
 ### 4.2 Later mappings
 
@@ -128,25 +125,18 @@ These additions must not weaken the initial W^X or MMIO attribute policy.
 ## 5. Bootstrap arena
 
 The first private page tables and stack must exist before the general physical
-allocator. Phase 6 should reserve a page-aligned bootstrap arena from
-`INITIAL`, using checked first-fit selection with an explicit size and
-alignment.
+allocator. The linker reserves a dedicated 64 KiB, page-aligned `NOLOAD`
+bootstrap-table arena inside `[__image_start, __image_end)`. `mm::prepare`
+explicitly zeros it before table construction.
 
-The arena will contain, in order determined by the later implementation:
+The arena contains the root and subordinate EL2 translation tables. The boot
+stack and guard remain separate linker sections. The complete tvisor runtime
+is inserted into the permanent reservation set during DTB discovery, so the
+post-switch allocator cannot return any arena page.
 
-- root and subordinate EL2 translation tables;
-- a private boot stack plus at least one unmapped guard page;
-- exception-transition storage; and
-- small fixed allocator metadata if required.
-
-The arena is tvisor-owned immediately after selection and must be inserted
-into the permanent reservation set before any usable map is consumed again.
-A monotonic page provider is sufficient during bootstrap; freeing pages is not
-required before takeover.
-
-Phase 5 deliberately leaves the arena size as an implementation-calculated
-value. The layout calculator must count the tables required by the actual
-mandatory mappings and then add the reviewed stack and metadata budget.
+The arena contains exactly sixteen pages. Linker assertions and runtime checks
+enforce its size and alignment, while `TableSet` reports exhaustion if the
+mandatory mappings exceed that capacity.
 
 ## 6. Translation-table structure
 
@@ -251,18 +241,17 @@ identity-addressed window, perform the required cache maintenance, barriers,
 MMU disable, TLB invalidation, register installation, and MMU enable entirely
 in assembly.
 
-## 11. Reclamation policy
+## 11. Post-takeover ownership policy
 
 After the no-return boundary:
 
-- U-Boot runtime, old stack, old translation tables, and staging buffers may
-  move from `HANDOFF` into the physical allocator if they are inside RAM and
-  do not overlap `RESERVED`;
-- the live DTB may be reclaimed only after all required information is owned;
+- U-Boot runtime, old stack, old translation tables, and staging buffers need
+  no runtime reservation or explicit reclamation pass;
+- the live DTB may be released only after all required information is owned;
 - the bootstrap arena remains tvisor-owned;
 - firmware carve-outs, permanent reservations, and MMIO never enter the RAM
   allocator; and
-- reclaiming a physical page does not automatically create an EL2 mapping.
+- allocating a physical page does not automatically create an EL2 mapping.
 
 The current dynamic CMA allocation-window policy remains conservative. Phase
 5 does not decide whether Linux-oriented CMA policy should be discarded for a
@@ -293,7 +282,7 @@ Before Phase 6 begins, review must confirm:
 - image sections can receive distinct permissions at page boundaries;
 - stack guard pages remain invalid;
 - Normal RAM and MMIO use different MAIR attributes;
-- page-table memory is never sourced from `RESERVED` or `HANDOFF`;
+- page-table memory is sourced only from the linker-owned tvisor runtime;
 - table count and bootstrap-arena size can be calculated without allocation;
 - the diagnostic return path remains separate from the no-return path; and
 - no U-Boot address becomes a permanent board constant.
