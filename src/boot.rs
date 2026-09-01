@@ -1,3 +1,4 @@
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
@@ -194,6 +195,7 @@ extern "C" fn phase7_post_switch(
     );
 
     phase8_allocator_test(&takeover);
+    phase_heap_allocator_test();
     if fault_test == FaultTest::Sync as u64 {
         println!("Triggering deliberate synchronous exception under tvisor tables...");
         unsafe { asm!("brk #0x600") };
@@ -223,6 +225,51 @@ extern "C" fn phase7_post_switch(
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
+}
+
+fn phase_heap_allocator_test() {
+    let initialized = crate::heap::initialize().expect("initialize Rust heap");
+    println!(
+        "Rust heap initialized: arena=[{}, {}) bytes={} free={}",
+        initialized.arena_start,
+        initialized.arena_end,
+        initialized.stats.arena_bytes,
+        initialized.stats.free_bytes,
+    );
+
+    let boxed = Box::new(0x4845_4150_424f_5831_u64);
+    assert_eq!(*boxed, 0x4845_4150_424f_5831);
+    let boxed_address = (&*boxed as *const u64) as usize;
+    assert!(boxed_address >= initialized.stats.arena_start);
+    assert!(boxed_address < initialized.stats.arena_start + initialized.stats.arena_bytes);
+
+    let mut values = Vec::<u64>::new();
+    values
+        .try_reserve_exact(128)
+        .expect("reserve heap test vector");
+    for value in 0..128_u64 {
+        values.push(value ^ 0x5456_4953_4f52_4845);
+    }
+    assert_eq!(values.len(), 128);
+    assert_eq!(values[0], 0x5456_4953_4f52_4845);
+    assert_eq!(values[127], 127 ^ 0x5456_4953_4f52_4845);
+    let vector_address = values.as_ptr() as usize;
+    assert!(vector_address >= initialized.stats.arena_start);
+    assert!(vector_address < initialized.stats.arena_start + initialized.stats.arena_bytes);
+
+    let active = crate::heap::stats().expect("active heap statistics");
+    assert_eq!(active.live_allocations, 2);
+    assert!(active.used_bytes >= size_of::<u64>() + 128 * size_of::<u64>());
+    drop(values);
+    drop(boxed);
+
+    let final_stats = crate::heap::stats().expect("final heap statistics");
+    assert_eq!(final_stats.live_allocations, 0);
+    assert_eq!(final_stats.used_bytes, 0);
+    println!(
+        "Rust heap checkpoint complete: Box/Vec passed used={} free={} failures={}",
+        final_stats.used_bytes, final_stats.free_bytes, final_stats.failed_allocations
+    );
 }
 
 fn phase8_allocator_test(takeover: &crate::mm::TakeoverResult) {

@@ -352,6 +352,15 @@ pub fn allocate_page() -> Result<PhysAddr, AllocatorError> {
     with_allocator(|allocator| allocator.allocate())
 }
 
+/// Allocate the lowest-addressed run of `pages` contiguous unused managed
+/// physical pages and mark the complete run `InUse` atomically.
+///
+/// Under tvisor's current identity map, the returned physical range is also a
+/// virtually contiguous EL2 range at the same address.
+pub fn allocate_contiguous_pages(pages: usize) -> Result<PhysAddr, AllocatorError> {
+    with_allocator(|allocator| allocator.allocate_contiguous(pages))
+}
+
 /// Allocate the highest-addressed unused managed 4 KiB physical page.
 ///
 /// The returned page is changed to `InUse`. This reverse-search API currently

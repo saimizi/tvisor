@@ -697,6 +697,19 @@ may copy the blob into tvisor-owned storage and then release the original pages.
   demonstrate controlled allocation from reclaimed pages while the original
   DTB remains retained and UART and exception handling remain operational.
 
+### Rust heap follow-up
+
+Before Phase 9 grows into a general VM and device model, add a wrapped Rust
+heap as a Phase 8 follow-up. Reserve one fixed 1 MiB contiguous physical range
+after takeover, use the current identity map as its equally contiguous EL2 VA
+range, and initialize `TvisorHeap` over `linked_list_allocator::Heap`.
+
+The wrapper, not the OSS allocator, owns tvisor's initialization,
+synchronization, statistics, and interrupt-context policy. Heap allocation is
+for variable-sized control metadata; guest RAM, translation tables, DMA, and
+other page-oriented objects remain physical-page-allocator clients. See
+`docs/rust_heap_allocator.md` for the implemented design and verification.
+
 ## 14. Phase 9: prepare for guest execution
 
 ### Goal
