@@ -195,6 +195,14 @@ __vcpu_run:
     ldr  x9, [x0, #272]
     msr  spsr_el2, x9
 
+    // Trap guest FP/Advanced-SIMD use only for the guest execution window.
+    // CPTR_EL2.TFP also affects EL2, so tvisor must not leave it set while
+    // running Rust code that may contain compiler-generated SIMD instructions.
+    mrs  x9, cptr_el2
+    orr  x9, x9, #0x400
+    msr  cptr_el2, x9
+    isb
+
     // Restore guest GPRs x1..x30
     ldp  x2,  x3,  [x0, #16]
     ldp  x4,  x5,  [x0, #32]
@@ -223,6 +231,13 @@ __vcpu_exit_handler:
     // Scratch save x0, x1 on stack
     sub  sp, sp, #32
     stp  x0, x1, [sp, #0]
+
+    // Re-enable FP/Advanced SIMD for the EL2 host before any Rust code can
+    // execute. Guest x0/x1 are already safe on the stack, so x0 is scratch.
+    mrs  x0, cptr_el2
+    bic  x0, x0, #0x400
+    msr  cptr_el2, x0
+    isb
 
     // Load active VcpuContext pointer
     adrp x0, __active_vcpu_context

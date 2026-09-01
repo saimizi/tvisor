@@ -191,9 +191,9 @@ impl Sp {
     }
 }
 
-impl Into<usize> for Sp {
-    fn into(self) -> usize {
-        self.value
+impl From<Sp> for usize {
+    fn from(sp: Sp) -> Self {
+        sp.value
     }
 }
 
@@ -883,6 +883,44 @@ pub struct VmpidrEl2 {
 }
 
 impl VmpidrEl2 {
+    pub const RES1_BIT: u64 = 1 << 31;
+    pub const U_BIT: u64 = 1 << 30;
+    pub const MT_BIT: u64 = 1 << 24;
+    pub const AFF2_SHIFT: u32 = 16;
+    pub const AFF1_SHIFT: u32 = 8;
+    pub const AFF0_SHIFT: u32 = 0;
+    pub const AFF_MASK: u64 = 0xff;
+
+    pub const fn uniprocessor(vcpu_id: u8) -> Self {
+        Self {
+            value: Self::RES1_BIT | Self::U_BIT | ((vcpu_id as u64) & Self::AFF_MASK),
+        }
+    }
+
+    pub const fn res1(&self) -> bool {
+        (self.value & Self::RES1_BIT) != 0
+    }
+
+    pub const fn u_bit(&self) -> bool {
+        (self.value & Self::U_BIT) != 0
+    }
+
+    pub const fn mt_bit(&self) -> bool {
+        (self.value & Self::MT_BIT) != 0
+    }
+
+    pub const fn aff0(&self) -> u8 {
+        ((self.value >> Self::AFF0_SHIFT) & Self::AFF_MASK) as u8
+    }
+
+    pub const fn aff1(&self) -> u8 {
+        ((self.value >> Self::AFF1_SHIFT) & Self::AFF_MASK) as u8
+    }
+
+    pub const fn aff2(&self) -> u8 {
+        ((self.value >> Self::AFF2_SHIFT) & Self::AFF_MASK) as u8
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub fn dump() -> Option<Self> {
         let el: ExceptionLevel = CurrentEL::dump().into();
@@ -892,7 +930,7 @@ impl VmpidrEl2 {
                 core::arch::asm!(
                     "mrs {value}, VMPIDR_EL2",
                     value = out(reg) value,
-                    options(nomem, nostack, preserves_flags),
+                    options(nostack, preserves_flags),
                 );
             }
             Some(Self { value })
@@ -907,7 +945,7 @@ impl VmpidrEl2 {
             core::arch::asm!(
                 "msr VMPIDR_EL2, {value}",
                 value = in(reg) self.value,
-                options(nomem, nostack, preserves_flags),
+                options(nostack, preserves_flags),
             );
         }
     }
@@ -1105,5 +1143,27 @@ mod tests {
         assert!(hcr.bit_swio());
         assert!(hcr.bit_vm());
         assert!(!hcr.bit_fmo());
+    }
+
+    #[test]
+    fn vmpidr_el2_decodes_uniprocessor_and_affinity_fields() {
+        let vmpidr = super::VmpidrEl2::uniprocessor(0);
+        assert_eq!(vmpidr.value, 0xC000_0000);
+        assert!(vmpidr.res1());
+        assert!(vmpidr.u_bit());
+        assert!(!vmpidr.mt_bit());
+        assert_eq!(vmpidr.aff0(), 0);
+        assert_eq!(vmpidr.aff1(), 0);
+        assert_eq!(vmpidr.aff2(), 0);
+
+        let vmpidr_custom = super::VmpidrEl2 {
+            value: (1 << 31) | (1 << 24) | (3 << 16) | (2 << 8) | 1,
+        };
+        assert!(vmpidr_custom.res1());
+        assert!(!vmpidr_custom.u_bit());
+        assert!(vmpidr_custom.mt_bit());
+        assert_eq!(vmpidr_custom.aff0(), 1);
+        assert_eq!(vmpidr_custom.aff1(), 2);
+        assert_eq!(vmpidr_custom.aff2(), 3);
     }
 }

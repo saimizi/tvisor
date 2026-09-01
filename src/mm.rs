@@ -74,6 +74,8 @@ static RECLAIM_MEMORY_INFO: GlobalReclaimMemoryInfo = GlobalReclaimMemoryInfo::e
 unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;
+    static __payload_start: u8;
+    static __payload_end: u8;
     static __vectors_start: u8;
     static __vectors_end: u8;
     static __rodata_start: u8;
@@ -163,6 +165,13 @@ pub fn prepare(
         link_addr!(__text_end),
         false,
         true,
+    )?;
+    map_identity(
+        &mut tables,
+        link_addr!(__payload_start),
+        link_addr!(__payload_end),
+        false,
+        false,
     )?;
     map_identity(
         &mut tables,
@@ -528,6 +537,18 @@ fn validate<const N: usize>(
 ) -> Result<(), PrepareError> {
     let checks = [
         (link_addr!(__text_start), false, true, MemoryType::Normal),
+        (
+            link_addr!(__payload_start),
+            false,
+            false,
+            MemoryType::Normal,
+        ),
+        (
+            link_addr!(__payload_end) - 1,
+            false,
+            false,
+            MemoryType::Normal,
+        ),
         (link_addr!(__vectors_start), false, true, MemoryType::Normal),
         (link_addr!(__rodata_start), false, false, MemoryType::Normal),
         (

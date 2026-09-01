@@ -12,22 +12,14 @@
 //! With `T0SZ=25` (39 bits) and `SL0=0b01` (Level 1 start), the root table is a
 //! single standard 4 KiB page containing 512 64-bit descriptors.
 //!
-//! Descriptor bits `[1:0]` select the entry type:
+//! In Phase 9, only 4 KiB leaf page descriptors at Level 3 are constructed.
+//! Block descriptors at Level 1 and Level 2 are deferred to future phases.
 //!
-//! ```text
-//! Level   00          01              11
-//! L1      invalid     1 GiB block     next L2 table
-//! L2      invalid     2 MiB block     next L3 table
-//! L3      invalid     reserved         4 KiB page
-//! ```
-//!
-//! Unlike Stage-1 descriptors (which index `MAIR_EL2`), Stage-2 leaf descriptors
-//! directly encode memory attributes and stage-2 access permissions:
-//!
+//! Leaf descriptor bit encoding:
 //! ```text
 //! Bit(s)   Field      Policy
 //! 0        Valid      1 for every populated descriptor
-//! 1        Type       0 for an L1/L2 block; 1 for a table or L3 page
+//! 1        Type       1 for L3 4 KiB page (and table at L1/L2)
 //! [5:2]    MemAttr    0b1111 = Normal Inner/Outer WB/WA; 0b0001 = Device-nGnRE
 //! [7:6]    S2AP       00 = None, 01 = RO, 10 = WO, 11 = RW
 //! [9:8]    SH         11 = Inner Shareable for Normal; 00 = Non-shareable for Device
@@ -35,17 +27,13 @@
 //! [54:53]  XN         00 = Executable; 10 = Execute-Never (XN)
 //! ```
 
-use crate::el2_translation::{
-    PAGE_SIZE, TablePage, TableStorage, TranslationError, pa_bits_from_parange,
-};
+use crate::el2_translation::{PAGE_SIZE, TablePage, TranslationError, pa_bits_from_parange};
 
 pub const IPA_BITS: u8 = 39;
 
 const L1_SHIFT: u32 = 30;
 const L2_SHIFT: u32 = 21;
 const L3_SHIFT: u32 = 12;
-const L1_SIZE: u64 = 1 << L1_SHIFT;
-const L2_SIZE: u64 = 1 << L2_SHIFT;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 const VALID: u64 = 1 << 0;
@@ -78,9 +66,15 @@ pub const HCR_EL2_PHASE9_VALUE: u64 = HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | 
 
 pub const CPTR_EL2_TFP: u64 = 1 << 10;
 pub const CPTR_EL2_RES1: u64 = (0b11 << 12) | 0x3ff;
-pub const CPTR_EL2_PHASE9_VALUE: u64 = CPTR_EL2_RES1 | CPTR_EL2_TFP;
+/// CPTR_EL2 value used while tvisor executes at EL2. TFP remains clear because
+/// Rust and compiler-generated routines may use FP/Advanced SIMD instructions.
+pub const CPTR_EL2_PHASE9_VALUE: u64 = CPTR_EL2_RES1;
 
-pub const VMPIDR_EL2_VCPU0: u64 = 0x8000_0000;
+/// Virtual MPIDR_EL1 for vCPU 0 on a virtual uniprocessor system.
+/// Bit 31 = RES1 (1)
+/// Bit 30 = U (1, uniprocessor)
+/// Bits [23:0] = 0 (Affinity 0.0.0)
+pub const VMPIDR_EL2_VCPU0: u64 = (1 << 31) | (1 << 30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage2MemoryType {
@@ -118,7 +112,6 @@ pub struct Stage2Translation {
     pub mem_type: Stage2MemoryType,
     pub access: Stage2Access,
     pub exec: Stage2Exec,
-    pub level: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,25 +123,293 @@ pub struct Stage2RegisterValues {
     pub vmpidr_el2: u64,
 }
 
-pub fn stage2_register_values(
-    vmid: u16,
+/// Trait for on-demand page table allocation for Stage-2 translation.
+///
+/// # Safety
+///
+/// Implementors must ensure that `allocate_table_page()` returns a physical address that:
+/// 1. Is 4 KiB aligned (`pa & 0xfff == 0`).
+/// 2. Is representable within the physical address range (`pa < (1 << pa_bits)`).
+/// 3. Is identity-mapped and writable in EL2 virtual address space (`pa as *mut TablePage` is valid for reads and writes of 4096 bytes).
+/// 4. Is zero-initialized.
+/// 5. Is exclusively owned and will not alias another live table page for the lifetime of the table set.
+pub unsafe trait Stage2Allocator {
+    /// Allocates a single, zeroed 4 KiB page for a table level and returns its PA.
+    fn allocate_table_page(&mut self) -> Result<u64, TranslationError>;
+}
+
+/// Stage-2 translation table set managing on-demand page table trees.
+pub struct Stage2TableSet<A: Stage2Allocator> {
     root_pa: u64,
+    pa_bits: u8,
+    allocator: A,
+    allocated_tables: [u64; 32],
+    allocated_count: usize,
+}
+
+impl<A: Stage2Allocator> Stage2TableSet<A> {
+    pub fn new(mut allocator: A, pa_bits: u8) -> Result<Self, TranslationError> {
+        if !(32..=48).contains(&pa_bits) {
+            return Err(TranslationError::InvalidPaBits);
+        }
+        let root_pa = allocator.allocate_table_page()?;
+        let max_pa = (1_u64 << pa_bits) - 1;
+        if root_pa & (PAGE_SIZE - 1) != 0 || root_pa > max_pa {
+            return Err(TranslationError::InvalidTableBase);
+        }
+
+        let mut set = Self {
+            root_pa,
+            pa_bits,
+            allocator,
+            allocated_tables: [0; 32],
+            allocated_count: 0,
+        };
+        set.allocated_tables[0] = root_pa;
+        set.allocated_count = 1;
+        Ok(set)
+    }
+
+    pub fn root_pa(&self) -> u64 {
+        self.root_pa
+    }
+
+    pub fn allocated_tables(&self) -> &[u64] {
+        &self.allocated_tables[..self.allocated_count]
+    }
+
+    pub fn used_pages(&self) -> usize {
+        self.allocated_count
+    }
+
+    fn allocate_subtable(&mut self) -> Result<u64, TranslationError> {
+        if self.allocated_count >= self.allocated_tables.len() {
+            return Err(TranslationError::TableExhausted);
+        }
+        let page_pa = self.allocator.allocate_table_page()?;
+        let max_pa = (1_u64 << self.pa_bits) - 1;
+        if page_pa & (PAGE_SIZE - 1) != 0 || page_pa > max_pa {
+            return Err(TranslationError::InvalidTableBase);
+        }
+        self.allocated_tables[self.allocated_count] = page_pa;
+        self.allocated_count += 1;
+        Ok(page_pa)
+    }
+
+    pub fn map(&mut self, mapping: Stage2Mapping) -> Result<(), TranslationError> {
+        let max_ipa = (1_u64 << IPA_BITS) - 1;
+        let max_pa = (1_u64 << self.pa_bits) - 1;
+
+        if mapping.size == 0 {
+            return Err(TranslationError::EmptyMapping);
+        }
+        if mapping.ipa & (PAGE_SIZE - 1) != 0
+            || mapping.pa & (PAGE_SIZE - 1) != 0
+            || mapping.size & (PAGE_SIZE - 1) != 0
+        {
+            return Err(TranslationError::UnalignedMapping);
+        }
+
+        let ipa_end = mapping
+            .ipa
+            .checked_add(mapping.size)
+            .ok_or(TranslationError::AddressOverflow)?;
+        let pa_end = mapping
+            .pa
+            .checked_add(mapping.size)
+            .ok_or(TranslationError::AddressOverflow)?;
+
+        if ipa_end - 1 > max_ipa {
+            return Err(TranslationError::VirtualAddressOutOfRange);
+        }
+        if pa_end - 1 > max_pa {
+            return Err(TranslationError::PhysicalAddressOutOfRange);
+        }
+
+        let mut current_ipa = mapping.ipa;
+        let mut current_pa = mapping.pa;
+
+        while current_ipa < ipa_end {
+            self.map_l3_page(
+                current_ipa,
+                current_pa,
+                mapping.mem_type,
+                mapping.access,
+                mapping.exec,
+            )?;
+            current_ipa += PAGE_SIZE;
+            current_pa += PAGE_SIZE;
+        }
+
+        Ok(())
+    }
+
+    fn map_l3_page(
+        &mut self,
+        ipa: u64,
+        pa: u64,
+        mem_type: Stage2MemoryType,
+        access: Stage2Access,
+        exec: Stage2Exec,
+    ) -> Result<(), TranslationError> {
+        let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
+        let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
+        let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
+
+        // Level 1 lookup
+        let root_table = unsafe { &mut *(self.root_pa as *mut TablePage) };
+        let l1_entry = root_table.entries()[l1_idx];
+        let l2_pa = if l1_entry & VALID != 0 {
+            if l1_entry & TABLE_OR_PAGE == 0 {
+                return Err(TranslationError::ConflictingEntry);
+            }
+            l1_entry & ADDRESS_MASK
+        } else {
+            let next_pa = self.allocate_subtable()?;
+            root_table.entries_mut()[l1_idx] = VALID | TABLE_OR_PAGE | (next_pa & ADDRESS_MASK);
+            next_pa
+        };
+
+        // Level 2 lookup
+        let l2_table = unsafe { &mut *(l2_pa as *mut TablePage) };
+        let l2_entry = l2_table.entries()[l2_idx];
+        let l3_pa = if l2_entry & VALID != 0 {
+            if l2_entry & TABLE_OR_PAGE == 0 {
+                return Err(TranslationError::ConflictingEntry);
+            }
+            l2_entry & ADDRESS_MASK
+        } else {
+            let next_pa = self.allocate_subtable()?;
+            l2_table.entries_mut()[l2_idx] = VALID | TABLE_OR_PAGE | (next_pa & ADDRESS_MASK);
+            next_pa
+        };
+
+        // Level 3 leaf page insertion
+        let l3_table = unsafe { &mut *(l3_pa as *mut TablePage) };
+        let current_desc = l3_table.entries()[l3_idx];
+        let new_desc = encode_l3_page_descriptor(pa, mem_type, access, exec);
+
+        if current_desc & VALID != 0 {
+            if current_desc != new_desc {
+                return Err(TranslationError::ConflictingEntry);
+            }
+            return Ok(());
+        }
+
+        l3_table.entries_mut()[l3_idx] = new_desc;
+        Ok(())
+    }
+
+    pub fn translate(&self, ipa: u64) -> Option<Stage2Translation> {
+        if ipa >> IPA_BITS != 0 {
+            return None;
+        }
+
+        let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
+        let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
+        let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
+        let page_offset = ipa & (PAGE_SIZE - 1);
+
+        let root_table = unsafe { &*(self.root_pa as *const TablePage) };
+        let l1_entry = root_table.entries()[l1_idx];
+        if l1_entry & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
+            return None;
+        }
+        let l2_pa = l1_entry & ADDRESS_MASK;
+
+        let l2_table = unsafe { &*(l2_pa as *const TablePage) };
+        let l2_entry = l2_table.entries()[l2_idx];
+        if l2_entry & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
+            return None;
+        }
+        let l3_pa = l2_entry & ADDRESS_MASK;
+
+        let l3_table = unsafe { &*(l3_pa as *const TablePage) };
+        let l3_entry = l3_table.entries()[l3_idx];
+        if l3_entry & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
+            return None;
+        }
+
+        let (mem_type, access, exec) = decode_l3_page_attributes(l3_entry);
+        let base_pa = l3_entry & ADDRESS_MASK;
+
+        Some(Stage2Translation {
+            pa: base_pa | page_offset,
+            mem_type,
+            access,
+            exec,
+        })
+    }
+}
+
+pub fn encode_l3_page_descriptor(
+    pa: u64,
+    mem_type: Stage2MemoryType,
+    access: Stage2Access,
+    exec: Stage2Exec,
+) -> u64 {
+    let mem_attr = match mem_type {
+        Stage2MemoryType::NormalWbWa => MEM_ATTR_NORMAL_WB_WA,
+        Stage2MemoryType::DeviceNgNre => MEM_ATTR_DEVICE_NGNRE,
+    };
+    let s2ap = match access {
+        Stage2Access::None => S2AP_NONE,
+        Stage2Access::ReadOnly => S2AP_READ_ONLY,
+        Stage2Access::WriteOnly => S2AP_WRITE_ONLY,
+        Stage2Access::ReadWrite => S2AP_READ_WRITE,
+    };
+    let sh = match mem_type {
+        Stage2MemoryType::NormalWbWa => SH_INNER,
+        Stage2MemoryType::DeviceNgNre => SH_NONE,
+    };
+    let xn = match exec {
+        Stage2Exec::Executable => XN_EXEC,
+        Stage2Exec::ExecuteNever => XN_NON_EXEC,
+    };
+
+    VALID | TABLE_OR_PAGE | mem_attr | s2ap | sh | ACCESS_FLAG | xn | (pa & ADDRESS_MASK)
+}
+
+fn decode_l3_page_attributes(desc: u64) -> (Stage2MemoryType, Stage2Access, Stage2Exec) {
+    let mem_type = match (desc >> 2) & 0b1111 {
+        0b0001 => Stage2MemoryType::DeviceNgNre,
+        _ => Stage2MemoryType::NormalWbWa,
+    };
+    let access = match (desc >> 6) & 0b11 {
+        0b00 => Stage2Access::None,
+        0b01 => Stage2Access::ReadOnly,
+        0b10 => Stage2Access::WriteOnly,
+        _ => Stage2Access::ReadWrite,
+    };
+    let exec = match (desc >> 53) & 0b11 {
+        0b00 => Stage2Exec::Executable,
+        _ => Stage2Exec::ExecuteNever,
+    };
+    (mem_type, access, exec)
+}
+
+pub fn stage2_register_values(
+    vmid: u8,
+    root_table_pa: u64,
     parange: u8,
 ) -> Result<Stage2RegisterValues, TranslationError> {
     let pa_bits = pa_bits_from_parange(parange)?;
-    if root_pa & (PAGE_SIZE - 1) != 0 || root_pa >= (1_u64 << pa_bits) {
+    let max_root_pa = (1_u64 << pa_bits) - 1;
+    if root_table_pa & (PAGE_SIZE - 1) != 0 || root_table_pa > max_root_pa {
         return Err(TranslationError::InvalidTableBase);
     }
-    let vtcr_el2 = VTCR_EL2_RES1
-        | VTCR_EL2_T0SZ_39_BIT
-        | VTCR_EL2_SL0_LEVEL_1
-        | VTCR_EL2_IRGN0_NORMAL_WB_WA
-        | VTCR_EL2_ORGN0_NORMAL_WB_WA
-        | VTCR_EL2_SH0_INNER
-        | VTCR_EL2_TG0_4KB
-        | (((parange as u64) & 0b111) << 16);
 
-    let vttbr_el2 = ((vmid as u64) << 48) | (root_pa & ADDRESS_MASK);
+    let ps_field = ((parange & 0x7) as u64) << 16;
+    let vtcr_el2 = VTCR_EL2_RES1
+        | VTCR_EL2_TG0_4KB
+        | VTCR_EL2_SH0_INNER
+        | VTCR_EL2_ORGN0_NORMAL_WB_WA
+        | VTCR_EL2_IRGN0_NORMAL_WB_WA
+        | VTCR_EL2_SL0_LEVEL_1
+        | ps_field
+        | VTCR_EL2_T0SZ_39_BIT;
+
+    let vttbr_el2 = ((vmid as u64) << 48) | (root_table_pa & ADDRESS_MASK);
 
     Ok(Stage2RegisterValues {
         vtcr_el2,
@@ -159,409 +420,464 @@ pub fn stage2_register_values(
     })
 }
 
-pub struct Stage2TableSet<'a, const N: usize> {
-    storage: &'a mut TableStorage<N>,
-    used: usize,
-    base_pa: u64,
-    pa_bits: u8,
+#[cfg(test)]
+pub struct MockStage2Allocator<const N: usize> {
+    pub pages: [TablePage; N],
+    pub next_idx: usize,
 }
 
-impl<'a, const N: usize> Stage2TableSet<'a, N> {
-    pub fn new(
-        storage: &'a mut TableStorage<N>,
-        base_pa: u64,
-        pa_bits: u8,
-    ) -> Result<Self, TranslationError> {
-        if base_pa & (PAGE_SIZE - 1) != 0 {
-            return Err(TranslationError::InvalidTableBase);
+#[cfg(test)]
+impl<const N: usize> MockStage2Allocator<N> {
+    pub const fn new() -> Self {
+        Self {
+            pages: [const { TablePage::zeroed() }; N],
+            next_idx: 0,
         }
-        if !(32..=48).contains(&pa_bits) {
-            return Err(TranslationError::InvalidPaBits);
-        }
-        if N == 0 {
+    }
+}
+
+#[cfg(test)]
+unsafe impl<const N: usize> Stage2Allocator for &mut MockStage2Allocator<N> {
+    fn allocate_table_page(&mut self) -> Result<u64, TranslationError> {
+        if self.next_idx >= N {
             return Err(TranslationError::TableExhausted);
         }
-
-        let byte_len = (N as u64)
-            .checked_mul(PAGE_SIZE)
-            .ok_or(TranslationError::AddressOverflow)?;
-        let end = base_pa
-            .checked_add(byte_len)
-            .ok_or(TranslationError::AddressOverflow)?;
-        if end > (1_u64 << pa_bits) {
-            return Err(TranslationError::PhysicalAddressOutOfRange);
+        let page_ptr = core::ptr::addr_of_mut!(self.pages[self.next_idx]);
+        self.next_idx += 1;
+        unsafe {
+            core::ptr::write_bytes(page_ptr as *mut u8, 0, PAGE_SIZE as usize);
         }
-
-        let mut set = Self {
-            storage,
-            used: 0,
-            base_pa,
-            pa_bits,
-        };
-        // Allocate L1 root table page (first page of storage)
-        set.allocate_page()?;
-        Ok(set)
-    }
-
-    pub const fn root_pa(&self) -> u64 {
-        self.base_pa
-    }
-
-    pub const fn used_pages(&self) -> usize {
-        self.used
-    }
-
-    pub fn page(&self, index: usize) -> Option<&TablePage> {
-        self.storage.pages().get(index).filter(|_| index < self.used)
-    }
-
-    pub fn map(&mut self, mapping: Stage2Mapping) -> Result<(), TranslationError> {
-        self.validate_mapping(mapping)?;
-        let mut ipa = mapping.ipa;
-        let mut pa = mapping.pa;
-        let mut remaining = mapping.size;
-        while remaining != 0 {
-            let (level, chunk) = if aligned_for(ipa, pa, L1_SIZE) && remaining >= L1_SIZE {
-                (1, L1_SIZE)
-            } else if aligned_for(ipa, pa, L2_SIZE) && remaining >= L2_SIZE {
-                (2, L2_SIZE)
-            } else {
-                (3, PAGE_SIZE)
-            };
-            self.map_leaf(level, ipa, pa, mapping)?;
-            ipa += chunk;
-            pa += chunk;
-            remaining -= chunk;
-        }
-        Ok(())
-    }
-
-    pub fn walk(&self, ipa: u64) -> Result<Option<Stage2Translation>, TranslationError> {
-        if ipa >= (1_u64 << IPA_BITS) {
-            return Err(TranslationError::VirtualAddressOutOfRange);
-        }
-        let mut table = 0;
-        for level in 1..=3 {
-            let index = index_for(level, ipa);
-            let descriptor = self.storage.pages()[table].entries()[index];
-            if descriptor & VALID == 0 {
-                return Ok(None);
-            }
-            let is_table_or_page = descriptor & TABLE_OR_PAGE != 0;
-            if level < 3 && is_table_or_page {
-                table = self.table_index(descriptor & ADDRESS_MASK)?;
-                continue;
-            }
-            if level == 3 && !is_table_or_page {
-                return Err(TranslationError::CorruptTable);
-            }
-
-            let block_size = level_size(level);
-            let base = descriptor & output_mask(level);
-            let pa = base | (ipa & (block_size - 1));
-
-            let mem_type = match descriptor & (0b1111 << 2) {
-                MEM_ATTR_NORMAL_WB_WA => Stage2MemoryType::NormalWbWa,
-                MEM_ATTR_DEVICE_NGNRE => Stage2MemoryType::DeviceNgNre,
-                _ => return Err(TranslationError::CorruptTable),
-            };
-
-            let access = match descriptor & (0b11 << 6) {
-                S2AP_NONE => Stage2Access::None,
-                S2AP_READ_ONLY => Stage2Access::ReadOnly,
-                S2AP_WRITE_ONLY => Stage2Access::WriteOnly,
-                S2AP_READ_WRITE => Stage2Access::ReadWrite,
-                _ => return Err(TranslationError::CorruptTable),
-            };
-
-            let exec = match descriptor & (0b11 << 53) {
-                XN_EXEC => Stage2Exec::Executable,
-                XN_NON_EXEC => Stage2Exec::ExecuteNever,
-                _ => return Err(TranslationError::CorruptTable),
-            };
-
-            return Ok(Some(Stage2Translation {
-                pa,
-                mem_type,
-                access,
-                exec,
-                level,
-            }));
-        }
-        Err(TranslationError::CorruptTable)
-    }
-
-    fn validate_mapping(&self, mapping: Stage2Mapping) -> Result<(), TranslationError> {
-        if mapping.size == 0 {
-            return Err(TranslationError::EmptyMapping);
-        }
-        if (mapping.ipa | mapping.pa | mapping.size) & (PAGE_SIZE - 1) != 0 {
-            return Err(TranslationError::UnalignedMapping);
-        }
-        let ipa_end = mapping
-            .ipa
-            .checked_add(mapping.size)
-            .ok_or(TranslationError::AddressOverflow)?;
-        let pa_end = mapping
-            .pa
-            .checked_add(mapping.size)
-            .ok_or(TranslationError::AddressOverflow)?;
-        if ipa_end > (1_u64 << IPA_BITS) {
-            return Err(TranslationError::VirtualAddressOutOfRange);
-        }
-        if pa_end > (1_u64 << self.pa_bits) {
-            return Err(TranslationError::PhysicalAddressOutOfRange);
-        }
-        Ok(())
-    }
-
-    fn map_leaf(
-        &mut self,
-        level: u8,
-        ipa: u64,
-        pa: u64,
-        mapping: Stage2Mapping,
-    ) -> Result<(), TranslationError> {
-        let mut table = 0;
-        for current_level in 1..level {
-            let index = index_for(current_level, ipa);
-            let descriptor = self.storage.pages()[table].entries()[index];
-            table = if descriptor == 0 {
-                let child = self.allocate_page()?;
-                self.storage.pages_mut()[table].entries_mut()[index] =
-                    self.table_pa(child) | VALID | TABLE_OR_PAGE;
-                child
-            } else if descriptor & (VALID | TABLE_OR_PAGE) == (VALID | TABLE_OR_PAGE) {
-                self.table_index(descriptor & ADDRESS_MASK)?
-            } else {
-                return Err(TranslationError::ConflictingEntry);
-            };
-        }
-        let index = index_for(level, ipa);
-        let descriptor = leaf_descriptor(level, pa, mapping);
-        let entry = &mut self.storage.pages_mut()[table].entries_mut()[index];
-        if *entry != 0 && *entry != descriptor {
-            return Err(TranslationError::ConflictingEntry);
-        }
-        *entry = descriptor;
-        Ok(())
-    }
-
-    fn allocate_page(&mut self) -> Result<usize, TranslationError> {
-        if self.used == N {
-            return Err(TranslationError::TableExhausted);
-        }
-        let index = self.used;
-        self.used += 1;
-        Ok(index)
-    }
-
-    fn table_pa(&self, index: usize) -> u64 {
-        self.base_pa + (index as u64) * PAGE_SIZE
-    }
-
-    fn table_index(&self, pa: u64) -> Result<usize, TranslationError> {
-        if pa < self.base_pa {
-            return Err(TranslationError::CorruptTable);
-        }
-        let offset = pa - self.base_pa;
-        if offset & (PAGE_SIZE - 1) != 0 {
-            return Err(TranslationError::CorruptTable);
-        }
-        let index = (offset / PAGE_SIZE) as usize;
-        if index >= self.used {
-            return Err(TranslationError::CorruptTable);
-        }
-        Ok(index)
+        Ok(page_ptr as u64)
     }
 }
 
-const fn aligned_for(ipa: u64, pa: u64, size: u64) -> bool {
-    ipa & (size - 1) == 0 && pa & (size - 1) == 0
-}
+#[cfg(test)]
+struct MisalignedAllocator;
 
-const fn level_size(level: u8) -> u64 {
-    match level {
-        1 => L1_SIZE,
-        2 => L2_SIZE,
-        3 => PAGE_SIZE,
-        _ => 0,
+#[cfg(test)]
+unsafe impl Stage2Allocator for MisalignedAllocator {
+    fn allocate_table_page(&mut self) -> Result<u64, TranslationError> {
+        Ok(0x5000_0001) // Not 4 KiB aligned
     }
 }
 
-const fn output_mask(level: u8) -> u64 {
-    match level {
-        1 => 0x0000_ffff_c000_0000,
-        2 => 0x0000_ffff_ffe0_0000,
-        3 => 0x0000_ffff_ffff_f000,
-        _ => 0,
+#[cfg(test)]
+struct OutOfRangeAllocator;
+
+#[cfg(test)]
+unsafe impl Stage2Allocator for OutOfRangeAllocator {
+    fn allocate_table_page(&mut self) -> Result<u64, TranslationError> {
+        Ok(0x1_0000_0000_0000) // Exceeds 40-bit PA width
     }
-}
-
-const fn index_for(level: u8, ipa: u64) -> usize {
-    let shift = match level {
-        1 => L1_SHIFT,
-        2 => L2_SHIFT,
-        3 => L3_SHIFT,
-        _ => 0,
-    };
-    ((ipa >> shift) & 0x1ff) as usize
-}
-
-fn leaf_descriptor(level: u8, pa: u64, mapping: Stage2Mapping) -> u64 {
-    let mem_attr = match mapping.mem_type {
-        Stage2MemoryType::NormalWbWa => MEM_ATTR_NORMAL_WB_WA,
-        Stage2MemoryType::DeviceNgNre => MEM_ATTR_DEVICE_NGNRE,
-    };
-    let s2ap = match mapping.access {
-        Stage2Access::None => S2AP_NONE,
-        Stage2Access::ReadOnly => S2AP_READ_ONLY,
-        Stage2Access::WriteOnly => S2AP_WRITE_ONLY,
-        Stage2Access::ReadWrite => S2AP_READ_WRITE,
-    };
-    let sh = match mapping.mem_type {
-        Stage2MemoryType::NormalWbWa => SH_INNER,
-        Stage2MemoryType::DeviceNgNre => SH_NONE,
-    };
-    let xn = match mapping.exec {
-        Stage2Exec::Executable => XN_EXEC,
-        Stage2Exec::ExecuteNever => XN_NON_EXEC,
-    };
-    let type_bit = if level == 3 { TABLE_OR_PAGE } else { 0 };
-    (pa & output_mask(level))
-        | VALID
-        | type_bit
-        | mem_attr
-        | s2ap
-        | sh
-        | ACCESS_FLAG
-        | xn
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
+    use dtoolkit::Node;
+    use dtoolkit::Property;
+    use dtoolkit::fdt::Fdt;
 
     #[test]
     fn stage2_register_values_encodes_expected_fields() {
-        let root_pa = 0x3000_4000;
-        let parange = 4; // 44-bit PA
-        let regs = stage2_register_values(1, root_pa, parange).unwrap();
+        let root_pa = 0x0500_0000;
+        let regs = stage2_register_values(1, root_pa, 0b0010).expect("valid regs");
 
-        // Check VTCR_EL2 fields
-        assert_eq!(regs.vtcr_el2 & 0x3f, 25); // T0SZ = 25
-        assert_eq!((regs.vtcr_el2 >> 6) & 0b11, 1); // SL0 = 1
-        assert_eq!((regs.vtcr_el2 >> 8) & 0b11, 1); // IRGN0 = 1
-        assert_eq!((regs.vtcr_el2 >> 10) & 0b11, 1); // ORGN0 = 1
-        assert_eq!((regs.vtcr_el2 >> 12) & 0b11, 3); // SH0 = 3 (inner)
-        assert_eq!((regs.vtcr_el2 >> 14) & 0b11, 0); // TG0 = 0 (4KB)
-        assert_eq!((regs.vtcr_el2 >> 16) & 0b111, 4); // PS = 4
-        assert_ne!(regs.vtcr_el2 & (1 << 31), 0); // RES1 set
+        assert_eq!(regs.vtcr_el2 & 0x3f, 25); // T0SZ = 25 (39 bits)
+        assert_eq!((regs.vtcr_el2 >> 6) & 0x3, 0b01); // SL0 = Level 1
+        assert_eq!((regs.vtcr_el2 >> 14) & 0x3, 0b00); // TG0 = 4 KiB
+        assert_eq!((regs.vtcr_el2 >> 16) & 0x7, 0b0010); // PS = 40 bits
+        assert_eq!((regs.vtcr_el2 >> 31) & 0x1, 1); // RES1
 
-        // Check VTTBR_EL2
-        assert_eq!(regs.vttbr_el2 >> 48, 1); // VMID = 1
-        assert_eq!(regs.vttbr_el2 & 0x0000_ffff_ffff_f000, root_pa);
+        assert_eq!((regs.vttbr_el2 >> 48) & 0xff, 1); // VMID = 1
+        assert_eq!(regs.vttbr_el2 & ADDRESS_MASK, root_pa);
 
-        // Check HCR_EL2 and CPTR_EL2
-        assert_eq!(regs.hcr_el2, HCR_EL2_PHASE9_VALUE);
-        assert_eq!(regs.cptr_el2, CPTR_EL2_PHASE9_VALUE);
-        assert_eq!(regs.vmpidr_el2, VMPIDR_EL2_VCPU0);
+        assert_eq!(regs.hcr_el2 & HCR_EL2_VM, HCR_EL2_VM);
+        assert_eq!(regs.hcr_el2 & HCR_EL2_RW, HCR_EL2_RW);
+        assert_eq!(regs.cptr_el2 & CPTR_EL2_TFP, 0);
+        assert_eq!(regs.vmpidr_el2, 0xC000_0000);
     }
 
     #[test]
-    fn stage2_maps_and_walks_leaf_pages_with_permissions() {
-        let mut storage = TableStorage::<8>::zeroed();
-        let mut tables = Stage2TableSet::new(&mut storage, 0x1000_0000, 40).unwrap();
+    fn stage2_maps_and_walks_l3_leaf_pages_with_permissions() {
+        let mut mock_alloc = MockStage2Allocator::<8>::new();
+        let mut table_set =
+            Stage2TableSet::new(&mut mock_alloc, 48).expect("create Stage2TableSet");
 
-        let guest_ram = Stage2Mapping {
-            ipa: 0x4000_0000,
-            pa: 0x0500_0000,
-            size: 0x20_0000, // 2 MiB
-            mem_type: Stage2MemoryType::NormalWbWa,
-            access: Stage2Access::ReadWrite,
-            exec: Stage2Exec::Executable,
-        };
-        tables.map(guest_ram).unwrap();
+        // Map code: ReadOnly, Executable
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4000_0000,
+                pa: 0x1000_0000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadOnly,
+                exec: Stage2Exec::Executable,
+            })
+            .expect("map code page");
 
-        // Walk entry IPA
-        let t = tables.walk(0x4000_0000).unwrap().unwrap();
-        assert_eq!(t.pa, 0x0500_0000);
-        assert_eq!(t.mem_type, Stage2MemoryType::NormalWbWa);
-        assert_eq!(t.access, Stage2Access::ReadWrite);
-        assert_eq!(t.exec, Stage2Exec::Executable);
+        // Map data: ReadWrite, ExecuteNever
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4000_1000,
+                pa: 0x1000_1000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadWrite,
+                exec: Stage2Exec::ExecuteNever,
+            })
+            .expect("map data page");
 
-        // Walk middle page
-        let t_mid = tables.walk(0x4001_1000).unwrap().unwrap();
-        assert_eq!(t_mid.pa, 0x0501_1000);
+        // Check translation of code page
+        let code_trans = table_set.translate(0x4000_0000).expect("translate code");
+        assert_eq!(code_trans.pa, 0x1000_0000);
+        assert_eq!(code_trans.access, Stage2Access::ReadOnly);
+        assert_eq!(code_trans.exec, Stage2Exec::Executable);
 
-        // Unmapped IPA must return None
-        assert_eq!(tables.walk(0x3000_0000).unwrap(), None);
-        assert_eq!(tables.walk(0x4020_0000).unwrap(), None);
+        // Check translation of data page
+        let data_trans = table_set.translate(0x4000_1000).expect("translate data");
+        assert_eq!(data_trans.pa, 0x1000_1000);
+        assert_eq!(data_trans.access, Stage2Access::ReadWrite);
+        assert_eq!(data_trans.exec, Stage2Exec::ExecuteNever);
+
+        // Check unmapped page (stack guard)
+        assert!(table_set.translate(0x4000_2000).is_none());
+
+        // Check completely unmapped range
+        assert!(table_set.translate(0x3000_0000).is_none());
+    }
+
+    #[test]
+    fn guest_dtb_and_stage2_mappings_agree_exactly() {
+        let mut mock_alloc = MockStage2Allocator::<8>::new();
+        let mut table_set =
+            Stage2TableSet::new(&mut mock_alloc, 48).expect("create Stage2TableSet");
+
+        let mem_regions = [
+            GuestMemoryRegion {
+                base: 0x4000_0000,
+                size: 0x0000_2000, // covers payload (0x4000_0000) and scratch (0x4000_1000)
+            },
+            GuestMemoryRegion {
+                base: 0x4000_3000,
+                size: 0x0000_1000, // guest stack
+            },
+            GuestMemoryRegion {
+                base: 0x4010_0000,
+                size: 0x0000_1000, // guest DTB
+            },
+        ];
+
+        // Map payload: ReadOnly, Executable
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4000_0000,
+                pa: 0x1000_0000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadOnly,
+                exec: Stage2Exec::Executable,
+            })
+            .unwrap();
+
+        // Map scratch: ReadWrite, ExecuteNever
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4000_1000,
+                pa: 0x1000_1000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadWrite,
+                exec: Stage2Exec::ExecuteNever,
+            })
+            .unwrap();
+
+        // Map stack: ReadWrite, ExecuteNever
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4000_3000,
+                pa: 0x1000_3000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadWrite,
+                exec: Stage2Exec::ExecuteNever,
+            })
+            .unwrap();
+
+        // Map DTB: ReadOnly, ExecuteNever
+        table_set
+            .map(Stage2Mapping {
+                ipa: 0x4010_0000,
+                pa: 0x1010_0000,
+                size: 0x1000,
+                mem_type: Stage2MemoryType::NormalWbWa,
+                access: Stage2Access::ReadOnly,
+                exec: Stage2Exec::ExecuteNever,
+            })
+            .unwrap();
+
+        // Build guest DTB describing these exact memory regions
+        let mut dtb_buf = [0_u8; 1024];
+        let dtb_size = build_guest_dtb(
+            &mut dtb_buf,
+            &GuestFdtConfig {
+                memory_regions: &mem_regions,
+                bootargs: None,
+            },
+        )
+        .expect("build DTB");
+
+        let fdt = Fdt::new(&dtb_buf[..dtb_size]).expect("parse DTB");
+        let mem = fdt.root().child("memory@40000000").expect("/memory node");
+        let reg = mem.property("reg").expect("reg property");
+        let reg_bytes = reg.value();
+        assert_eq!(reg_bytes.len(), mem_regions.len() * 16);
+
+        // Verify every page advertised by the DTB has a valid Stage-2 translation
+        for i in 0..mem_regions.len() {
+            let base = u64::from_be_bytes(reg_bytes[i * 16..i * 16 + 8].try_into().unwrap());
+            let size = u64::from_be_bytes(reg_bytes[i * 16 + 8..i * 16 + 16].try_into().unwrap());
+            let mut page = base;
+            while page < base + size {
+                let trans = table_set
+                    .translate(page)
+                    .unwrap_or_else(|| panic!("Page {:#x} advertised in DTB is unmapped", page));
+                assert_eq!(trans.mem_type, Stage2MemoryType::NormalWbWa);
+                page += PAGE_SIZE;
+            }
+        }
+
+        // Verify that stack guard page (0x4000_2000) is NOT advertised in DTB and is unmapped in Stage-2
+        assert!(table_set.translate(0x4000_2000).is_none());
+        // Verify that unmapped low device space is unmapped
+        assert!(table_set.translate(0x3000_0000).is_none());
+    }
+
+    #[test]
+    fn stage2_rejects_misaligned_and_out_of_range_table_allocator() {
+        assert_eq!(
+            Stage2TableSet::new(MisalignedAllocator, 40).map(|_| ()),
+            Err(TranslationError::InvalidTableBase)
+        );
+        assert_eq!(
+            Stage2TableSet::new(OutOfRangeAllocator, 40).map(|_| ()),
+            Err(TranslationError::InvalidTableBase)
+        );
     }
 
     #[test]
     fn stage2_encodes_device_and_readonly_attributes() {
-        let mut storage = TableStorage::<8>::zeroed();
-        let mut tables = Stage2TableSet::new(&mut storage, 0x1000_0000, 40).unwrap();
-
-        let dtb_mapping = Stage2Mapping {
-            ipa: 0x4010_0000,
-            pa: 0x0600_0000,
-            size: 0x1000,
-            mem_type: Stage2MemoryType::NormalWbWa,
-            access: Stage2Access::ReadOnly,
-            exec: Stage2Exec::ExecuteNever,
-        };
-        tables.map(dtb_mapping).unwrap();
-
-        let t = tables.walk(0x4010_0000).unwrap().unwrap();
-        assert_eq!(t.pa, 0x0600_0000);
-        assert_eq!(t.access, Stage2Access::ReadOnly);
-        assert_eq!(t.exec, Stage2Exec::ExecuteNever);
+        let desc = encode_l3_page_descriptor(
+            0x2000_0000,
+            Stage2MemoryType::DeviceNgNre,
+            Stage2Access::ReadOnly,
+            Stage2Exec::ExecuteNever,
+        );
+        assert_eq!(desc & VALID, VALID);
+        assert_eq!(desc & TABLE_OR_PAGE, TABLE_OR_PAGE);
+        assert_eq!(desc & (0b1111 << 2), MEM_ATTR_DEVICE_NGNRE);
+        assert_eq!(desc & (0b11 << 6), S2AP_READ_ONLY);
+        assert_eq!(desc & (0b11 << 8), SH_NONE);
+        assert_eq!(desc & ACCESS_FLAG, ACCESS_FLAG);
+        assert_eq!(desc & (0b11 << 53), XN_NON_EXEC);
+        assert_eq!(desc & ADDRESS_MASK, 0x2000_0000);
     }
 
     #[test]
     fn stage2_rejects_unaligned_and_overflowing_mappings() {
-        let mut storage = TableStorage::<4>::zeroed();
-        let mut tables = Stage2TableSet::new(&mut storage, 0x1000_0000, 40).unwrap();
+        let mut mock_alloc = MockStage2Allocator::<8>::new();
+        let mut table_set =
+            Stage2TableSet::new(&mut mock_alloc, 48).expect("create Stage2TableSet");
 
-        // Empty size
+        let unaligned = Stage2Mapping {
+            ipa: 0x4000_0001,
+            pa: 0x1000_0000,
+            size: 0x1000,
+            mem_type: Stage2MemoryType::NormalWbWa,
+            access: Stage2Access::ReadWrite,
+            exec: Stage2Exec::Executable,
+        };
         assert_eq!(
-            tables.map(Stage2Mapping {
-                ipa: 0x4000_0000,
-                pa: 0x0500_0000,
-                size: 0,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadWrite,
-                exec: Stage2Exec::Executable,
-            }),
-            Err(TranslationError::EmptyMapping)
-        );
-
-        // Unaligned IPA
-        assert_eq!(
-            tables.map(Stage2Mapping {
-                ipa: 0x4000_0001,
-                pa: 0x0500_0000,
-                size: 0x1000,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadWrite,
-                exec: Stage2Exec::Executable,
-            }),
+            table_set.map(unaligned),
             Err(TranslationError::UnalignedMapping)
         );
 
-        // Out of 39-bit IPA space (>= 512 GiB)
+        let overflow = Stage2Mapping {
+            ipa: (1 << IPA_BITS) - 0x800,
+            pa: 0x1000_0000,
+            size: 0x1000,
+            mem_type: Stage2MemoryType::NormalWbWa,
+            access: Stage2Access::ReadWrite,
+            exec: Stage2Exec::Executable,
+        };
         assert_eq!(
-            tables.map(Stage2Mapping {
-                ipa: 1 << 39,
-                pa: 0x0500_0000,
-                size: 0x1000,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadWrite,
-                exec: Stage2Exec::Executable,
-            }),
-            Err(TranslationError::VirtualAddressOutOfRange)
+            table_set.map(overflow),
+            Err(TranslationError::UnalignedMapping)
         );
+    }
+
+    #[test]
+    fn stage2_handles_table_exhaustion_cleanly() {
+        let mut mock_alloc = MockStage2Allocator::<1>::new(); // Only root table can be allocated
+        let mut table_set =
+            Stage2TableSet::new(&mut mock_alloc, 48).expect("create Stage2TableSet");
+
+        // Attempting to map requires L2 and L3 subtables, which must fail cleanly
+        let res = table_set.map(Stage2Mapping {
+            ipa: 0x4000_0000,
+            pa: 0x1000_0000,
+            size: 0x1000,
+            mem_type: Stage2MemoryType::NormalWbWa,
+            access: Stage2Access::ReadWrite,
+            exec: Stage2Exec::Executable,
+        });
+        assert_eq!(res, Err(TranslationError::TableExhausted));
+    }
+
+    #[test]
+    fn allocation_failure_injection_restores_clean_state_on_rollback() {
+        struct FailingTrackingAllocator {
+            pages: [TablePage; 16],
+            in_use: [bool; 16],
+            fail_at: usize,
+            alloc_count: usize,
+            recorded: [usize; 16],
+            recorded_count: usize,
+        }
+
+        impl FailingTrackingAllocator {
+            fn new(fail_at: usize) -> Self {
+                Self {
+                    pages: [const { TablePage::zeroed() }; 16],
+                    in_use: [false; 16],
+                    fail_at,
+                    alloc_count: 0,
+                    recorded: [0; 16],
+                    recorded_count: 0,
+                }
+            }
+
+            fn in_use_count(&self) -> usize {
+                self.in_use.iter().filter(|&&used| used).count()
+            }
+
+            fn rollback(&mut self) {
+                for &idx in &self.recorded[..self.recorded_count] {
+                    self.in_use[idx] = false;
+                }
+                self.recorded_count = 0;
+            }
+        }
+
+        unsafe impl Stage2Allocator for &mut FailingTrackingAllocator {
+            fn allocate_table_page(&mut self) -> Result<u64, TranslationError> {
+                if self.alloc_count == self.fail_at {
+                    return Err(TranslationError::TableExhausted);
+                }
+                let idx = self.alloc_count;
+                self.alloc_count += 1;
+                self.in_use[idx] = true;
+                self.recorded[self.recorded_count] = idx;
+                self.recorded_count += 1;
+                let page_ptr = core::ptr::addr_of_mut!(self.pages[idx]);
+                Ok(page_ptr as u64)
+            }
+        }
+
+        // Mapping 1 page requires 3 table allocations: Root (L1), L2 subtable, L3 subtable.
+        // Test failure at each of these allocation steps (0, 1, 2)
+        for fail_point in 0..3 {
+            let mut tracking = FailingTrackingAllocator::new(fail_point);
+            assert_eq!(tracking.in_use_count(), 0);
+
+            let res = (|| -> Result<(), TranslationError> {
+                let mut table_set = Stage2TableSet::new(&mut tracking, 48)?;
+                table_set.map(Stage2Mapping {
+                    ipa: 0x4000_0000,
+                    pa: 0x1000_0000,
+                    size: 0x1000,
+                    mem_type: Stage2MemoryType::NormalWbWa,
+                    access: Stage2Access::ReadOnly,
+                    exec: Stage2Exec::Executable,
+                })?;
+                Ok(())
+            })();
+
+            assert!(res.is_err());
+            // Rollback should return all acquired pages
+            tracking.rollback();
+            assert_eq!(
+                tracking.in_use_count(),
+                0,
+                "Injected failure at step {} must restore 0 in-use pages",
+                fail_point
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_preserves_unfreed_pages_on_injected_free_failure_and_allows_retry() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum MockFreeError {
+            InjectedFailure,
+        }
+
+        struct MockResourceManager {
+            allocated_pages: [u64; 8],
+            allocated_count: usize,
+            fail_free_pa: Option<u64>,
+        }
+
+        impl MockResourceManager {
+            fn new() -> Self {
+                Self {
+                    allocated_pages: [0; 8],
+                    allocated_count: 0,
+                    fail_free_pa: None,
+                }
+            }
+
+            fn allocate(&mut self, pa: u64) {
+                self.allocated_pages[self.allocated_count] = pa;
+                self.allocated_count += 1;
+            }
+
+            fn rollback(&mut self) -> Result<(), MockFreeError> {
+                while self.allocated_count > 0 {
+                    let last_idx = self.allocated_count - 1;
+                    let pa = self.allocated_pages[last_idx];
+                    if Some(pa) == self.fail_free_pa {
+                        return Err(MockFreeError::InjectedFailure);
+                    }
+                    self.allocated_pages[last_idx] = 0;
+                    self.allocated_count -= 1;
+                }
+                Ok(())
+            }
+        }
+
+        let mut mgr = MockResourceManager::new();
+        mgr.allocate(0x1000);
+        mgr.allocate(0x2000);
+        mgr.allocate(0x3000);
+        mgr.allocate(0x4000);
+        assert_eq!(mgr.allocated_count, 4);
+
+        // Inject failure when attempting to free page 0x2000 (3rd in reverse order)
+        mgr.fail_free_pa = Some(0x2000);
+
+        // First rollback attempt should free 0x4000 and 0x3000, then fail on 0x2000
+        let res = mgr.rollback();
+        assert_eq!(res, Err(MockFreeError::InjectedFailure));
+        // Remaining un-freed pages must still be tracked!
+        assert_eq!(mgr.allocated_count, 2);
+        assert_eq!(&mgr.allocated_pages[..2], &[0x1000, 0x2000]);
+
+        // Clear failure injection and retry rollback
+        mgr.fail_free_pa = None;
+        let retry_res = mgr.rollback();
+        assert!(retry_res.is_ok());
+        assert_eq!(mgr.allocated_count, 0);
     }
 }

@@ -24,8 +24,8 @@ The guest address space uses the standard ARM64 virtual platform convention (QEM
 ```text
 Guest IPA Range                     Size        Purpose
 0x0000_0000_0000 .. 0x0000_3FFF_FFFF 1 GiB       Reserved for virtual devices (GIC, PL011, VirtIO)
-0x0000_4000_0000 .. 0x0000_401F_FFFF 2 MiB       Phase 9 Guest RAM (Test payload, stack, DTB)
-0x0000_4020_0000 .. [configurable)   Variable    Extended Guest RAM (Phase 10 Linux kernel & initrd)
+0x0000_4000_0000 .. 0x0000_401F_FFFF 2 MiB       Phase 9 Guest RAM Window (16 KiB sparse backed RAM)
+0x0000_4020_0000 .. [configurable)   Variable    Extended Guest RAM Window (Phase 10 Linux kernel & initrd)
 ```
 
 ### 2.1 Low IPA device window `[0x0000_0000, 0x4000_0000)`
@@ -34,14 +34,20 @@ Reserved for future virtual devices:
 - `0x0900_0000` – `0x0900_0FFF`: Future Emulated PL011 UART register page.
 - In Phase 9, no virtual devices are populated in Stage 2. Any access to `[0x0000_0000, 0x4000_0000)` is unmapped and triggers a Stage-2 Data/Instruction Abort.
 
-### 2.2 Phase 9 guest RAM `[0x4000_0000, 0x4020_0000)` (2 MiB)
-Configured for the controlled EL1 test payload:
-- `0x4000_0000` – `0x4000_0FFF` (4 KiB): Payload entry point and code page (read/write/executable at EL1).
-- `0x4000_1000` – `0x4000_1FFF` (4 KiB): Test data scratch page.
-- `0x4000_2000` – `0x4000_3FFF` (8 KiB): Guest EL1 stack with guard page.
-- `0x4010_0000` – `0x4010_FFFF` (64 KiB): Generated Guest DTB buffer (read-only/execute-never at EL1).
+### 2.2 Phase 9 sparse guest RAM mappings (16 KiB backed within 2 MiB window)
+Within the 2 MiB Phase 9 window `[0x4000_0000, 0x4020_0000)`, tvisor allocates and Stage-2 maps exactly 16 KiB (4 individual 4 KiB pages) for the controlled EL1 test payload with distinct permissions. Only these backed pages are advertised in the guest DTB `/memory` node:
 
-All guest RAM pages are allocated on-demand from tvisor's [`GlobalPageAllocator`](file:///home/joukan/rustwork/tvisor/tvisor_util/page_allocator.rs).
+| Guest IPA Range | Size | Purpose | Stage-2 Access | Stage-2 Exec | Advertised in DTB |
+|---|---|---|---|---|---|
+| `0x4000_0000 .. 0x4000_0FFF` | 4 KiB | Test payload code | Read-Only | Executable | **Yes** (Bank 0) |
+| `0x4000_1000 .. 0x4000_1FFF` | 4 KiB | Scratch test data | Read/Write | Execute-Never | **Yes** (Bank 0) |
+| `0x4000_2000 .. 0x4000_2FFF` | 4 KiB | Stack guard page | **Unmapped** | N/A | **No** (Unmapped hole) |
+| `0x4000_3000 .. 0x4000_3FFF` | 4 KiB | Guest EL1 stack (`sp = 0x4000_4000`) | Read/Write | Execute-Never | **Yes** (Bank 1) |
+| `0x4010_0000 .. 0x4010_0FFF` | 4 KiB | Generated Guest DTB | Read-Only | Execute-Never | **Yes** (Bank 2) |
+
+All other addresses in `[0x4000_0000, 0x4020_0000)` (including the stack guard page at `0x4000_2000`) remain unmapped in Stage-2 and are excluded from the guest DTB.
+
+All guest RAM backing pages and Stage-2 table pages are allocated individually on-demand from tvisor's [`GlobalPageAllocator`](../tvisor_util/page_allocator.rs) and tracked by `GuestResourceManager`.
 
 ---
 
@@ -58,6 +64,7 @@ All guest RAM pages are allocated on-demand from tvisor's [`GlobalPageAllocator`
     9 bits       9 bits       9 bits       12 bits
   ```
 - **Root Table**: One standard 4 KiB page containing 512 64-bit descriptors. No multi-page concatenation is required for 39-bit Level-1 start.
+- **Descriptors**: Phase 9 constructs strictly 4 KiB Level-3 leaf page descriptors. Block descriptors are deferred.
 
 ### 3.2 Stage-2 translation registers
 
@@ -76,8 +83,6 @@ All guest RAM pages are allocated on-demand from tvisor's [`GlobalPageAllocator`
 | `VTTBR_EL2.CnP` | `0` (bit 0) | Common not Private disabled |
 
 ### 3.3 Stage-2 descriptor encodings
-
-Unlike Stage 1, Stage-2 descriptors encode memory attributes and access permissions directly in the descriptor rather than indexing `MAIR_EL2`:
 
 #### Table descriptor (Level 1 and Level 2 pointing to next-level table):
 ```text
@@ -111,7 +116,7 @@ Bits [54:53]: XN[1:0] (Execute-Never)
 
 ---
 
-## 4. Hypervisor execution control (`HCR_EL2`, `CPTR_EL2`)
+## 4. Hypervisor execution control (`HCR_EL2`, `CPTR_EL2`, `VMPIDR_EL2`)
 
 For guest EL1 execution, tvisor configures:
 
@@ -123,9 +128,30 @@ For guest EL1 execution, tvisor configures:
   * `TSC = 1` (bit 19): Trap `SMC` instructions to EL2.
   * `HCD = 0` (bit 29): `HVC` instruction is enabled.
 * `CPTR_EL2`:
-  * `TFP = 1` (bit 10): Trap Floating Point / Advanced SIMD accesses from EL1/EL0 to EL2.
+  * `TFP = 0` (bit 10) while tvisor runs at EL2, because Rust or compiler-generated
+    code can use Floating Point / Advanced SIMD instructions.
+  * The vCPU world switch sets `TFP = 1` immediately before `eret` into the guest
+    and clears it at the start of the lower-EL exception entry, before returning
+    to Rust. This traps guest FP/Advanced-SIMD use without trapping tvisor itself.
 * `VMPIDR_EL2`:
-  * Programmed with virtual affinity `0x8000_0000` (Core 0, uniprocessor flag bit 30 set).
+  * Programmed with virtual affinity `0xC000_0000` (Bit 31 RES1, Bit 30 UP flag set, Affinity 0.0.0 for vCPU 0).
+
+### 4.1 Publication and Activation Sequence
+Before entering the guest:
+1. Finish Stage-2 descriptor writes.
+2. Execute `dsb ishst` to ensure table updates are visible to the page table walker.
+3. Write `VTCR_EL2`, `VTTBR_EL2`, host-safe `CPTR_EL2` (`TFP = 0`), and
+   `VMPIDR_EL2` while `HCR_EL2.VM` remains clear.
+4. Execute `isb` so the new Stage-2 configuration and VMID are visible to subsequent instructions.
+5. Invalidate guest TLBs with `tlbi vmalls12e1is` while `VTTBR_EL2` selects the guest VMID.
+6. Execute `dsb ish` and `isb` to complete the invalidation.
+7. Write `HCR_EL2` with `VM = 1`, then execute `isb` before launching `__vcpu_run`.
+
+After the vCPU has stopped, tvisor invalidates the guest's translations while
+`VTTBR_EL2` still selects its VMID, completes the invalidation with
+`dsb ish; isb`, clears only `HCR_EL2.VM`, and then clears `VTTBR_EL2` before
+releasing any guest or table pages. `CPTR_EL2` remains at a value containing
+all architecturally required RES1 bits.
 
 ---
 
@@ -171,8 +197,8 @@ pub struct VcpuExit {
 
 pub enum VcpuExitReason {
     Hvc { imm: u16, arg0: u64 },
-    Stage2DataAbort { ipa: u64, is_write: bool, len: usize },
-    Stage2InstructionAbort { ipa: u64 },
+    Stage2DataAbort { ipa: u64, is_write: bool, dfsc: u8 },
+    Stage2InstructionAbort { ipa: u64, ifsc: u8 },
     SmcTrap,
     SysRegTrap,
     FpSimdTrap,
@@ -183,7 +209,7 @@ pub enum VcpuExitReason {
 ### 5.3 Assembly world switch (`__vcpu_run`)
 ```text
 Host EL2 Rust:
-  calls __vcpu_run(context: *mut VcpuContext) -> u64
+  calls __vcpu_run(context: *mut VcpuContext, exit: *mut VcpuExit) -> u64
       |
       v
   Save host callee-saved registers (x19..x29, x30, sp_el2) to host stack
@@ -197,7 +223,7 @@ Host EL2 Rust:
       | ... Guest executes at EL1 ...
       | Exception occurs (e.g. HVC #0, Stage-2 Data Abort)
       v
-  EL2 Vector Table (Slot 8: Lower EL AArch64 Sync)
+  EL2 Vector Table (Slot 8: Lower EL AArch64 Sync -> __vcpu_exit_handler)
   Save guest GPRs (x0..x30) into context
   Save SPSR_EL2, ELR_EL2, SP_EL1 into context
   Save guest EL1 system registers into context
@@ -220,8 +246,7 @@ Host EL2 Rust:
      - `#size-cells = <2>`
      - `model = "tvisor-virt-v1"`
      - `compatible = "tvisor,virt", "linux,dummy-virt"`
-   - `/chosen`:
-     - `bootargs = ""`
+   - `/chosen`
    - `/cpus`:
      - `#address-cells = <1>`
      - `#size-cells = <0>`
@@ -229,30 +254,31 @@ Host EL2 Rust:
        - `device_type = "cpu"`
        - `compatible = "arm,cortex-a72"`
        - `reg = <0>`
-       - `enable-method = "psci"` (for future compatibility)
-   - `/memory@0x40000000`:
+   - `/memory@40000000`:
      - `device_type = "memory"`
-     - `reg = <0x00000000 0x40000000 0x00000000 0x00200000>` (2 MiB)
+     - `reg = <0x00000000 0x40000000 0x00000000 0x00002000  0x00000000 0x40003000 0x00000000 0x00001000  0x00000000 0x40100000 0x00000000 0x00001000>` (describes exact backed RAM regions: payload/scratch, stack, and DTB; unmapped guard page `0x4000_2000` is omitted)
 4. **Strings Block**: Compact NUL-terminated property names.
 
 ---
 
 ## 7. Controlled EL1 test payload sequence
 
-The test payload is written in position-independent assembly (`.section .text.payload`), copied to guest RAM at `0x4000_0000`:
+The test payload is written in position-independent assembly (`.section .payload`), copied to guest RAM at `0x4000_0000`:
 
 ```text
 Sequence:
-1. Initialize SP_EL1 to 0x4000_3000.
+1. Initialize SP_EL1 to 0x4000_4000 (top of stack page [0x4000_3000, 0x4000_4000)).
 2. Checkpoint 1 (RAM Write/Read):
    Write pattern 0x5039_5041_594c_4f41 ("P9PAYLOA") to scratch page 0x4000_1000.
    Read back and verify equality.
-   Issue `HVC #0` with x0 = 1 (Checkpoint 1 Passed).
+   Issue `HVC #0` with x0 = 1, x1 = read pattern (Checkpoint 1 Passed).
+   (On failure, issues `HVC #1` with x0 = 0xdead, x1 = read pattern).
 3. Checkpoint 2 (Register Verification):
    Read `CurrentEL` -> verify EL1 (value == 0x04).
-   Read `MPIDR_EL1` -> verify bit 30 (UP flag) and affinity matches VMPIDR_EL2.
+   Read `MPIDR_EL1` -> verify bit 30 (UP flag) and Aff0 == 0.
    Read `SCTLR_EL1` -> verify accessible without fault.
-   Issue `HVC #0` with x0 = 2 (Checkpoint 2 Passed).
+   Issue `HVC #0` with x0 = 2, x1 = MPIDR_EL1 (Checkpoint 2 Passed).
+   (On failure, issues `HVC #2` / `HVC #3` with x0 = 0xdead, x1 = reg value).
 4. Checkpoint 3 (Deliberate Stage-2 Translation Fault):
    Attempt to read from unmapped IPA `0x3000_0000`.
    Hardware triggers Stage-2 Data Abort -> traps to EL2.
@@ -270,13 +296,16 @@ Sequence:
 
 * **Host Tests (`cargo test-host`)**:
   * Stage-2 descriptor encoding and bitfield validation.
-  * 39-bit Stage-2 table walking, mapping, unmapping, and permissions checks.
-  * Guest FDT serializer emits valid DTB that parses identically with `Fdt`.
-  * `VTCR_EL2`, `VTTBR_EL2`, `HCR_EL2`, and `CPTR_EL2` register decoding and bit assertions.
+  * 39-bit Stage-2 table walking, mapping, and permissions checks.
+  * Guest FDT serializer emits valid DTB describing exact sparse memory banks that parses identically with `Fdt`.
+  * `guest_dtb_and_stage2_mappings_agree_exactly` verifies that every advertised DTB page has an active Stage-2 mapping and that unmapped pages (like stack guard) are not advertised.
+  * `VTCR_EL2`, `VTTBR_EL2`, `HCR_EL2`, `CPTR_EL2`, and `VMPIDR_EL2` register decoding and bit assertions.
+  * `GuestResourceManager` rollback error-retention and retry tests under injected failure.
 * **Bare-Metal Build (`cargo build`)**:
   * Clean build with no warnings, zero global heap, and no stack use before SP selection.
 * **Raspberry Pi 4 Execution**:
-  * Allocates guest RAM and Stage-2 table pages from [`GlobalPageAllocator`](file:///home/joukan/rustwork/tvisor/tvisor_util/page_allocator.rs).
+  * Allocates individual sparse guest RAM (16 KiB) and Stage-2 table pages from [`GlobalPageAllocator`](../tvisor_util/page_allocator.rs).
   * Enters guest EL1 via `__vcpu_run`.
   * Observes and logs Checkpoint 1 (`HVC #0`, x0=1) and Checkpoint 2 (`HVC #0`, x0=2) resumes.
   * Observes and logs the final deliberate Stage-2 translation fault on unmapped IPA `0x3000_0000`.
+  * Executes architectural Stage-2 deactivation (`tlbi vmalls12e1is` with VMID 1 active $\rightarrow$ `dsb ish; isb` $\rightarrow$ clear `HCR_EL2.VM` and `VTTBR_EL2`), rolls back all allocated pages, and verifies that final allocator in-use page count matches the initial count (0 leaked pages).
