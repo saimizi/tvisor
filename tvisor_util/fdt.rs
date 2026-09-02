@@ -1,5 +1,4 @@
 use core::fmt;
-use core::mem::size_of;
 
 use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
 use spin::Once;
@@ -187,9 +186,6 @@ fn parse_hex_address(value: &[u8]) -> Result<usize, FdtArgError> {
     })
 }
 
-const MINI_UART_COMPATIBLE: &str = "brcm,bcm2835-aux-uart";
-const MINI_UART_MIN_REGISTER_SIZE: u64 = 0x18;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleDiscoveryError {
     MissingChosen,
@@ -250,7 +246,7 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
         return Err(ConsoleDiscoveryError::ConsoleDisabled);
     }
 
-    let kind = if node.is_compatible(MINI_UART_COMPATIBLE) {
+    let kind = if node.is_compatible(ConsoleKind::MiniUart.compatible_str()) {
         ConsoleKind::MiniUart
     } else {
         return Err(ConsoleDiscoveryError::UnsupportedConsole);
@@ -270,12 +266,13 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
         .size::<u64>()
         .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
 
-    if register_size < MINI_UART_MIN_REGISTER_SIZE {
+    if register_size < kind.min_register_size() {
         return Err(ConsoleDiscoveryError::InvalidRegister);
     }
 
+    // Translate register address from bus address to cpu address.
     let physical_address = translate_to_cpu_address(fdt, path, bus_address)?;
-    if physical_address == 0 || !physical_address.is_multiple_of(size_of::<u32>() as u64) {
+    if physical_address == 0 || !physical_address.is_multiple_of(kind.min_alignment()) {
         return Err(ConsoleDiscoveryError::InvalidRegister);
     }
     let registers = PhysRegion::new(PhysAddr::new(physical_address), register_size)

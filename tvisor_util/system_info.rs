@@ -442,6 +442,25 @@ pub enum ConsoleKind {
     MiniUart,
 }
 
+impl ConsoleKind {
+    pub const fn min_alignment(&self) -> u64 {
+        match self {
+            ConsoleKind::MiniUart => size_of::<u32>() as u64,
+        }
+    }
+
+    pub const fn min_register_size(&self) -> u64 {
+        match self {
+            ConsoleKind::MiniUart => 0x18,
+        }
+    }
+
+    pub const fn compatible_str(&self) -> &'static str {
+        match self {
+            ConsoleKind::MiniUart => "brcm,bcm2835-aux-uart",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsoleInfo {
     pub kind: ConsoleKind,
