@@ -48,6 +48,10 @@ SECTIONS {
         __writable_start = .;
         *(.data .data.*)
         *(.got .got.*)
+    }
+
+    /* save binary size to put it at last */
+    .bss (NOLOAD) : ALIGN(__ALIGN_SIZE) {
         __bss_start = .;
         *(.bss .bss.*)
         . = ALIGN(16);
