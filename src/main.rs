@@ -4,9 +4,9 @@
 use core::arch::{asm, global_asm};
 use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::CurrentEL;
+use tvisor_util::aarch64_reg::*;
 use tvisor_util::boot_mode::fault_test_from_args;
 use tvisor_util::debug_util::{debug_fini, debug_init};
-use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
 use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::platform::discover_system_info_builder;
 use tvisor_util::println;
@@ -120,40 +120,31 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     // registers. In particular, ID-group register reads performed at EL1
     // can be redirected to EL2 by HCR_EL2.TID3.
     let current_el = CurrentEL::dump();
-    if !should_collect_full_diagnostics(current_el.current_el()) {
+    if current_el.current_el() != ExceptionLevel::EL2 {
         println!("CurrentEL: {:#018x}", current_el.value);
         stop();
     }
 
-    let diag_state = DiagState::dump();
-
-    if diag_state.sctlr_el2.as_ref().is_some_and(|s| s.bit_ee()) {
+    if SctlrEl2::dump().is_some_and(|s| s.bit_ee()) {
         println!("Handoff validation failed: SCTLR_EL2.EE selects big-endian data accesses");
         stop();
     }
 
-    if diag_state
-        .vbar_el2
-        .as_ref()
-        .is_some_and(|v| !v.is_aligned())
-    {
+    if VbarEl2::dump().is_some_and(|v| !v.is_aligned()) {
         println!("Handoff validation failed: VBAR_EL2 is not 2 KiB aligned");
         stop();
     }
 
-    if diag_state
-        .id_aa64pfr0_el1
-        .as_ref()
-        .is_some_and(|r| r.el2() == 0)
-    {
+    if IdAa64Pfr0El1::dump().is_some_and(|v| v.el2() == 0) {
         println!("Handoff validation failed: EL2 is not implemented");
         stop();
     }
 
-    let Some(mpidr_el1) = diag_state.mpidr_el1 else {
+    let Some(mpidr_el1) = MpidrEl1::dump() else {
         println!("Platform discovery failed: MPIDR_EL1 is unavailable");
         stop();
     };
+
     let image_start = core::ptr::addr_of!(__image_start) as u64;
     let image_end = core::ptr::addr_of!(__image_end) as u64;
     let tvisor_image =
@@ -187,7 +178,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
 
     println!("{}", system_info);
-    println!("{}", diag_state);
 
     let live_dtb = match PhysRegion::new(
         PhysAddr::new(dtb_base as usize as u64),
@@ -201,7 +191,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
 
     // Check whether 4 KiB translation granules are supported.
-    let Some(mmfr0) = diag_state.id_aa64mmfr0_el1 else {
+    let Some(mmfr0) = IdAa64Mmfr0El1::dump() else {
         println!("Phase 7 table preparation failed: PARange is unavailable");
         stop();
     };
@@ -210,7 +200,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         stop();
     }
 
-    let Some(hcr) = diag_state.hcr_el2 else {
+    let Some(hcr) = HcrEl2::dump() else {
         println!("Phase 7 cannot validate HCR_EL2");
         stop();
     };

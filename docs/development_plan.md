@@ -49,7 +49,8 @@ The current implementation has these properties:
 - `rust_main` validates the DTB and EL2 handoff state, builds `SystemInfo`,
   prepares linker-owned translation tables, and enters private EL2.
 - `tvisor_util/aarch64_reg.rs` contains typed AArch64 register accessors.
-- `tvisor_util/diag.rs` collects the read-only handoff state.
+- `src/main.rs` reads only the architectural registers required to validate
+  takeover; the earlier full handoff-snapshot module has been retired.
 - `tvisor_util/debug_util.rs` supplies the early mini-UART debug path.
 - `src/boot.rs` installs tvisor's private stack, vectors, and EL2 translation
   regime, then initializes the physical allocator.
@@ -58,8 +59,8 @@ The current implementation has these properties:
 - `scripts/rpi.ld` links tvisor at physical address `0x0400_0000` and exports
   page-aligned image, section, guard, stack, and bootstrap-table symbols.
 - `docs/address_translation.md` describes EL2 stage 1 and guest stage 2.
-- `docs/check_handoff_state.md` defines the diagnostic phase and the observed
-  U-Boot handoff register state.
+- `docs/check_handoff_state.md` records the completed historical diagnostic
+  phase and the observed U-Boot handoff register state.
 - `docs/uboot_rpi4_memory.md` records the observed Raspberry Pi 4 RAM, LMB,
   U-Boot, DTB, and peripheral layout.
 - `docs/peripheral_address_translation.md` explains how DT `ranges` converts
@@ -134,7 +135,6 @@ tvisor_util/
   bcm2711.rs          BCM2711-compatible details when bindings are insufficient
   memory_map.rs       normalization, reservation subtraction, and validation
   aarch64_reg.rs      architectural register accessors
-  diag.rs             inherited-state diagnostics
   debug_util.rs       early UART diagnostics
 
 src/
@@ -323,8 +323,9 @@ from RAM that remains usable after reservations are subtracted.
   containment, overlap, adjacency, list capacity, and formatting.
 - **AArch64 build:** `cargo build --target aarch64-unknown-none` succeeds
   without an allocator.
-- **Raspberry Pi 4:** No behavioral change is required yet; the diagnostic
-  program continues to run and return to U-Boot.
+- **Raspberry Pi 4:** At this milestone, the diagnostic program continues to
+  run and return to U-Boot. Later takeover phases intentionally replace this
+  behavior with a no-return path.
 
 ## 7. Phase 2: discover RAM and reservations
 
