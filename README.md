@@ -12,12 +12,13 @@ U-Boot and eventually run guest virtual machines. The current implementation:
   (DTB);
 - initializes the DTB-selected mini UART for diagnostics;
 - records RAM, firmware reservations, MMIO windows, CPUs, and console data;
-- distinguishes permanent reservations from temporary U-Boot handoff memory;
-- derives pre-takeover and post-takeover usable-RAM maps without a heap; and
-- installs a private stack, exception vectors, and EL2 stage-1 page tables.
+- derives permanent reservations and post-takeover usable RAM without a heap;
+- installs a private stack, exception vectors, and linker-owned EL2 stage-1
+  page tables; and
+- runs a controlled single-vCPU EL1 payload under stage-2 translation.
 
-Tvisor does not run a guest VM yet. After validating the handoff, it takes
-ownership of EL2 and does not return to U-Boot.
+After validating the handoff, tvisor takes ownership of EL2 and does not
+return to U-Boot. Booting a full guest operating system remains future work.
 
 ## Requirements
 
@@ -91,8 +92,10 @@ U-Boot> bdinfo
 U-Boot> printenv fdt_addr
 ```
 
-Do not assume that LMB, DTB, stack, or relocated U-Boot addresses remain the
-same after changing firmware, U-Boot, the DTB, or the boot sequence.
+`bdinfo` and LMB remain useful deployment evidence for validating the fixed
+load window, but tvisor does not accept them as runtime inputs. Do not assume
+that the DTB, stack, or relocated U-Boot addresses remain the same after
+changing firmware, U-Boot, the DTB, or the boot sequence.
 
 ### 3. Download tvisor
 
@@ -105,6 +108,14 @@ U-Boot> tftpboot 0x04000000 <tftp-server-ip>:tvisor
 
 U-Boot sets `filesize` to the downloaded file size.
 
+The downloaded size does not include linker `NOLOAD` storage. Confirm that the
+complete runtime interval reported by `__image_start` and `__image_end` fits
+the board's validated load window:
+
+```sh
+nm -n target/aarch64-unknown-none/debug/tvisor | grep -E '__image_(start|end)$'
+```
+
 ### 4. Run tvisor
 
 Use the `main` address reported by `nm`:
@@ -113,23 +124,9 @@ Use the `main` address reported by `nm`:
 U-Boot> go <main-address> fdt=${fdt_addr}
 ```
 
-For a more accurate pre-takeover safety map, also pass the download buffer and
-every LMB reservation reported by the immediately preceding `bdinfo`:
-
-```text
-U-Boot> go <main-address> \
-    fdt=${fdt_addr} \
-    bootmem=4000000:${filesize} \
-    lmb=<start0>:<size0> \
-    lmb=<start1>:<size1>
-```
-
-The backslashes above show logical line wrapping; enter the command as one
-line in U-Boot. Addresses and sizes are hexadecimal without a required `0x`
-prefix.
-
-`lmb=` and `bootmem=` describe temporary U-Boot ownership. They refine the
-`INITIAL` map but never reduce the final post-takeover `USABLE` map.
+The complete tvisor runtime footprint must not overlap live U-Boot or firmware
+state. Initial EL2 tables come from tvisor's linker-owned bootstrap arena, so
+no `lmb=` or `bootmem=` arguments are accepted or required.
 
 Tvisor always installs its own EL2 stage-1 tables. An optional `fault=`
 argument selects a post-switch test:
@@ -147,14 +144,14 @@ A successful run should print:
 
 - DTB version, size, and board model;
 - discovered RAM, reservations, MMIO translations, CPUs, and console;
-- normalized `RESERVED`, `HANDOFF`, `INITIAL`, and `USABLE` regions;
+- normalized `RESERVED` and `USABLE` RAM plus MMIO regions;
 - inherited EL2 register state; and
 - the private-environment checkpoints:
 
 ```text
 Phase 7 checkpoint 2: tvisor EL2 page tables active
 Phase 7 checkpoint 3: register, stack, and image validation passed
-Phase 7 checkpoint complete; halting
+Phase 9 Guest Preparation & Execution Verification: PASSED
 ```
 
 The final halt is intentional. Reset or power-cycle the board before another

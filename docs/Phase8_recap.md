@@ -1,12 +1,12 @@
-# Phase 8 recap: physical-page allocation and boot-memory reclamation
+# Phase 8 recap: post-takeover physical-page allocation
 
 ## 1. Starting point
 
 Phase 7 completes the irreversible U-Boot handoff. Tvisor now owns its EL2
 stack, vector table, UART access, and stage-1 translation tables, and it has no
 return path to U-Boot. Phase 8 turns the normalized physical-memory database
-into allocatable 4 KiB pages and releases handoff-only storage at explicit
-lifetime boundaries.
+into allocatable 4 KiB pages. Initial tables reside in tvisor's linker-owned
+runtime footprint, so allocator initialization is deferred until this point.
 
 Phase 8 does not add a Rust global heap, create guest stage-2 mappings, or boot
 a guest. Those are later milestones.
@@ -22,7 +22,7 @@ Implement a deterministic physical-page allocator that:
 - detects invalid and double frees according to a documented policy;
 - makes allocator-managed RAM accessible through the current EL2 identity
   map; and
-- reclaims U-Boot pages while retaining the mapped original DTB in place.
+- retains the mapped original DTB in place.
 
 ## 3. Allocator model
 
@@ -31,7 +31,7 @@ The first allocator uses 4 KiB pages and two bitmaps stored in tvisor-owned
 three states without per-page ownership metadata:
 
 - `Reserved`: the page belongs to RAM, but is permanently unavailable;
-- `InUse`: the page is allocatable RAM currently occupied by U-Boot or tvisor;
+- `InUse`: the page is allocator-managed RAM currently owned by tvisor;
 - `Unused`: the page is immediately available for allocation.
 
 Both bitmaps cover one flat 4 GiB physical aperture. The managed bitmap
@@ -64,25 +64,16 @@ Permanent exclusions include:
 - MMIO and device-owned ranges; and
 - any future runtime object explicitly retained by tvisor.
 
-Reclaimable handoff-only regions include:
-
-- U-Boot relocated code, data, heap, stack, and translation tables;
-- raw ELF staging bytes outside the live tvisor image; and
-- other buffers described by `lmb=` or `bootmem=` arguments.
-
-They become allocator candidates only after:
-
-1. tvisor has crossed the no-return boundary;
-2. its private stack, vectors, UART mapping, and translation tables are active;
-3. all required platform and memory information has been copied into owned
-   structures or explicitly retained;
-4. no executing code or dereferenced pointer depends on the reclaimed U-Boot
-   regions; and
-5. page-rounded reservation boundaries have been handled conservatively.
+U-Boot runtime allocations are not represented in the permanent memory map.
+Before takeover, tvisor writes only its fixed, linker-defined runtime interval.
+After takeover, former U-Boot RAM is included in `USABLE` without a separate
+reclamation pass. The deployment procedure must validate that the complete
+tvisor interval `[__image_start, __image_end)` did not overlap U-Boot or
+firmware state before entry.
 
 The global FDT handle borrows the original DTB. Tvisor therefore retains its
-page-rounded storage and maps it read-only/XN while other U-Boot handoff pages
-are reclaimed. A later design may copy the DTB and release these pages.
+page-rounded storage and maps it read-only/XN. A later design may copy the DTB
+and release these pages.
 
 ## 5. EL2 mapping requirement
 
@@ -92,33 +83,32 @@ read/write, and execute-never before test code dereferences allocated pages.
 Large homogeneous ranges may use L1 or L2 block descriptors, while reservation
 and attribute boundaries must remain exact.
 
-The complete contiguous page-table store is allocated from pre-takeover
-`Unused` RAM through the global allocator and remains `InUse`. Descriptor
-stores are published before the table switch using the existing barrier
-sequence.
+The complete 64 KiB page-table store is a dedicated, 4 KiB-aligned linker
+`NOLOAD` section inside tvisor's runtime footprint.
+`mm::setup_bootstrap_page_table` explicitly zeros
+the arena and constructs the linker-owned mappings without initializing the
+allocator. `rust_main` adds usable-RAM, retained-DTB, and UART mappings, then
+moves the final memory map into static storage. Descriptor stores are published
+before the table switch using the existing barrier sequence.
 
 The live DTB's page-rounded region is identity-mapped as Normal, read-only,
 execute-never memory before switching tables. After the no-return boundary,
-handoff pages transition from `InUse` to `Unused`, except for these retained
-DTB pages. Tvisor then validates the DTB magic and total size through its own
-mapping, so the original blob remains usable without copying.
+the post-switch allocator excludes these retained pages. Tvisor validates the
+DTB magic and total size through its own mapping, so the original blob remains
+usable without copying.
 
 ## 6. Implementation structure
 
 - Add a host-testable allocator module under `tvisor_util/` containing bitmap,
   region, allocation, free, statistics, and error logic.
-- Extend `src/mm.rs` to initialize the allocator before table construction,
-  allocate the table store from it, and map allocator-managed RAM.
-- Copy only the delayed-reclamation metadata into a one-shot
-  `ReclaimMemoryInfo` value in tvisor-owned `.bss`. Consume it after the
-  private-EL2 transition to release U-Boot regions while retaining DTB pages;
-  it is not part of `GlobalPageAllocator`.
-- Pass only owned allocator state across the private-EL2 transition; do not
-  retain references to the U-Boot stack.
+- Extend `scripts/rpi.ld` with the linker-owned bootstrap-table arena.
+- Make `src/mm.rs::prepare` construct tables in that arena and move the final
+  `MemoryMap` into one-shot tvisor-owned `.bss` storage.
+- Initialize the allocator in the post-switch path directly from `USABLE`;
+  do not retain references to the U-Boot stack.
 - Run allocation/write/read/free validation after the Phase 7 post-switch
   checks.
-- Print allocator totals, free-page counts, selected test pages, and explicit
-  reclamation status.
+- Print allocator totals, free-page counts, and selected test pages.
 
 ## 7. Acceptance criteria
 
@@ -129,7 +119,7 @@ mapping, so the original blob remains usable without copying.
 - exhaustion and reuse after free;
 - invalid, unaligned, reserved, and double-free rejection;
 - bitmap-aperture overflow rejection;
-- allocator ownership of the active table store; and
+- permanent exclusion of the linker-owned table store; and
 - statistics consistency after every operation.
 
 ### AArch64 build
@@ -141,14 +131,13 @@ mapping, so the original blob remains usable without copying.
 
 ### Raspberry Pi 4
 
-- initialize the allocator before the page-table switch and allocate the table
-  store from pre-takeover `Unused` RAM;
+- construct the page tables without initializing the allocator;
+- initialize the allocator only after the private page-table switch;
 - allocate pages from eligible low and high RAM banks;
 - write and read known patterns through their identity mappings;
 - free and reallocate test pages deterministically;
 - prove no returned page intersects permanent reservations or the table arena;
-- demonstrate allocation from reclaimed U-Boot memory while retaining the
-  original DTB reservation; and
+- retain the original DTB reservation; and
 - keep UART output and EL2 exception handling operational throughout.
 
 Every hardware run begins from a fresh boot and ends with the board in a known

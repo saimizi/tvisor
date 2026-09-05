@@ -2,8 +2,7 @@ use core::fmt;
 
 use crate::system_info::{
     FixedList, MAX_DYNAMIC_ALLOC_RANGES, MAX_DYNAMIC_RESERVATIONS, MAX_MMIO_REGIONS,
-    MAX_RAM_REGIONS, MAX_RESERVED_REGIONS, PhysRegion, RamSource, RegionError, ReservationOrigin,
-    ReservationOwner, ReservedRegion, SystemInfoBuilder,
+    MAX_RAM_REGIONS, MAX_RESERVED_REGIONS, PhysRegion, RamSource, RegionError, SystemInfoBuilder,
 };
 
 pub const MAX_NORMALIZED_RESERVED_REGIONS: usize =
@@ -38,9 +37,8 @@ impl fmt::Display for MemoryMapError {
 /// discovery records.
 ///
 /// Every list is sorted and has overlapping or adjacent regions merged. The
-/// two usable-RAM views describe different ownership points in the boot
-/// transition: `initial_usable_ram` is safe while U-Boot resources are still
-/// live, whereas `usable_ram` is the candidate RAM after no-return takeover.
+/// usable-RAM view is the allocator input after tvisor has installed its own
+/// EL2 execution environment.
 pub struct MemoryMap {
     /// Physical RAM reported by the platform, including firmware carve-outs.
     ///
@@ -51,29 +49,17 @@ pub struct MemoryMap {
     ///
     /// This includes permanent DTB/firmware reservations and the possible
     /// placement windows of dynamic reservations whose placement tvisor does
-    /// not yet control. These regions are subtracted from both usable views.
+    /// not yet control. These regions are subtracted from usable RAM.
     permanent_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
-    /// Handoff-time reservations owned by U-Boot or containing the source DTB.
-    ///
-    /// They must not be overwritten while tvisor might return to U-Boot or
-    /// still borrow handoff data. They become reclaimable only after the
-    /// explicit no-return boundary and after all required data is owned.
-    transition_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
     /// CPU physical-address windows classified as MMIO rather than RAM.
     ///
     /// These regions are never allocator input and must be mapped with Device
     /// attributes when tvisor needs to access them.
     mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS>,
-    /// RAM safe for bootstrap allocations before the no-return takeover.
+    /// RAM allocatable after tvisor has completed takeover.
     ///
-    /// It is `ram` minus both permanent and transition reservations. Phase 7
-    /// obtains its bootstrap page-table arena from this conservative view.
-    initial_usable_ram: FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS>,
-    /// RAM potentially allocatable after tvisor has completed takeover.
-    ///
-    /// It is `ram` minus permanent reservations only. Transition-reserved
-    /// ranges appear here because they can eventually be reclaimed, but a
-    /// future allocator must wait for their individual lifetime conditions.
+    /// It is `ram` minus every permanent reservation. Bootstrap table storage
+    /// comes from the linker-owned tvisor image rather than this list.
     usable_ram: FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS>,
 }
 
@@ -89,8 +75,6 @@ impl MemoryMap {
 
         let mut raw_permanent: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
             FixedList::new();
-        let mut raw_transition: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            FixedList::new();
         for ram in info.ram() {
             if ram.source == RamSource::FirmwareCarveout {
                 raw_permanent
@@ -99,12 +83,7 @@ impl MemoryMap {
             }
         }
         for reserved in info.reserved() {
-            let target = if is_transition_reservation(reserved) {
-                &mut raw_transition
-            } else {
-                &mut raw_permanent
-            };
-            target
+            raw_permanent
                 .push(reserved.region)
                 .map_err(|_| MemoryMapError::Capacity)?;
         }
@@ -122,8 +101,6 @@ impl MemoryMap {
         }
         let permanent_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
             normalize(&raw_permanent)?;
-        let transition_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            normalize(&raw_transition)?;
 
         let mut raw_mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS> = FixedList::new();
         for mmio in info.mmio() {
@@ -149,26 +126,10 @@ impl MemoryMap {
             subtract_all(*ram_region, &permanent_reserved, &mut usable_ram)?;
         }
 
-        let mut all_active: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            FixedList::new();
-        for region in permanent_reserved.iter().chain(transition_reserved.iter()) {
-            all_active
-                .push(*region)
-                .map_err(|_| MemoryMapError::Capacity)?;
-        }
-        let all_active: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            normalize(&all_active)?;
-        let mut initial_usable_ram = FixedList::new();
-        for ram_region in &ram {
-            subtract_all(*ram_region, &all_active, &mut initial_usable_ram)?;
-        }
-
         Ok(Self {
             ram,
             permanent_reserved,
-            transition_reserved,
             mmio,
-            initial_usable_ram,
             usable_ram,
         })
     }
@@ -179,28 +140,12 @@ impl MemoryMap {
     pub const fn reserved(&self) -> &FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> {
         &self.permanent_reserved
     }
-    pub const fn transition_reserved(
-        &self,
-    ) -> &FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> {
-        &self.transition_reserved
-    }
     pub const fn mmio(&self) -> &FixedList<PhysRegion, MAX_MMIO_REGIONS> {
         &self.mmio
     }
     pub const fn usable_ram(&self) -> &FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS> {
         &self.usable_ram
     }
-    pub const fn initial_usable_ram(&self) -> &FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS> {
-        &self.initial_usable_ram
-    }
-}
-
-fn is_transition_reservation(reserved: &ReservedRegion) -> bool {
-    reserved.owner == ReservationOwner::Bootloader
-        || matches!(
-            reserved.origin,
-            ReservationOrigin::Bootloader | ReservationOrigin::Dtb
-        )
 }
 
 fn normalize<const IN: usize, const OUT: usize>(
@@ -279,14 +224,8 @@ impl fmt::Display for MemoryMap {
         for region in &self.permanent_reserved {
             writeln!(formatter, "    RESERVED   {region}")?;
         }
-        for region in &self.transition_reserved {
-            writeln!(formatter, "    HANDOFF    {region} reclaim-after-takeover")?;
-        }
-        for region in &self.initial_usable_ram {
-            writeln!(formatter, "    INITIAL    {region}")?;
-        }
         for region in &self.usable_ram {
-            writeln!(formatter, "    USABLE     {region} after-takeover")?;
+            writeln!(formatter, "    USABLE     {region}")?;
         }
         for region in &self.mmio {
             writeln!(formatter, "  MMIO       {region}")?;
@@ -429,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn bootloader_memory_is_only_excluded_before_takeover() {
+    fn every_explicit_reservation_is_excluded_from_usable_ram() {
         let mut info = SystemInfoBuilder::new();
         info.add_ram(RamRegion {
             region: region(0, 0x10_000),
@@ -448,17 +387,10 @@ mod tests {
         let map = MemoryMap::from_builder(&info).unwrap();
         assert_eq!(
             map.reserved().iter().copied().collect::<std::vec::Vec<_>>(),
-            [region(0x2000, 0x1000)]
+            [region(0x2000, 0x1000), region(0x8000, 0x2000)]
         );
         assert_eq!(
-            map.transition_reserved()
-                .iter()
-                .copied()
-                .collect::<std::vec::Vec<_>>(),
-            [region(0x8000, 0x2000)]
-        );
-        assert_eq!(
-            map.initial_usable_ram()
+            map.usable_ram()
                 .iter()
                 .copied()
                 .collect::<std::vec::Vec<_>>(),
@@ -467,13 +399,6 @@ mod tests {
                 region(0x3000, 0x5000),
                 region(0xa000, 0x6000)
             ]
-        );
-        assert_eq!(
-            map.usable_ram()
-                .iter()
-                .copied()
-                .collect::<std::vec::Vec<_>>(),
-            [region(0, 0x2000), region(0x3000, 0xd000)]
         );
     }
 }

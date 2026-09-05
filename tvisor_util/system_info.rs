@@ -41,6 +41,7 @@ pub enum RegionError {
     Empty,
     EndBeforeStart,
     AddressOverflow,
+    InvalidAlignment,
 }
 
 impl fmt::Display for RegionError {
@@ -49,6 +50,7 @@ impl fmt::Display for RegionError {
             Self::Empty => formatter.write_str("physical region is empty"),
             Self::EndBeforeStart => formatter.write_str("physical region ends before it starts"),
             Self::AddressOverflow => formatter.write_str("physical region end overflows"),
+            Self::InvalidAlignment => formatter.write_str("region alignment is not a power of two"),
         }
     }
 }
@@ -57,6 +59,17 @@ impl fmt::Display for RegionError {
 pub struct PhysRegion {
     start: PhysAddr,
     size: u64,
+}
+
+pub const fn align_down(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    match value.checked_add(alignment - 1) {
+        Some(value) => Some(align_down(value, alignment)),
+        None => None,
+    }
 }
 
 impl PhysRegion {
@@ -69,6 +82,31 @@ impl PhysRegion {
         }
 
         Ok(Self { start, size })
+    }
+
+    pub const fn new_aligned(
+        start: PhysAddr,
+        size: u64,
+        alignment: u64,
+    ) -> Result<Self, RegionError> {
+        if size == 0 {
+            return Err(RegionError::Empty);
+        }
+        if !alignment.is_power_of_two() {
+            return Err(RegionError::InvalidAlignment);
+        }
+        let aligned_start = align_down(start.value(), alignment);
+        let Some(end) = start.value().checked_add(size) else {
+            return Err(RegionError::AddressOverflow);
+        };
+        let Some(aligned_end) = align_up(end, alignment) else {
+            return Err(RegionError::AddressOverflow);
+        };
+
+        Ok(Self {
+            start: PhysAddr::new(aligned_start),
+            size: aligned_end - aligned_start,
+        })
     }
 
     pub const fn from_bounds(start: PhysAddr, end: PhysAddr) -> Result<Self, RegionError> {
@@ -442,13 +480,32 @@ pub enum ConsoleKind {
     MiniUart,
 }
 
+impl ConsoleKind {
+    pub const fn min_alignment(&self) -> u64 {
+        match self {
+            ConsoleKind::MiniUart => size_of::<u32>() as u64,
+        }
+    }
+
+    pub const fn min_register_size(&self) -> u64 {
+        match self {
+            ConsoleKind::MiniUart => 0x18,
+        }
+    }
+
+    pub const fn compatible_str(&self) -> &'static str {
+        match self {
+            ConsoleKind::MiniUart => "brcm,bcm2835-aux-uart",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsoleInfo {
     pub kind: ConsoleKind,
     pub registers: PhysRegion,
 }
 
-/// Temporary platform records collected from the DTB and U-Boot handoff.
+/// Temporary platform records collected from the DTB and fixed tvisor runtime.
 ///
 /// Call `finalize()` after discovery is complete. Finalization normalizes the
 /// memory records into `MemoryMap`, moves runtime platform data into
@@ -575,6 +632,12 @@ impl SystemInfo {
         &self.memory
     }
 
+    /// Consume the platform record and transfer ownership of its normalized
+    /// memory map to the post-takeover allocator initialization path.
+    pub fn into_memory(self) -> MemoryMap {
+        self.memory
+    }
+
     pub const fn bus_translations(&self) -> &FixedList<BusTranslation, MAX_BUS_TRANSLATIONS> {
         &self.bus_translations
     }
@@ -655,6 +718,22 @@ mod tests {
         assert_eq!(
             PhysRegion::new(PhysAddr::new(u64::MAX), 1),
             Err(RegionError::AddressOverflow)
+        );
+        assert_eq!(
+            PhysRegion::new_aligned(PhysAddr::new(0x1000), 0, 0x1000),
+            Err(RegionError::Empty)
+        );
+        assert_eq!(
+            PhysRegion::new_aligned(PhysAddr::new(0x1000), 1, 3),
+            Err(RegionError::InvalidAlignment)
+        );
+    }
+
+    #[test]
+    fn rounds_aligned_regions_outward() {
+        assert_eq!(
+            PhysRegion::new_aligned(PhysAddr::new(0x1fff), 2, 0x1000).unwrap(),
+            region(0x1000, 0x2000)
         );
     }
 

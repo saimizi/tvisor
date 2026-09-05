@@ -1,18 +1,13 @@
 use core::fmt;
-use core::mem::size_of;
 
 use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
 use spin::Once;
 
-use crate::system_info::{ConsoleInfo, ConsoleKind, FixedList, PhysAddr, PhysRegion, RegionError};
+use crate::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 
 const MAX_UBOOT_ARGS: usize = 16;
 const MAX_UBOOT_ARG_LEN: usize = 64;
 const FDT_ARG_PREFIX: &[u8] = b"fdt=";
-const LMB_ARG_PREFIX: &[u8] = b"lmb=";
-const BOOTMEM_ARG_PREFIX: &[u8] = b"bootmem=";
-pub const MAX_UBOOT_LMB_REGIONS: usize = 16;
-pub const MAX_UBOOT_BOOTMEM_REGIONS: usize = 8;
 
 static GLOBAL_FDT: Once<Fdt<'static>> = Once::new();
 
@@ -27,29 +22,6 @@ pub enum FdtArgError {
     InvalidAddress,
     AddressOverflow,
     ZeroAddress,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UbootRegionArgError {
-    Argument(FdtArgError),
-    InvalidFormat,
-    InvalidRegion(RegionError),
-    Capacity,
-}
-
-impl fmt::Display for UbootRegionArgError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Argument(error) => write!(formatter, "invalid U-Boot argument: {error}"),
-            Self::InvalidFormat => formatter.write_str("a physical-region argument is malformed"),
-            Self::InvalidRegion(error) => {
-                write!(formatter, "invalid physical-region argument: {error}")
-            }
-            Self::Capacity => {
-                formatter.write_str("too many physical-region arguments were supplied")
-            }
-        }
-    }
 }
 
 impl fmt::Display for FdtArgError {
@@ -176,91 +148,6 @@ pub unsafe fn fdt_address_from_uboot_args(
     Ok(address as *const u8)
 }
 
-/// Decodes repeatable `lmb=<hex-start>:<hex-size>` U-Boot handoff arguments.
-///
-/// The caller must supply every live LMB reservation from the same boot
-/// session when a pre-takeover safety map is required. The list is optional
-/// because U-Boot ownership does not constrain the post-takeover map.
-///
-/// # Safety
-///
-/// This function has the same `argc` and `argv` validity requirements as
-/// [`fdt_address_from_uboot_args`].
-pub unsafe fn uboot_lmb_reservations_from_args(
-    argc: isize,
-    argv: *const *const u8,
-) -> Result<FixedList<PhysRegion, MAX_UBOOT_LMB_REGIONS>, UbootRegionArgError> {
-    // SAFETY: Forwarded from this function's documented contract.
-    unsafe { uboot_regions_from_args(argc, argv, LMB_ARG_PREFIX) }
-}
-
-/// Decodes repeatable `bootmem=<hex-start>:<hex-size>` handoff arguments.
-///
-/// These regions cover transient input buffers such as the downloaded ELF
-/// container. They stay reserved while tvisor can return to U-Boot.
-///
-/// # Safety
-///
-/// This function has the same `argc` and `argv` validity requirements as
-/// [`fdt_address_from_uboot_args`].
-pub unsafe fn uboot_boot_allocations_from_args(
-    argc: isize,
-    argv: *const *const u8,
-) -> Result<FixedList<PhysRegion, MAX_UBOOT_BOOTMEM_REGIONS>, UbootRegionArgError> {
-    // SAFETY: Forwarded from this function's documented contract.
-    unsafe { uboot_regions_from_args(argc, argv, BOOTMEM_ARG_PREFIX) }
-}
-
-unsafe fn uboot_regions_from_args<const N: usize>(
-    argc: isize,
-    argv: *const *const u8,
-    prefix: &[u8],
-) -> Result<FixedList<PhysRegion, N>, UbootRegionArgError> {
-    let argc = usize::try_from(argc)
-        .map_err(|_| UbootRegionArgError::Argument(FdtArgError::InvalidArgCount))?;
-    if argc == 0 || argc > MAX_UBOOT_ARGS {
-        return Err(UbootRegionArgError::Argument(FdtArgError::InvalidArgCount));
-    }
-    if argv.is_null() {
-        return Err(UbootRegionArgError::Argument(FdtArgError::NullArgv));
-    }
-
-    let mut reservations = FixedList::new();
-    for index in 0..argc {
-        // SAFETY: The caller guarantees that argv contains argc readable
-        // pointers.
-        let argument = unsafe { *argv.add(index) };
-        if argument.is_null() {
-            return Err(UbootRegionArgError::Argument(FdtArgError::NullArgument));
-        }
-        // SAFETY: The caller guarantees a valid NUL-terminated U-Boot
-        // argument.
-        let argument =
-            unsafe { bounded_c_string(argument) }.map_err(UbootRegionArgError::Argument)?;
-        let Some(value) = argument.strip_prefix(prefix) else {
-            continue;
-        };
-        let separator = value
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or(UbootRegionArgError::InvalidFormat)?;
-        if value[separator + 1..].contains(&b':') {
-            return Err(UbootRegionArgError::InvalidFormat);
-        }
-        let start = parse_hex_address(&value[..separator])
-            .map_err(|_| UbootRegionArgError::InvalidFormat)? as u64;
-        let size = parse_hex_address(&value[separator + 1..])
-            .map_err(|_| UbootRegionArgError::InvalidFormat)? as u64;
-        let region = PhysRegion::new(PhysAddr::new(start), size)
-            .map_err(UbootRegionArgError::InvalidRegion)?;
-        reservations
-            .push(region)
-            .map_err(|_| UbootRegionArgError::Capacity)?;
-    }
-
-    Ok(reservations)
-}
-
 unsafe fn bounded_c_string<'a>(pointer: *const u8) -> Result<&'a [u8], FdtArgError> {
     for length in 0..MAX_UBOOT_ARG_LEN {
         // SAFETY: The caller guarantees that pointer identifies a valid
@@ -298,9 +185,6 @@ fn parse_hex_address(value: &[u8]) -> Result<usize, FdtArgError> {
             .ok_or(FdtArgError::AddressOverflow)
     })
 }
-
-const MINI_UART_COMPATIBLE: &str = "brcm,bcm2835-aux-uart";
-const MINI_UART_MIN_REGISTER_SIZE: u64 = 0x18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleDiscoveryError {
@@ -362,7 +246,7 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
         return Err(ConsoleDiscoveryError::ConsoleDisabled);
     }
 
-    let kind = if node.is_compatible(MINI_UART_COMPATIBLE) {
+    let kind = if node.is_compatible(ConsoleKind::MiniUart.compatible_str()) {
         ConsoleKind::MiniUart
     } else {
         return Err(ConsoleDiscoveryError::UnsupportedConsole);
@@ -382,12 +266,13 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
         .size::<u64>()
         .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
 
-    if register_size < MINI_UART_MIN_REGISTER_SIZE {
+    if register_size < kind.min_register_size() {
         return Err(ConsoleDiscoveryError::InvalidRegister);
     }
 
+    // Translate register address from bus address to cpu address.
     let physical_address = translate_to_cpu_address(fdt, path, bus_address)?;
-    if physical_address == 0 || !physical_address.is_multiple_of(size_of::<u32>() as u64) {
+    if physical_address == 0 || !physical_address.is_multiple_of(kind.min_alignment()) {
         return Err(ConsoleDiscoveryError::InvalidRegister);
     }
     let registers = PhysRegion::new(PhysAddr::new(physical_address), register_size)
@@ -557,79 +442,5 @@ mod tests {
         assert_eq!(parent_path("/soc"), Some("/"));
         assert_eq!(parent_path("/"), None);
         assert_eq!(parent_path("relative"), None);
-    }
-
-    #[test]
-    fn decodes_multiple_lmb_reservations() {
-        let entry = b"4001244\0";
-        let fdt = b"fdt=2eff1f00\0";
-        let first = b"lmb=0:1000\0";
-        let second = b"lmb=36b2b000:14d5000\0";
-        let argv = [
-            entry.as_ptr(),
-            fdt.as_ptr(),
-            first.as_ptr(),
-            second.as_ptr(),
-        ];
-
-        let reservations =
-            unsafe { uboot_lmb_reservations_from_args(argv.len() as isize, argv.as_ptr()) }
-                .unwrap();
-
-        assert_eq!(reservations.len(), 2);
-        assert_eq!(
-            reservations.get(0),
-            Some(&PhysRegion::new(PhysAddr::new(0), 0x1000).unwrap())
-        );
-        assert_eq!(
-            reservations.get(1),
-            Some(&PhysRegion::new(PhysAddr::new(0x36b2_b000), 0x14d_5000).unwrap())
-        );
-    }
-
-    #[test]
-    fn accepts_missing_and_rejects_malformed_lmb_reservations() {
-        let fdt = b"fdt=2eff1f00\0";
-        let missing_argv = [fdt.as_ptr()];
-        assert_eq!(
-            unsafe {
-                uboot_lmb_reservations_from_args(missing_argv.len() as isize, missing_argv.as_ptr())
-            },
-            Ok(FixedList::new())
-        );
-
-        let malformed = b"lmb=1000\0";
-        let malformed_argv = [fdt.as_ptr(), malformed.as_ptr()];
-        assert_eq!(
-            unsafe {
-                uboot_lmb_reservations_from_args(
-                    malformed_argv.len() as isize,
-                    malformed_argv.as_ptr(),
-                )
-            },
-            Err(UbootRegionArgError::InvalidFormat)
-        );
-    }
-
-    #[test]
-    fn decodes_optional_boot_allocations() {
-        let fdt = b"fdt=2eff1f00\0";
-        let allocation = b"bootmem=2000000:2ca930\0";
-        let argv = [fdt.as_ptr(), allocation.as_ptr()];
-        let allocations =
-            unsafe { uboot_boot_allocations_from_args(argv.len() as isize, argv.as_ptr()) }
-                .unwrap();
-        assert_eq!(
-            allocations.get(0),
-            Some(&PhysRegion::new(PhysAddr::new(0x0200_0000), 0x2ca930).unwrap())
-        );
-
-        let missing_argv = [fdt.as_ptr()];
-        assert_eq!(
-            unsafe {
-                uboot_boot_allocations_from_args(missing_argv.len() as isize, missing_argv.as_ptr())
-            },
-            Ok(FixedList::new())
-        );
     }
 }

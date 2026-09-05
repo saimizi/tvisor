@@ -1,26 +1,22 @@
 #![no_std]
 #![no_main]
 
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 use dtoolkit::standard::NodeStandard;
-use tvisor_util::aarch64_reg::CurrentEL;
+use tvisor_util::aarch64_reg::*;
 use tvisor_util::boot_mode::fault_test_from_args;
-use tvisor_util::debug_util::{debug_fini, debug_init};
-use tvisor_util::diag::{DiagState, should_collect_full_diagnostics};
-use tvisor_util::fdt::{
-    discover_console, fdt_address_from_uboot_args, fdt_init, uboot_boot_allocations_from_args,
-    uboot_lmb_reservations_from_args,
-};
+use tvisor_util::debug_util::{debug_init, stop};
+use tvisor_util::el2_translation::PAGE_SIZE;
+use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::platform::discover_system_info_builder;
-use tvisor_util::println;
-use tvisor_util::system_info::{
-    ConsoleKind, PhysAddr, PhysRegion, ReservationAttributes, ReservationOrigin, ReservationOwner,
-    ReservedRegion,
-};
+use tvisor_util::system_info::{ConsoleKind, FixedList, PhysAddr, PhysRegion};
+use tvisor_util::{halt, println};
 
 mod boot;
 mod exception;
+mod guest;
 mod mm;
+mod vcpu;
 
 unsafe extern "C" {
     static __image_start: u8;
@@ -53,17 +49,6 @@ main:
     .size main, . - main
 "#,
 );
-
-fn halt() -> ! {
-    loop {
-        unsafe { asm!("wfe", options(nomem, nostack, preserves_flags)) };
-    }
-}
-
-fn stop() -> ! {
-    debug_fini();
-    halt()
-}
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
@@ -115,8 +100,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         Ok(fault_test) => fault_test,
         Err(error) => {
             println!("Invalid fault test: {}", error);
-            debug_fini();
-            halt();
+            stop();
         }
     };
 
@@ -124,40 +108,31 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     // registers. In particular, ID-group register reads performed at EL1
     // can be redirected to EL2 by HCR_EL2.TID3.
     let current_el = CurrentEL::dump();
-    if !should_collect_full_diagnostics(current_el.current_el()) {
+    if current_el.current_el() != ExceptionLevel::EL2 {
         println!("CurrentEL: {:#018x}", current_el.value);
         stop();
     }
 
-    let diag_state = DiagState::dump();
-
-    if diag_state.sctlr_el2.as_ref().is_some_and(|s| s.bit_ee()) {
+    if SctlrEl2::dump().is_some_and(|s| s.bit_ee()) {
         println!("Handoff validation failed: SCTLR_EL2.EE selects big-endian data accesses");
         stop();
     }
 
-    if diag_state
-        .vbar_el2
-        .as_ref()
-        .is_some_and(|v| !v.is_aligned())
-    {
+    if VbarEl2::dump().is_some_and(|v| !v.is_aligned()) {
         println!("Handoff validation failed: VBAR_EL2 is not 2 KiB aligned");
         stop();
     }
 
-    if diag_state
-        .id_aa64pfr0_el1
-        .as_ref()
-        .is_some_and(|r| r.el2() == 0)
-    {
+    if IdAa64Pfr0El1::dump().is_some_and(|v| v.el2() == 0) {
         println!("Handoff validation failed: EL2 is not implemented");
         stop();
     }
 
-    let Some(mpidr_el1) = diag_state.mpidr_el1 else {
+    let Some(mpidr_el1) = MpidrEl1::dump() else {
         println!("Platform discovery failed: MPIDR_EL1 is unavailable");
         stop();
     };
+
     let image_start = core::ptr::addr_of!(__image_start) as u64;
     let image_end = core::ptr::addr_of!(__image_end) as u64;
     let tvisor_image =
@@ -168,7 +143,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
                 stop();
             }
         };
-    let mut system_info_builder = match discover_system_info_builder(
+    let system_info_builder = match discover_system_info_builder(
         *fdt,
         PhysAddr::new(dtb_base as usize as u64),
         tvisor_image,
@@ -182,32 +157,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         }
     };
 
-    let uboot_lmb = match unsafe { uboot_lmb_reservations_from_args(argc, argv) } {
-        Ok(reservations) => reservations,
-        Err(error) => {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    };
-    let boot_allocations = match unsafe { uboot_boot_allocations_from_args(argc, argv) } {
-        Ok(allocations) => allocations,
-        Err(error) => {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    };
-    for region in uboot_lmb.iter().chain(boot_allocations.iter()) {
-        if let Err(error) = system_info_builder.add_reserved(ReservedRegion {
-            region: *region,
-            origin: ReservationOrigin::Bootloader,
-            owner: ReservationOwner::Bootloader,
-            attributes: ReservationAttributes::default(),
-        }) {
-            println!("Memory-map discovery failed: {}", error);
-            stop();
-        }
-    }
-
     let system_info = match system_info_builder.finalize() {
         Ok(info) => info,
         Err(error) => {
@@ -217,7 +166,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
 
     println!("{}", system_info);
-    println!("{}", diag_state);
 
     let live_dtb = match PhysRegion::new(
         PhysAddr::new(dtb_base as usize as u64),
@@ -231,7 +179,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
 
     // Check whether 4 KiB translation granules are supported.
-    let Some(mmfr0) = diag_state.id_aa64mmfr0_el1 else {
+    let Some(mmfr0) = IdAa64Mmfr0El1::dump() else {
         println!("Phase 7 table preparation failed: PARange is unavailable");
         stop();
     };
@@ -240,11 +188,13 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         stop();
     }
 
-    let Some(hcr) = diag_state.hcr_el2 else {
+    let Some(hcr) = HcrEl2::dump() else {
         println!("Phase 7 cannot validate HCR_EL2");
         stop();
     };
-    // The initial translation regime requires stage 2 and VHE disabled.
+    // The initial translation regime suppose
+    // * stage 2 translation is disabled
+    // * VHE is disabled.
     if hcr.bit_vm() || hcr.bit_e2h() {
         println!(
             "Phase 7 requires HCR_EL2.VM=0 and E2H=0 (VM={} E2H={})",
@@ -254,45 +204,90 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         stop();
     }
 
-    let prepared = match mm::prepare(
-        system_info.memory(),
-        console.registers.start().value(),
-        mmfr0.parange(),
-        live_dtb,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            println!("Phase 7 table preparation failed: {}", error);
-            stop();
-        }
+    // Set up bootstrap page table
+    let pa_range = mmfr0.pa_range();
+    let Ok(mut tables) = mm::setup_bootstrap_page_table(pa_range) else {
+        println!("Failed to setup bootstrap page tables");
+        stop();
     };
 
-    drop(system_info);
+    // Map usable memory and DTB
+    {
+        // Map usable RAM to RW
+        let mut exclusive_list = FixedList::<PhysRegion, 1>::new();
+        let Ok(live_dtb_region) =
+            PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE)
+        else {
+            println!("Failed to remap live dtb region to page aligned.");
+            stop();
+        };
 
-    println!(
-        "Phase 7 tables prepared: arena=[{:#018x}, {:#018x}) pages={}",
-        prepared.arena_start, prepared.arena_end, prepared.used_pages
-    );
-    println!(
-        "  MAIR_EL2={:#018x} TCR_EL2={:#018x}",
-        prepared.registers.mair_el2, prepared.registers.tcr_el2
-    );
-    println!(
-        " TTBR0_EL2={:#018x} SCTLR_EL2={:#018x}",
-        prepared.registers.ttbr0_el2, prepared.registers.sctlr_el2
-    );
-    println!(
-        "Phase 8 allocator prepared: RAM={} reserved={} in-use={} unused={} DTB={}",
-        prepared.allocator_stats.ram_pages,
-        prepared.allocator_stats.reserved_pages,
-        prepared.allocator_stats.in_use_pages,
-        prepared.allocator_stats.unused_pages,
-        prepared.live_dtb_pages,
-    );
+        if exclusive_list.push(live_dtb_region).is_err() {
+            println!("Failed to create exclusive list");
+            stop();
+        }
+
+        if mm::map_identity_regions_excluding(
+            &mut tables,
+            system_info.memory().usable_ram(),
+            &exclusive_list,
+            true,
+            false,
+        )
+        .is_err()
+        {
+            println!("Failed to map useable memory region");
+            stop();
+        }
+
+        // Map live DTB region to R
+        if mm::map_identity(
+            &mut tables,
+            live_dtb_region.start().value(),
+            live_dtb_region.end().value(),
+            false,
+            false,
+        )
+        .is_err()
+        {
+            println!("Failed to map live dtb region");
+            stop();
+        };
+
+        let Ok(console_registers) = PhysRegion::new_aligned(
+            console.registers.start(),
+            console.registers.size(),
+            PAGE_SIZE,
+        ) else {
+            println!("Failed to align console MMIO region");
+            stop();
+        };
+        if mm::map_identity_device(&mut tables, console_registers).is_err() {
+            println!("Failed to map console MMIO region");
+            stop();
+        }
+
+        if mm::validate_bootstrap_page_table(
+            &tables,
+            console.registers.start().value(),
+            live_dtb_region,
+        )
+        .is_err()
+        {
+            println!("Bootstrap page-table validation failed");
+            stop();
+        }
+    }
+
+    if mm::prepare_allocator_after_takeover(system_info.into_memory(), live_dtb).is_err() {
+        println!("Failed to retain memory map for allocator initialization");
+        stop();
+    }
+
     println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.
-    unsafe { boot::enter_private_el2(fault_test, prepared.registers) }
+    unsafe { boot::enter_private_el2(fault_test, tables.root_pa(), pa_range) }
 }
 
 #[panic_handler]

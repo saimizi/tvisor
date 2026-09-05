@@ -63,49 +63,27 @@ The platform layer converts parser-specific values into the owned types.
 
 Phase 4 implements the next layer in `tvisor_util/memory_map.rs`. It consumes
 the temporary discovery records to produce sorted and merged physical `RAM`,
-permanent `RESERVED`, temporary `HANDOFF`, `MMIO`, `INITIAL`, and
-post-takeover `USABLE` views. The final `SystemInfo` retains this normalized
-`MemoryMap`; duplicate raw RAM and reservation records are discarded.
+permanent `RESERVED`, `MMIO`, and post-takeover `USABLE` views. The final
+`SystemInfo` retains this normalized `MemoryMap`; duplicate raw RAM and
+reservation records are discarded.
 
-`INITIAL` excludes both permanent and handoff reservations and is the only map
-that may be used while execution still depends on U-Boot. `USABLE` excludes
-only permanent reservations and describes candidates after the explicit
-no-return takeover. Neither view itself transfers ownership or allocates
-pages.
+No general physical allocator runs while execution still depends on U-Boot.
+The initial EL2 tables occupy a linker-owned arena inside tvisor's permanent
+runtime footprint. After the no-return switch, `USABLE` becomes the allocator
+input. It is `RAM - RESERVED`; the view itself does not allocate pages.
 
-### 3.1 Reservation lifetimes and usable views
+### 3.1 Reservation lifetime
 
-`HANDOFF` and post-takeover `USABLE` are not disjoint classifications.
-`HANDOFF` records a temporary ownership constraint, whereas `USABLE` is the
-result obtained after that constraint expires. In set notation:
+The memory model no longer represents U-Boot's runtime allocations. U-Boot's
+LMB is an implementation detail and is not a tvisor handoff ABI. Tvisor writes
+only inside its validated runtime footprint before takeover; after takeover,
+former U-Boot pages are ordinary candidates unless excluded by a stable
+platform reservation.
 
-```text
-INITIAL = RAM - RESERVED - HANDOFF
-
-USABLE_AFTER_TAKEOVER = RAM - RESERVED
-                      = INITIAL + reclaimable HANDOFF portions
-```
-
-Crossing the takeover boundary does not make every `HANDOFF` byte usable. A
-handoff region that also overlaps permanent `RESERVED` memory remains
-unavailable. Likewise, a handoff record outside a discovered RAM bank does not
-become allocatable RAM.
-
-On the current Raspberry Pi 4, the normalized map demonstrates the lifetime
-change:
-
-```text
-INITIAL
-  [0x30000000, 0x36b2b000)
-
-reclaimed from U-Boot after takeover
-  [0x36b2b000, 0x38000000)
-  [0x40000000, 0xfc000000)
-
-USABLE_AFTER_TAKEOVER
-  [0x30000000, 0x38000000)
-  [0x40000000, 0xfc000000)
-```
+The original DTB is different: the global FDT handle continues to borrow it.
+Its page-rounded range is therefore recorded as a permanent tvisor reservation
+and remains mapped read-only/execute-never until the blob is copied or all
+references are removed.
 
 The low `[0, 0x30000000)` interval is not absent because of U-Boot. The
 current conservative policy reserves the complete allocation window of an

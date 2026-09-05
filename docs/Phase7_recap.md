@@ -14,7 +14,7 @@ leave that environment safely:
 
 Phase 7 keeps those foundations and replaces only the inherited EL2 stage-1
 translation regime. It does not enable guest stage-2 translation, start an
-allocator, reclaim U-Boot memory, or return to U-Boot after the switch.
+allocator or return to U-Boot after the switch.
 
 ## 2. Goal
 
@@ -44,7 +44,8 @@ boundary unless:
 - `ID_AA64MMFR0_EL1.TGran4` reports 4 KiB granule support;
 - `ID_AA64MMFR0_EL1.PARange` represents every mapped physical address;
 - a UART physical address was discovered from the DTB;
-- a 64 KiB bootstrap table arena fits in normalized `INITIAL` RAM; and
+- the linker-owned 64 KiB bootstrap table arena has the required size and
+  alignment; and
 - every mandatory mapping passes the software table walker.
 
 Failure here prints an error when UART is available and halts. Once the private

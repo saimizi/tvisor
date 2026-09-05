@@ -16,6 +16,13 @@ SECTIONS {
         __text_end = .;
     }
 
+    .payload : ALIGN(__ALIGN_SIZE) {
+        __payload_start = .;
+        KEEP(*(.payload .payload.*))
+        . = ALIGN(__ALIGN_SIZE);
+        __payload_end = .;
+    }
+
     /*
      * AArch64 has 16 exception-vector slots of 128 bytes, so VBAR_EL2 must
      * point to a 2 KiB-aligned table.  Use the stricter 4 KiB page alignment
@@ -41,6 +48,10 @@ SECTIONS {
         __writable_start = .;
         *(.data .data.*)
         *(.got .got.*)
+    }
+
+    /* save binary size to put it at last */
+    .bss (NOLOAD) : ALIGN(__ALIGN_SIZE) {
         __bss_start = .;
         *(.bss .bss.*)
         . = ALIGN(16);
@@ -66,6 +77,25 @@ SECTIONS {
         __boot_stack_top = .;
     }
 
+    /*
+     * Linker-owned storage for the initial EL2 stage-1 tables.  Keeping this
+     * arena inside tvisor's runtime footprint removes any need to allocate
+     * physical pages while U-Boot's translation regime is still active.
+     * NOLOAD means startup code must explicitly zero it before use.
+     */
+    .bootstrap_tables (NOLOAD) : ALIGN(__ALIGN_SIZE) {
+        __bootstrap_tables_start = .;
+        . += 0x10000;
+        __bootstrap_tables_end = .;
+    }
+
     . = ALIGN(__ALIGN_SIZE);
     __image_end = .;
+
+    ASSERT((__bootstrap_tables_start & 0xfff) == 0,
+           "bootstrap table arena must be 4 KiB aligned")
+    ASSERT((__bootstrap_tables_end & 0xfff) == 0,
+           "bootstrap table arena end must be 4 KiB aligned")
+    ASSERT((__bootstrap_tables_end - __bootstrap_tables_start) == 0x10000,
+           "bootstrap table arena must contain exactly 16 pages")
 }

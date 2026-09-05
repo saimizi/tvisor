@@ -3,11 +3,12 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use tvisor_util::aarch64_reg::{MairEl2, SctlrEl2, Sp, SpSel, TcrEl2, Ttbr0El2, VbarEl2};
 use tvisor_util::boot_mode::FaultTest;
-use tvisor_util::el2_translation::{El2RegisterValues, PAGE_SIZE};
+use tvisor_util::debug_util::stop;
+use tvisor_util::el2_translation::is_page_aligned;
+use tvisor_util::page_allocator::AllocatorStats;
 use tvisor_util::println;
-use tvisor_util::system_info::PhysRegion;
+use tvisor_util::{aarch64_reg::*, el2_translation::is_in_physical_address_range};
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
@@ -50,15 +51,40 @@ unsafe extern "C" {
     ) -> !;
 }
 
-pub unsafe fn enter_private_el2(fault_test: FaultTest, registers: El2RegisterValues) -> ! {
-    // SAFETY: The caller accepts the documented no-return state transition.
+pub unsafe fn enter_private_el2(
+    fault_test: FaultTest,
+    bootstrap_table_root: u64,
+    pa_range: u8,
+) -> ! {
+    if !is_page_aligned(bootstrap_table_root) {
+        println!("Bootstrap page table is not page aligned");
+        stop()
+    }
+
+    if is_in_physical_address_range(bootstrap_table_root, pa_range) != Ok(true) {
+        println!("Bootstrap page table is not in physical address range");
+        stop()
+    }
+
+    let tcr_el2 = TCR_EL2_RES1
+        | TCR_EL2_T0SZ_FOR_VA_39_BIT
+        | TCR_EL2_IRGN0_MEM_WB_RA_WA
+        | TCR_EL2_ORGN0_MEM_WB_RA_WA
+        | TCR_EL2_SH0_INNER_SHAREABLE
+        | ((pa_range as u64) << 16);
+
+    const SCTLR_EL2_RES1: u64 =
+        (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
+    const SCTLR_EL2_VALUE: u64 =
+        SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
+
     unsafe {
         __enter_private_el2(
             fault_test as u64,
-            registers.mair_el2,
-            registers.tcr_el2,
-            registers.ttbr0_el2,
-            registers.sctlr_el2,
+            MAIR_EL2_VALUE,
+            tcr_el2,
+            bootstrap_table_root,
+            SCTLR_EL2_VALUE,
         )
     }
 }
@@ -179,21 +205,20 @@ extern "C" fn phase7_post_switch(
     );
     println!("Phase 7 checkpoint 3: register, stack, and image validation passed");
 
-    let before = crate::mm::allocator_stats().expect("Phase 8 allocator initialization");
+    let initialized =
+        crate::mm::initialize_allocator_after_takeover().expect("Phase 8 allocator initialization");
     println!(
-        "Phase 8 allocator before reclaim: RAM={} reserved={} in-use={} unused={}",
-        before.ram_pages, before.reserved_pages, before.in_use_pages, before.unused_pages
-    );
-    let takeover = crate::mm::complete_takeover().expect("complete U-Boot takeover");
-    println!(
-        "Phase 8 takeover: released={} DTB={} in-use={} unused={}",
-        takeover.released_pages,
-        takeover.live_dtb,
-        takeover.stats.in_use_pages,
-        takeover.stats.unused_pages,
+        "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
+        initialized.stats.ram_pages,
+        initialized.stats.reserved_pages,
+        initialized.stats.in_use_pages,
+        initialized.stats.unused_pages,
+        initialized.live_dtb,
     );
 
-    phase8_allocator_test(&takeover);
+    phase8_allocator_test(initialized.stats);
+    crate::guest::run_phase9_guest_test();
+
     if fault_test == FaultTest::Sync as u64 {
         println!("Triggering deliberate synchronous exception under tvisor tables...");
         unsafe { asm!("brk #0x600") };
@@ -219,31 +244,20 @@ extern "C" fn phase7_post_switch(
         // returns; the private EL2 handler reports the translation fault.
         let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
     }
-    println!("Phase 7 checkpoint complete; halting");
+    println!("Phase 9 checkpoint complete; halting");
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
 }
 
-fn phase8_allocator_test(takeover: &crate::mm::TakeoverResult) {
+fn phase8_allocator_test(baseline: AllocatorStats) {
     let low = crate::mm::allocate_page().expect("allocate low test page");
     let high = crate::mm::allocate_high_page().expect("allocate high test page");
     assert_ne!(low, high);
 
-    let reclaimed_base = takeover
-        .reclaimed_test_page
-        .expect("reclaimed U-Boot test page");
-    let reclaimed_region =
-        PhysRegion::new(reclaimed_base, PAGE_SIZE).expect("reclaimed page region");
-    let reclaimed =
-        crate::mm::allocate_page_in(reclaimed_region).expect("allocate reclaimed U-Boot page");
-    assert_ne!(reclaimed, low);
-    assert_ne!(reclaimed, high);
-
     for (page, pattern) in [
         (low, 0x5038_4c4f_5750_4147_u64),
         (high, 0x5038_4849_4748_5047_u64),
-        (reclaimed, 0x5038_5245_434c_4149_u64),
     ] {
         let pointer = page.value() as *mut u64;
         // SAFETY: the allocator returned a mapped, exclusively owned Normal
@@ -253,20 +267,16 @@ fn phase8_allocator_test(takeover: &crate::mm::TakeoverResult) {
             assert_eq!(core::ptr::read_volatile(pointer), pattern);
         }
     }
-    println!(
-        "Phase 8 page test: low={} high={} reclaimed={}",
-        low, high, reclaimed
-    );
+    println!("Phase 8 page test: low={} high={}", low, high);
 
     crate::mm::free_page(low).expect("free low test page");
     crate::mm::free_page(high).expect("free high test page");
-    crate::mm::free_page(reclaimed).expect("free reclaimed test page");
     let reused = crate::mm::allocate_page().expect("reallocate first-fit page");
     assert_eq!(reused, low);
     crate::mm::free_page(reused).expect("free reused page");
 
     let final_stats = crate::mm::allocator_stats().expect("Phase 8 allocator statistics");
-    assert_eq!(final_stats.in_use_pages, takeover.stats.in_use_pages);
-    assert_eq!(final_stats.unused_pages, takeover.stats.unused_pages);
+    assert_eq!(final_stats.in_use_pages, baseline.in_use_pages);
+    assert_eq!(final_stats.unused_pages, baseline.unused_pages);
     println!("Phase 8 checkpoint complete: allocator validation passed");
 }

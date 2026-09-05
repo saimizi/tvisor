@@ -42,8 +42,8 @@ pub struct AllocatorStats {
     /// firmware carve-outs, the tvisor image, and other non-reclaimable
     /// reservations.
     pub reserved_pages: usize,
-    /// Allocator-controlled RAM pages currently occupied by U-Boot or tvisor,
-    /// including active EL2 translation-table pages.
+    /// Allocator-controlled RAM pages currently allocated to tvisor objects,
+    /// such as guest backing pages and stage-2 translation tables.
     pub in_use_pages: usize,
     /// Allocator-controlled RAM pages that can be returned by an allocation.
     pub unused_pages: usize,

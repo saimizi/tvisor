@@ -1,3 +1,4 @@
+use crate::halt;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -114,4 +115,9 @@ pub fn debug_fini() {
     if let Some(uart) = MiniUart::configured() {
         let _ = uart.wait_io_completed();
     }
+}
+
+pub fn stop() -> ! {
+    debug_fini();
+    halt()
 }
