@@ -3,7 +3,7 @@
 use core::arch::global_asm;
 
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
-use tvisor_util::el2_translation::{PAGE_SIZE, TranslationError, pa_bits_from_parange};
+use tvisor_util::el2_translation::{PAGE_SIZE, TranslationError, pa_bits_from_pa_range};
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
 use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::println;
@@ -307,7 +307,7 @@ pub fn run_phase9_guest_test() {
 
     // 1. Processor PARange verification
     let mmfr0 = IdAa64Mmfr0El1::dump().expect("ID_AA64MMFR0_EL1 is available at EL2");
-    let parange = mmfr0.parange();
+    let parange = mmfr0.pa_range();
 
     let mut res_manager = GuestResourceManager::new();
     let mut stage2_active = false;
@@ -400,7 +400,7 @@ pub fn run_phase9_guest_test() {
         // 6. Build Stage-2 translation tables with distinct per-region permissions (4 KiB L3 leaves only).
         // Use the same implemented PA width for software descriptor validation
         // that stage2_register_values() encodes in VTCR_EL2.PS below.
-        let pa_bits = pa_bits_from_parange(parange)
+        let pa_bits = pa_bits_from_pa_range(parange)
             .map_err(|_| println!("  [ERR] Unsupported physical address range"))?;
         let mut stage2_tables = Stage2TableSet::new(&mut res_manager, pa_bits)
             .map_err(|_| println!("  [ERR] Failed to create Stage2TableSet"))?;

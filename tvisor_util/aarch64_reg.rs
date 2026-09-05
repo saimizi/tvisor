@@ -1,3 +1,27 @@
+// TCR_EL2
+pub const TCR_EL2_RES1: u64 = (1 << 31) | (1 << 23);
+pub const TCR_EL2_T0SZ_FOR_VA_39_BIT: u64 = 64_u64 - 39_u64;
+pub const TCR_EL2_IRGN0_MEM_NO_CACHEABLE: u64 = 0b00 << 8;
+pub const TCR_EL2_IRGN0_MEM_WB_RA_WA: u64 = 0b01 << 8;
+pub const TCR_EL2_IRGN0_MEM_WT_RA_NOWA: u64 = 0b10 << 8;
+pub const TCR_EL2_IRGN0_MEM_WB_RA_NOWA: u64 = 0b11 << 8;
+pub const TCR_EL2_ORGN0_MEM_NO_CACHEABLE: u64 = 0b00 << 10;
+pub const TCR_EL2_ORGN0_MEM_WB_RA_WA: u64 = 0b01 << 10;
+pub const TCR_EL2_ORGN0_MEM_WT_RA_NOWA: u64 = 0b10 << 10;
+pub const TCR_EL2_ORGN0_MEM_WB_RA_NOWA: u64 = 0b11 << 10;
+pub const TCR_EL2_SH0_NON_SHAREABLE: u64 = 0b00 << 12;
+pub const TCR_EL2_SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
+pub const TCR_EL2_SH0_INNER_SHAREABLE: u64 = 0b11 << 12;
+
+// MAIR
+// Common attreibute
+pub const MAIR_NORMAL_WB_WA: u8 = 0xff;
+pub const MAIR_DEVICE_NGNRE: u8 = 0x04;
+pub const MAIR_INDEX_NORMAL_WB_WA: u32 = 0;
+pub const MAIR_INDEX_DEVICE_NGNRE: u32 = 1;
+pub const MAIR_EL2_VALUE: u64 = ((MAIR_NORMAL_WB_WA as u64) << (MAIR_INDEX_NORMAL_WB_WA * 8))
+    | ((MAIR_DEVICE_NGNRE as u64) << (MAIR_INDEX_DEVICE_NGNRE * 8));
+
 #[inline]
 pub fn bit_check(value: u64, bit: u64) -> bool {
     value & (0x1 << bit) == (0x1 << bit)
@@ -817,7 +841,7 @@ impl IdAa64Mmfr0El1 {
         }
     }
     // Implemented physical-address range
-    pub fn parange(&self) -> u8 {
+    pub fn pa_range(&self) -> u8 {
         (self.value & 0xf) as u8
     }
 
@@ -953,7 +977,10 @@ impl VmpidrEl2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, VtcrEl2, VttbrEl2};
+    use super::{
+        CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, TCR_EL2_SH0_INNER_SHAREABLE,
+        TCR_EL2_SH0_NON_SHAREABLE, TCR_EL2_SH0_OUTER_SHAREABLE, VtcrEl2, VttbrEl2,
+    };
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -1106,7 +1133,7 @@ mod tests {
             | (0b0000_u64 << 28); // TGran4 [31:28] = 0 (supported)
 
         let r = IdAa64Mmfr0El1 { value: raw };
-        assert_eq!(r.parange(), 6);
+        assert_eq!(r.pa_range(), 6);
         assert_eq!(r.asidbits(), 2);
         assert_eq!(r.tgran16(), 1);
         assert_eq!(r.tgran64(), 0);
@@ -1116,11 +1143,19 @@ mod tests {
     #[test]
     fn id_aa64mmfr0_el1_fields_do_not_overlap() {
         let r = IdAa64Mmfr0El1 { value: u64::MAX };
-        assert_eq!(r.parange(), 0xf);
+        assert_eq!(r.pa_range(), 0xf);
         assert_eq!(r.asidbits(), 0xf);
         assert_eq!(r.tgran16(), 0xf);
         assert_eq!(r.tgran64(), 0xf);
         assert_eq!(r.tgran4(), 0xf);
+    }
+
+    #[test]
+    fn tcr_el2_shareability_constants_encode_only_sh0() {
+        assert_eq!((TCR_EL2_SH0_NON_SHAREABLE >> 12) & 0b11, 0b00);
+        assert_eq!((TCR_EL2_SH0_OUTER_SHAREABLE >> 12) & 0b11, 0b10);
+        assert_eq!((TCR_EL2_SH0_INNER_SHAREABLE >> 12) & 0b11, 0b11);
+        assert_eq!(TCR_EL2_SH0_INNER_SHAREABLE & !(0b11 << 12), 0);
     }
 
     #[test]

@@ -84,10 +84,12 @@ Large homogeneous ranges may use L1 or L2 block descriptors, while reservation
 and attribute boundaries must remain exact.
 
 The complete 64 KiB page-table store is a dedicated, 4 KiB-aligned linker
-`NOLOAD` section inside tvisor's runtime footprint. `mm::prepare` explicitly
-zeros it and constructs tables there without initializing the allocator.
-Descriptor stores are published before the table switch using the existing
-barrier sequence.
+`NOLOAD` section inside tvisor's runtime footprint.
+`mm::setup_bootstrap_page_table` explicitly zeros
+the arena and constructs the linker-owned mappings without initializing the
+allocator. `rust_main` adds usable-RAM, retained-DTB, and UART mappings, then
+moves the final memory map into static storage. Descriptor stores are published
+before the table switch using the existing barrier sequence.
 
 The live DTB's page-rounded region is identity-mapped as Normal, read-only,
 execute-never memory before switching tables. After the no-return boundary,

@@ -112,9 +112,12 @@ must not depend on its power-on or U-Boot-provided contents.
 
 ### 4.2 No pre-switch physical allocation
 
-`mm::prepare` must construct the initial table set directly in the linker-owned
-arena. It must not initialize or call the general physical-page allocator to
-find table storage before replacing `TTBR0_EL2`.
+`mm::setup_bootstrap_page_table` must construct the initial table set directly
+in the linker-owned arena. It must not initialize or call the general
+physical-page allocator to find table storage before replacing `TTBR0_EL2`.
+The pre-switch boot path then adds platform-derived RAM, DTB, and UART mappings
+and moves the final memory map into static storage for post-switch allocator
+initialization.
 
 The pre-switch storage set becomes entirely static:
 

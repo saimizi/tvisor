@@ -126,8 +126,11 @@ These additions must not weaken the initial W^X or MMIO attribute policy.
 
 The first private page tables and stack must exist before the general physical
 allocator. The linker reserves a dedicated 64 KiB, page-aligned `NOLOAD`
-bootstrap-table arena inside `[__image_start, __image_end)`. `mm::prepare`
-explicitly zeros it before table construction.
+bootstrap-table arena inside `[__image_start, __image_end)`. Table preparation
+is split into explicit construction and policy steps:
+`mm::setup_bootstrap_page_table` zeros the arena and maps linker-owned boot
+objects, while `rust_main` adds usable RAM, the retained DTB, and UART MMIO
+before validating the completed table set.
 
 The arena contains the root and subordinate EL2 translation tables. The boot
 stack and guard remain separate linker sections. The complete tvisor runtime

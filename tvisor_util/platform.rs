@@ -1,5 +1,6 @@
 use core::fmt;
 
+use crate::println;
 use dtoolkit::fdt::Fdt;
 use dtoolkit::standard::{NodeStandard, Status};
 use dtoolkit::{Node, Property, ToCellInt};
@@ -159,6 +160,7 @@ fn discover_ram(fdt: Fdt<'_>, info: &mut SystemInfoBuilder) -> Result<(), Platfo
                 .map_err(|_| PlatformError::InvalidMemory)?;
             let region = PhysRegion::new(PhysAddr::new(start), size)
                 .map_err(|_| PlatformError::InvalidMemory)?;
+            println!("Found RAM region: {}", region);
             info.add_ram(RamRegion {
                 region,
                 source: RamSource::DeviceTree,
@@ -184,6 +186,7 @@ fn discover_reservations(
     for reservation in fdt.memory_reservations() {
         let region = PhysRegion::new(PhysAddr::new(reservation.address()), reservation.size())
             .map_err(|_| PlatformError::InvalidReservation)?;
+        println!("Found Reserved Memory Region: {}", region);
         add_reserved(
             info,
             region,

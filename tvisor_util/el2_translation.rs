@@ -56,6 +56,8 @@
 
 use core::fmt;
 
+use crate::aarch64_reg::{MAIR_INDEX_DEVICE_NGNRE, MAIR_INDEX_NORMAL_WB_WA};
+
 pub const PAGE_SIZE: u64 = 4096;
 pub const ENTRIES_PER_TABLE: usize = 512;
 pub const VA_BITS: u8 = 39;
@@ -77,28 +79,15 @@ const ACCESS_FLAG: u64 = 1 << 10;
 // EL0/EL1 regime, but is not the execute permission used by this regime.
 const XN: u64 = 1 << 54;
 
-pub const MAIR_NORMAL_WB_WA: u8 = 0xff;
-pub const MAIR_DEVICE_NGNRE: u8 = 0x04;
-const MAIR_INDEX_NORMAL_WB_WA: u32 = 0;
-const MAIR_INDEX_DEVICE_NGNRE: u32 = 1;
-pub const MAIR_EL2_VALUE: u64 = ((MAIR_NORMAL_WB_WA as u64) << (MAIR_INDEX_NORMAL_WB_WA * 8))
-    | ((MAIR_DEVICE_NGNRE as u64) << (MAIR_INDEX_DEVICE_NGNRE * 8));
-pub const TCR_EL2_T0SZ_39_BIT: u64 = 25;
-pub const TCR_EL2_RES1: u64 = (1 << 31) | (1 << 23);
-pub const SCTLR_EL2_RES1: u64 =
-    (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
-pub const SCTLR_EL2_VALUE: u64 =
-    SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct El2RegisterValues {
-    pub mair_el2: u64,
-    pub tcr_el2: u64,
-    pub ttbr0_el2: u64,
-    pub sctlr_el2: u64,
+pub fn is_page_aligned(addr: u64) -> bool {
+    is_aligned(addr, PAGE_SIZE)
 }
 
-pub fn pa_bits_from_parange(parange: u8) -> Result<u8, TranslationError> {
+pub fn is_aligned(addr: u64, alignment: u64) -> bool {
+    alignment.is_power_of_two() && addr & (alignment - 1) == 0
+}
+
+pub fn pa_bits_from_pa_range(parange: u8) -> Result<u8, TranslationError> {
     match parange {
         0 => Ok(32),
         1 => Ok(36),
@@ -110,23 +99,9 @@ pub fn pa_bits_from_parange(parange: u8) -> Result<u8, TranslationError> {
     }
 }
 
-pub fn register_values(root_pa: u64, parange: u8) -> Result<El2RegisterValues, TranslationError> {
-    let pa_bits = pa_bits_from_parange(parange)?;
-    if root_pa & (PAGE_SIZE - 1) != 0 || root_pa >= (1_u64 << pa_bits) {
-        return Err(TranslationError::InvalidTableBase);
-    }
-    let tcr_el2 = TCR_EL2_RES1
-        | TCR_EL2_T0SZ_39_BIT
-        | (0b01 << 8)
-        | (0b01 << 10)
-        | (0b11 << 12)
-        | ((parange as u64) << 16);
-    Ok(El2RegisterValues {
-        mair_el2: MAIR_EL2_VALUE,
-        tcr_el2,
-        ttbr0_el2: root_pa,
-        sctlr_el2: SCTLR_EL2_VALUE,
-    })
+pub fn is_in_physical_address_range(addr: u64, pa_range: u8) -> Result<bool, TranslationError> {
+    let pa_bits = pa_bits_from_pa_range(pa_range)?;
+    Ok(addr < (1_u64 << pa_bits))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,6 +469,20 @@ fn leaf_descriptor(level: u8, pa: u64, mapping: Mapping) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn validates_alignment_and_physical_address_width() {
+        assert!(is_page_aligned(0x3000_0000));
+        assert!(!is_page_aligned(0x3000_0001));
+        assert!(!is_aligned(0, 0));
+        assert!(!is_aligned(0, 3));
+        assert_eq!(is_in_physical_address_range((1 << 36) - 1, 1), Ok(true));
+        assert_eq!(is_in_physical_address_range(1 << 36, 1), Ok(false));
+        assert_eq!(
+            is_in_physical_address_range(0, 0xf),
+            Err(TranslationError::InvalidPaBits)
+        );
+    }
+
     fn mapping(va: u64, pa: u64, size: u64) -> Mapping {
         Mapping {
             va,
@@ -603,26 +592,5 @@ mod tests {
             tables.map(mapping(1, 0, PAGE_SIZE)),
             Err(TranslationError::UnalignedMapping)
         );
-    }
-
-    #[test]
-    fn encodes_expected_mair_attributes() {
-        assert_eq!(MAIR_EL2_VALUE, 0x04ff);
-    }
-
-    #[test]
-    fn constructs_phase7_register_values() {
-        let registers = register_values(0x3000_0000, 4).unwrap();
-        assert_eq!(registers.mair_el2, 0x04ff);
-        assert_eq!(registers.ttbr0_el2, 0x3000_0000);
-        assert_eq!(registers.tcr_el2 & 0x3f, 25);
-        assert_eq!((registers.tcr_el2 >> 8) & 0b11, 0b01);
-        assert_eq!((registers.tcr_el2 >> 10) & 0b11, 0b01);
-        assert_eq!((registers.tcr_el2 >> 12) & 0b11, 0b11);
-        assert_eq!((registers.tcr_el2 >> 14) & 0b11, 0b00);
-        assert_eq!((registers.tcr_el2 >> 16) & 0b111, 4);
-        assert_eq!(registers.tcr_el2 & TCR_EL2_RES1, TCR_EL2_RES1);
-        assert_ne!(registers.sctlr_el2 & (1 << 0), 0);
-        assert_ne!(registers.sctlr_el2 & (1 << 19), 0);
     }
 }

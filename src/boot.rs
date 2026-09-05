@@ -3,11 +3,12 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use tvisor_util::aarch64_reg::{MairEl2, SctlrEl2, Sp, SpSel, TcrEl2, Ttbr0El2, VbarEl2};
 use tvisor_util::boot_mode::FaultTest;
-use tvisor_util::el2_translation::El2RegisterValues;
+use tvisor_util::debug_util::stop;
+use tvisor_util::el2_translation::is_page_aligned;
 use tvisor_util::page_allocator::AllocatorStats;
 use tvisor_util::println;
+use tvisor_util::{aarch64_reg::*, el2_translation::is_in_physical_address_range};
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
@@ -50,15 +51,40 @@ unsafe extern "C" {
     ) -> !;
 }
 
-pub unsafe fn enter_private_el2(fault_test: FaultTest, registers: El2RegisterValues) -> ! {
-    // SAFETY: The caller accepts the documented no-return state transition.
+pub unsafe fn enter_private_el2(
+    fault_test: FaultTest,
+    bootstrap_table_root: u64,
+    pa_range: u8,
+) -> ! {
+    if !is_page_aligned(bootstrap_table_root) {
+        println!("Bootstrap page table is not page aligned");
+        stop()
+    }
+
+    if is_in_physical_address_range(bootstrap_table_root, pa_range) != Ok(true) {
+        println!("Bootstrap page table is not in physical address range");
+        stop()
+    }
+
+    let tcr_el2 = TCR_EL2_RES1
+        | TCR_EL2_T0SZ_FOR_VA_39_BIT
+        | TCR_EL2_IRGN0_MEM_WB_RA_WA
+        | TCR_EL2_ORGN0_MEM_WB_RA_WA
+        | TCR_EL2_SH0_INNER_SHAREABLE
+        | ((pa_range as u64) << 16);
+
+    const SCTLR_EL2_RES1: u64 =
+        (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
+    const SCTLR_EL2_VALUE: u64 =
+        SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
+
     unsafe {
         __enter_private_el2(
             fault_test as u64,
-            registers.mair_el2,
-            registers.tcr_el2,
-            registers.ttbr0_el2,
-            registers.sctlr_el2,
+            MAIR_EL2_VALUE,
+            tcr_el2,
+            bootstrap_table_root,
+            SCTLR_EL2_VALUE,
         )
     }
 }

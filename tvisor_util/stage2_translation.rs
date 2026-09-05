@@ -27,7 +27,7 @@
 //! [54:53]  XN         00 = Executable; 10 = Execute-Never (XN)
 //! ```
 
-use crate::el2_translation::{PAGE_SIZE, TablePage, TranslationError, pa_bits_from_parange};
+use crate::el2_translation::{PAGE_SIZE, TablePage, TranslationError, pa_bits_from_pa_range};
 
 pub const IPA_BITS: u8 = 39;
 
@@ -393,7 +393,7 @@ pub fn stage2_register_values(
     root_table_pa: u64,
     parange: u8,
 ) -> Result<Stage2RegisterValues, TranslationError> {
-    let pa_bits = pa_bits_from_parange(parange)?;
+    let pa_bits = pa_bits_from_pa_range(parange)?;
     let max_root_pa = (1_u64 << pa_bits) - 1;
     if root_table_pa & (PAGE_SIZE - 1) != 0 || root_table_pa > max_root_pa {
         return Err(TranslationError::InvalidTableBase);

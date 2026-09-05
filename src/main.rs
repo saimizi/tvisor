@@ -1,16 +1,16 @@
 #![no_std]
 #![no_main]
 
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 use dtoolkit::standard::NodeStandard;
-use tvisor_util::aarch64_reg::CurrentEL;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::boot_mode::fault_test_from_args;
-use tvisor_util::debug_util::{debug_fini, debug_init};
+use tvisor_util::debug_util::{debug_init, stop};
+use tvisor_util::el2_translation::PAGE_SIZE;
 use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::platform::discover_system_info_builder;
-use tvisor_util::println;
-use tvisor_util::system_info::{ConsoleKind, PhysAddr, PhysRegion};
+use tvisor_util::system_info::{ConsoleKind, FixedList, PhysAddr, PhysRegion};
+use tvisor_util::{halt, println};
 
 mod boot;
 mod exception;
@@ -49,17 +49,6 @@ main:
     .size main, . - main
 "#,
 );
-
-fn halt() -> ! {
-    loop {
-        unsafe { asm!("wfe", options(nomem, nostack, preserves_flags)) };
-    }
-}
-
-fn stop() -> ! {
-    debug_fini();
-    halt()
-}
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
@@ -111,8 +100,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         Ok(fault_test) => fault_test,
         Err(error) => {
             println!("Invalid fault test: {}", error);
-            debug_fini();
-            halt();
+            stop();
         }
     };
 
@@ -204,7 +192,9 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         println!("Phase 7 cannot validate HCR_EL2");
         stop();
     };
-    // The initial translation regime requires stage 2 and VHE disabled.
+    // The initial translation regime suppose
+    // * stage 2 translation is disabled
+    // * VHE is disabled.
     if hcr.bit_vm() || hcr.bit_e2h() {
         println!(
             "Phase 7 requires HCR_EL2.VM=0 and E2H=0 (VM={} E2H={})",
@@ -214,36 +204,90 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         stop();
     }
 
-    let prepared = match mm::prepare(
-        system_info.into_memory(),
-        console.registers.start().value(),
-        mmfr0.parange(),
-        live_dtb,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            println!("Phase 7 table preparation failed: {}", error);
-            stop();
-        }
+    // Set up bootstrap page table
+    let pa_range = mmfr0.pa_range();
+    let Ok(mut tables) = mm::setup_bootstrap_page_table(pa_range) else {
+        println!("Failed to setup bootstrap page tables");
+        stop();
     };
 
-    println!(
-        "Phase 7 tables prepared: arena=[{:#018x}, {:#018x}) pages={}",
-        prepared.arena_start, prepared.arena_end, prepared.used_pages
-    );
-    println!(
-        "  MAIR_EL2={:#018x} TCR_EL2={:#018x}",
-        prepared.registers.mair_el2, prepared.registers.tcr_el2
-    );
-    println!(
-        " TTBR0_EL2={:#018x} SCTLR_EL2={:#018x}",
-        prepared.registers.ttbr0_el2, prepared.registers.sctlr_el2
-    );
-    println!("  Live DTB pages retained: {}", prepared.live_dtb_pages);
+    // Map usable memory and DTB
+    {
+        // Map usable RAM to RW
+        let mut exclusive_list = FixedList::<PhysRegion, 1>::new();
+        let Ok(live_dtb_region) =
+            PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE)
+        else {
+            println!("Failed to remap live dtb region to page aligned.");
+            stop();
+        };
+
+        if exclusive_list.push(live_dtb_region).is_err() {
+            println!("Failed to create exclusive list");
+            stop();
+        }
+
+        if mm::map_identity_regions_excluding(
+            &mut tables,
+            system_info.memory().usable_ram(),
+            &exclusive_list,
+            true,
+            false,
+        )
+        .is_err()
+        {
+            println!("Failed to map useable memory region");
+            stop();
+        }
+
+        // Map live DTB region to R
+        if mm::map_identity(
+            &mut tables,
+            live_dtb_region.start().value(),
+            live_dtb_region.end().value(),
+            false,
+            false,
+        )
+        .is_err()
+        {
+            println!("Failed to map live dtb region");
+            stop();
+        };
+
+        let Ok(console_registers) = PhysRegion::new_aligned(
+            console.registers.start(),
+            console.registers.size(),
+            PAGE_SIZE,
+        ) else {
+            println!("Failed to align console MMIO region");
+            stop();
+        };
+        if mm::map_identity_device(&mut tables, console_registers).is_err() {
+            println!("Failed to map console MMIO region");
+            stop();
+        }
+
+        if mm::validate_bootstrap_page_table(
+            &tables,
+            console.registers.start().value(),
+            live_dtb_region,
+        )
+        .is_err()
+        {
+            println!("Bootstrap page-table validation failed");
+            stop();
+        }
+    }
+
+    if mm::prepare_allocator_after_takeover(system_info.into_memory(), live_dtb).is_err() {
+        println!("Failed to retain memory map for allocator initialization");
+        stop();
+    }
+
     println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.
-    unsafe { boot::enter_private_el2(fault_test, prepared.registers) }
+    unsafe { boot::enter_private_el2(fault_test, tables.root_pa(), pa_range) }
 }
 
 #[panic_handler]
