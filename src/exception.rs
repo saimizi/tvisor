@@ -79,7 +79,8 @@ __el2_vectors:
     // Current EL using SPx (SP_EL2 at EL2): SError.
     VECTOR_SLOT 7
     // Lower EL executing AArch64: synchronous exception.
-    VECTOR_SLOT 8
+    b __vcpu_exit_handler
+    .balign 128
     // Lower EL executing AArch64: IRQ.
     VECTOR_SLOT 9
     // Lower EL executing AArch64: FIQ.

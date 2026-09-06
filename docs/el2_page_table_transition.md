@@ -30,8 +30,8 @@ The takeover path must stop before writing registers unless all of these hold:
 - the private stack and vector table from Phase 6 are active;
 - asynchronous exceptions are masked;
 - the UART CPU physical page is known;
-- every DTB value required after takeover has been copied into owned data;
-- page-table storage lies entirely in `INITIAL`; and
+- the final memory map has been moved into tvisor-owned static storage;
+- page-table storage lies entirely in the linker-owned bootstrap arena; and
 - all mandatory identity mappings pass a software table walk.
 
 Failure before the no-return boundary uses the diagnostic error path and
@@ -39,10 +39,9 @@ halts. Failure after it enters the private exception handler and also halts.
 
 ## 3. Bootstrap table storage
 
-The layout calculator receives mandatory mapping requests and determines the
-exact number of 4 KiB table pages. A checked first-fit selector reserves that
-many pages from `INITIAL`, with room for any Phase 6 bootstrap objects not
-statically linked into the image.
+The linker reserves sixteen 4 KiB pages in a dedicated, aligned
+`.bootstrap_tables` `NOLOAD` section inside the tvisor runtime footprint.
+Linker assertions and runtime checks validate its size and alignment.
 
 The first provider is monotonic:
 
@@ -54,8 +53,8 @@ allocate_table_page():
 ```
 
 Every allocated table page is zeroed before a descriptor points to it. The
-arena becomes a permanent tvisor reservation immediately and must be mapped
-Normal WB/WA, read/write, execute-never.
+complete runtime footprint, including the arena, is a permanent tvisor
+reservation. The arena is mapped Normal WB/WA, read/write, execute-never.
 
 For the current sparse layout, the expected shape is approximately one L1
 root, separate L2 tables for low RAM and the high UART area, and L3 tables for
@@ -244,8 +243,9 @@ The first code after enabling translation performs only bounded operations:
 5. walk the active tables in software; and
 6. report success, then halt.
 
-The first hardware milestone does not initialize the physical allocator or
-reclaim `HANDOFF` memory. Those belong to Phase 8.
+The first hardware milestone does not initialize the physical allocator.
+Phase 8 initializes it after this checkpoint; no U-Boot reclamation pass is
+required.
 
 After the positive test passes, separate opt-in tests deliberately access the
 unmapped guard page and a representative unmapped VA. Each must enter the

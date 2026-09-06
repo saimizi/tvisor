@@ -1,3 +1,27 @@
+// TCR_EL2
+pub const TCR_EL2_RES1: u64 = (1 << 31) | (1 << 23);
+pub const TCR_EL2_T0SZ_FOR_VA_39_BIT: u64 = 64_u64 - 39_u64;
+pub const TCR_EL2_IRGN0_MEM_NO_CACHEABLE: u64 = 0b00 << 8;
+pub const TCR_EL2_IRGN0_MEM_WB_RA_WA: u64 = 0b01 << 8;
+pub const TCR_EL2_IRGN0_MEM_WT_RA_NOWA: u64 = 0b10 << 8;
+pub const TCR_EL2_IRGN0_MEM_WB_RA_NOWA: u64 = 0b11 << 8;
+pub const TCR_EL2_ORGN0_MEM_NO_CACHEABLE: u64 = 0b00 << 10;
+pub const TCR_EL2_ORGN0_MEM_WB_RA_WA: u64 = 0b01 << 10;
+pub const TCR_EL2_ORGN0_MEM_WT_RA_NOWA: u64 = 0b10 << 10;
+pub const TCR_EL2_ORGN0_MEM_WB_RA_NOWA: u64 = 0b11 << 10;
+pub const TCR_EL2_SH0_NON_SHAREABLE: u64 = 0b00 << 12;
+pub const TCR_EL2_SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
+pub const TCR_EL2_SH0_INNER_SHAREABLE: u64 = 0b11 << 12;
+
+// MAIR
+// Common attreibute
+pub const MAIR_NORMAL_WB_WA: u8 = 0xff;
+pub const MAIR_DEVICE_NGNRE: u8 = 0x04;
+pub const MAIR_INDEX_NORMAL_WB_WA: u32 = 0;
+pub const MAIR_INDEX_DEVICE_NGNRE: u32 = 1;
+pub const MAIR_EL2_VALUE: u64 = ((MAIR_NORMAL_WB_WA as u64) << (MAIR_INDEX_NORMAL_WB_WA * 8))
+    | ((MAIR_DEVICE_NGNRE as u64) << (MAIR_INDEX_DEVICE_NGNRE * 8));
+
 #[inline]
 pub fn bit_check(value: u64, bit: u64) -> bool {
     value & (0x1 << bit) == (0x1 << bit)
@@ -191,9 +215,9 @@ impl Sp {
     }
 }
 
-impl Into<usize> for Sp {
-    fn into(self) -> usize {
-        self.value
+impl From<Sp> for usize {
+    fn from(sp: Sp) -> Self {
+        sp.value
     }
 }
 
@@ -284,6 +308,9 @@ impl HcrEl2 {
     pub fn bit_vm(&self) -> bool {
         bit_check(self.value, 0)
     }
+    pub fn bit_swio(&self) -> bool {
+        bit_check(self.value, 1)
+    }
     pub fn bit_ptw(&self) -> bool {
         bit_check(self.value, 2)
     }
@@ -310,6 +337,9 @@ impl HcrEl2 {
     }
     pub fn bit_twe(&self) -> bool {
         bit_check(self.value, 14)
+    }
+    pub fn bit_tsc(&self) -> bool {
+        bit_check(self.value, 19)
     }
     pub fn bit_ttlb(&self) -> bool {
         bit_check(self.value, 25)
@@ -811,7 +841,7 @@ impl IdAa64Mmfr0El1 {
         }
     }
     // Implemented physical-address range
-    pub fn parange(&self) -> u8 {
+    pub fn pa_range(&self) -> u8 {
         (self.value & 0xf) as u8
     }
 
@@ -836,9 +866,121 @@ impl IdAa64Mmfr0El1 {
     }
 }
 
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct HpfarEl2 {
+    pub value: u64,
+}
+
+impl HpfarEl2 {
+    #[cfg(target_arch = "aarch64")]
+    pub fn dump() -> Option<Self> {
+        let el: ExceptionLevel = CurrentEL::dump().into();
+        if el >= ExceptionLevel::EL2 {
+            let value;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {value}, HPFAR_EL2",
+                    value = out(reg) value,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            Some(Self { value })
+        } else {
+            None
+        }
+    }
+
+    /// Fault IPA page base (bits [47:12]) held in HPFAR_EL2[47:4].
+    pub fn fipa_page(&self) -> u64 {
+        ((self.value >> 4) & 0x0000_0fff_ffff_ffff) << 12
+    }
+
+    /// Reconstructs the full faulting IPA using low 12 bits from FAR_EL2.
+    pub fn fault_ipa(&self, far_el2: u64) -> u64 {
+        self.fipa_page() | (far_el2 & 0xfff)
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct VmpidrEl2 {
+    pub value: u64,
+}
+
+impl VmpidrEl2 {
+    pub const RES1_BIT: u64 = 1 << 31;
+    pub const U_BIT: u64 = 1 << 30;
+    pub const MT_BIT: u64 = 1 << 24;
+    pub const AFF2_SHIFT: u32 = 16;
+    pub const AFF1_SHIFT: u32 = 8;
+    pub const AFF0_SHIFT: u32 = 0;
+    pub const AFF_MASK: u64 = 0xff;
+
+    pub const fn uniprocessor(vcpu_id: u8) -> Self {
+        Self {
+            value: Self::RES1_BIT | Self::U_BIT | ((vcpu_id as u64) & Self::AFF_MASK),
+        }
+    }
+
+    pub const fn res1(&self) -> bool {
+        (self.value & Self::RES1_BIT) != 0
+    }
+
+    pub const fn u_bit(&self) -> bool {
+        (self.value & Self::U_BIT) != 0
+    }
+
+    pub const fn mt_bit(&self) -> bool {
+        (self.value & Self::MT_BIT) != 0
+    }
+
+    pub const fn aff0(&self) -> u8 {
+        ((self.value >> Self::AFF0_SHIFT) & Self::AFF_MASK) as u8
+    }
+
+    pub const fn aff1(&self) -> u8 {
+        ((self.value >> Self::AFF1_SHIFT) & Self::AFF_MASK) as u8
+    }
+
+    pub const fn aff2(&self) -> u8 {
+        ((self.value >> Self::AFF2_SHIFT) & Self::AFF_MASK) as u8
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn dump() -> Option<Self> {
+        let el: ExceptionLevel = CurrentEL::dump().into();
+        if el >= ExceptionLevel::EL2 {
+            let value;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {value}, VMPIDR_EL2",
+                    value = out(reg) value,
+                    options(nostack, preserves_flags),
+                );
+            }
+            Some(Self { value })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn write(&self) {
+        unsafe {
+            core::arch::asm!(
+                "msr VMPIDR_EL2, {value}",
+                value = in(reg) self.value,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, VtcrEl2, VttbrEl2};
+    use super::{
+        CnthctlEl2, CptrEl2, Daif, IdAa64Mmfr0El1, IdAa64Pfr0El1, TCR_EL2_SH0_INNER_SHAREABLE,
+        TCR_EL2_SH0_NON_SHAREABLE, TCR_EL2_SH0_OUTER_SHAREABLE, VtcrEl2, VttbrEl2,
+    };
 
     #[test]
     fn vtcr_el2_decodes_every_field() {
@@ -991,7 +1133,7 @@ mod tests {
             | (0b0000_u64 << 28); // TGran4 [31:28] = 0 (supported)
 
         let r = IdAa64Mmfr0El1 { value: raw };
-        assert_eq!(r.parange(), 6);
+        assert_eq!(r.pa_range(), 6);
         assert_eq!(r.asidbits(), 2);
         assert_eq!(r.tgran16(), 1);
         assert_eq!(r.tgran64(), 0);
@@ -1001,10 +1143,62 @@ mod tests {
     #[test]
     fn id_aa64mmfr0_el1_fields_do_not_overlap() {
         let r = IdAa64Mmfr0El1 { value: u64::MAX };
-        assert_eq!(r.parange(), 0xf);
+        assert_eq!(r.pa_range(), 0xf);
         assert_eq!(r.asidbits(), 0xf);
         assert_eq!(r.tgran16(), 0xf);
         assert_eq!(r.tgran64(), 0xf);
         assert_eq!(r.tgran4(), 0xf);
+    }
+
+    #[test]
+    fn tcr_el2_shareability_constants_encode_only_sh0() {
+        assert_eq!((TCR_EL2_SH0_NON_SHAREABLE >> 12) & 0b11, 0b00);
+        assert_eq!((TCR_EL2_SH0_OUTER_SHAREABLE >> 12) & 0b11, 0b10);
+        assert_eq!((TCR_EL2_SH0_INNER_SHAREABLE >> 12) & 0b11, 0b11);
+        assert_eq!(TCR_EL2_SH0_INNER_SHAREABLE & !(0b11 << 12), 0);
+    }
+
+    #[test]
+    fn hpfar_el2_reconstructs_fault_ipa() {
+        // IPA 0x4000_1234 -> FIPA page 0x4000_1000 in bits [47:4] is (0x4000_1000 >> 12) << 4 = 0x400010
+        let hpfar = super::HpfarEl2 {
+            value: (0x4000_1000_u64 >> 12) << 4,
+        };
+        assert_eq!(hpfar.fipa_page(), 0x4000_1000);
+        assert_eq!(hpfar.fault_ipa(0x0000_0234), 0x4000_1234);
+    }
+
+    #[test]
+    fn hcr_el2_decodes_virtualization_bits() {
+        let hcr = super::HcrEl2 {
+            value: (1 << 31) | (1 << 19) | (1 << 1) | (1 << 0),
+        };
+        assert!(hcr.bit_rw());
+        assert!(hcr.bit_tsc());
+        assert!(hcr.bit_swio());
+        assert!(hcr.bit_vm());
+        assert!(!hcr.bit_fmo());
+    }
+
+    #[test]
+    fn vmpidr_el2_decodes_uniprocessor_and_affinity_fields() {
+        let vmpidr = super::VmpidrEl2::uniprocessor(0);
+        assert_eq!(vmpidr.value, 0xC000_0000);
+        assert!(vmpidr.res1());
+        assert!(vmpidr.u_bit());
+        assert!(!vmpidr.mt_bit());
+        assert_eq!(vmpidr.aff0(), 0);
+        assert_eq!(vmpidr.aff1(), 0);
+        assert_eq!(vmpidr.aff2(), 0);
+
+        let vmpidr_custom = super::VmpidrEl2 {
+            value: (1 << 31) | (1 << 24) | (3 << 16) | (2 << 8) | 1,
+        };
+        assert!(vmpidr_custom.res1());
+        assert!(!vmpidr_custom.u_bit());
+        assert!(vmpidr_custom.mt_bit());
+        assert_eq!(vmpidr_custom.aff0(), 1);
+        assert_eq!(vmpidr_custom.aff1(), 2);
+        assert_eq!(vmpidr_custom.aff2(), 3);
     }
 }

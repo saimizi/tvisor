@@ -1,49 +1,25 @@
 use core::{
-    arch::asm,
     cell::UnsafeCell,
     fmt,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use spin::Mutex;
+use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_translation::{
-    El2RegisterValues, Mapping, MemoryType, PAGE_SIZE, TableSet, TableStorage, TranslationError,
-    pa_bits_from_parange, register_values,
+    Mapping, MemoryType, PAGE_SIZE, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
-use tvisor_util::memory_map::{MAX_NORMALIZED_RESERVED_REGIONS, MemoryMap};
+use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
-    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, PageState,
-    page_covering,
+    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
 };
+use tvisor_util::println;
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = MAX_TABLE_PAGES as u64 * PAGE_SIZE;
 
-#[derive(Clone, Copy)]
-struct ReclaimMemoryInfo {
-    /// U-Boot handoff regions eligible for reclamation after takeover.
-    reclaimable_regions: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
-    /// Exact live DTB byte range used for post-takeover validation.
-    live_dtb: PhysRegion,
-    /// Page-rounded DTB range that must remain allocated during reclamation.
-    retained_dtb_pages: PhysRegion,
-}
-
-struct GlobalReclaimMemoryInfo {
-    value: UnsafeCell<Option<ReclaimMemoryInfo>>,
-}
-
-// Phase 8 remains single-core with DAIF masked. The value is installed before
-// allocator initialization is published and consumed exactly once afterward.
-unsafe impl Sync for GlobalReclaimMemoryInfo {}
-
-impl GlobalReclaimMemoryInfo {
-    const fn empty() -> Self {
-        Self {
-            value: UnsafeCell::new(None),
-        }
-    }
-}
+static TVISOR_TABLES: Mutex<Option<TableSet<'static, MAX_TABLE_PAGES>>> = Mutex::new(None);
 
 struct GlobalPageAllocator {
     managed: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
@@ -69,11 +45,13 @@ impl GlobalPageAllocator {
 }
 
 static PAGE_ALLOCATOR: GlobalPageAllocator = GlobalPageAllocator::new();
-static RECLAIM_MEMORY_INFO: GlobalReclaimMemoryInfo = GlobalReclaimMemoryInfo::empty();
+static BOOTSTRAP_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;
+    static __payload_start: u8;
+    static __payload_end: u8;
     static __vectors_start: u8;
     static __vectors_end: u8;
     static __rodata_start: u8;
@@ -84,6 +62,8 @@ unsafe extern "C" {
     static __boot_stack_guard_end: u8;
     static __boot_stack_bottom: u8;
     static __boot_stack_top: u8;
+    static __bootstrap_tables_start: u8;
+    static __bootstrap_tables_end: u8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,51 +92,78 @@ impl fmt::Display for PrepareError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PreparedTables {
-    pub registers: El2RegisterValues,
-    pub arena_start: u64,
-    pub arena_end: u64,
-    pub used_pages: usize,
-    pub allocator_stats: AllocatorStats,
-    pub live_dtb_pages: PhysRegion,
-}
-
 macro_rules! link_addr {
     ($symbol:ident) => {
         core::ptr::addr_of!($symbol) as u64
     };
 }
 
-pub fn prepare(
-    memory_map: &MemoryMap,
-    uart_register_base: u64,
-    parange: u8,
-    live_dtb: PhysRegion,
-) -> Result<PreparedTables, PrepareError> {
-    let pa_bits = pa_bits_from_parange(parange)?;
-    initialize_allocator(memory_map, live_dtb)?;
-    let arena_start =
-        with_allocator(|allocator| allocator.allocate_contiguous(MAX_TABLE_PAGES))?.value();
-    let arena_end = arena_start
-        .checked_add(TABLE_ARENA_SIZE)
-        .ok_or(PrepareError::AddressOverflow)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapPageTable {
+    pub root_pa: u64,
+    pub pa_range: u8,
+}
 
-    // SAFETY: the global allocator returned MAX_TABLE_PAGES contiguous pages
-    // from INITIAL RAM and marked all of them InUse. U-Boot identity-maps this
-    // RAM, and TableSet has exclusive access to the allocation.
-    let storage = unsafe {
-        core::ptr::write_bytes(arena_start as *mut u8, 0, TABLE_ARENA_SIZE as usize);
-        &mut *(arena_start as *mut TableStorage<MAX_TABLE_PAGES>)
+pub fn setup_bootstrap_page_table(
+    live_dtb_pages: PhysRegion,
+    uart_region: PhysRegion,
+) -> Result<BootstrapPageTable, PrepareError> {
+    if BOOTSTRAP_TABLES_CLAIMED.swap(true, Ordering::AcqRel) {
+        return Err(PrepareError::Validation);
+    }
+
+    // Check whether 4 KiB translation granules are supported.
+    let Some(mmfr0) = IdAa64Mmfr0El1::dump() else {
+        println!("Failed to read IdAa64Mmfr0El1 for PARange");
+        return Err(PrepareError::Validation);
     };
-    let mut tables = TableSet::new(storage, arena_start, pa_bits)?;
 
-    let live_dtb_pages = page_covering(live_dtb)?;
-    let mut mapping_exclusions = FixedList::<PhysRegion, 1>::new();
-    mapping_exclusions
-        .push(live_dtb_pages)
-        .map_err(|_| PrepareError::Validation)?;
+    if mmfr0.tgran4() != 0 {
+        println!("4 KiB translation-granule is not support.");
+        return Err(PrepareError::Validation);
+    }
 
+    if let Some(hcr) = HcrEl2::dump() {
+        // The initial translation regime suppose
+        // * stage 2 translation is disabled
+        // * VHE is disabled.
+        if hcr.bit_vm() || hcr.bit_e2h() {
+            println!(
+                "Phase 7 requires HCR_EL2.VM=0 and E2H=0 (VM={} E2H={})",
+                hcr.bit_vm(),
+                hcr.bit_e2h()
+            );
+            return Err(PrepareError::Validation);
+        }
+    } else {
+        println!("Phase 7 cannot validate HCR_EL2");
+        return Err(PrepareError::Validation);
+    };
+
+    let pa_range = mmfr0.pa_range();
+
+    let pt_area_start = link_addr!(__bootstrap_tables_start);
+    let pt_area_end = link_addr!(__bootstrap_tables_end);
+
+    let is_page_aligned = |addr: u64| -> bool { addr & (PAGE_SIZE - 1) == 0 };
+
+    if !is_page_aligned(pt_area_start) || !is_page_aligned(pt_area_end) {
+        return Err(PrepareError::Validation);
+    }
+
+    if pt_area_end.checked_sub(pt_area_start) != Some(TABLE_ARENA_SIZE) {
+        return Err(PrepareError::Validation);
+    }
+
+    // clear page table area
+    let storage: &'static mut TableStorage<MAX_TABLE_PAGES> = unsafe {
+        core::ptr::write_bytes(pt_area_start as *mut u8, 0, TABLE_ARENA_SIZE as usize);
+        &mut *(pt_area_start as *mut TableStorage<MAX_TABLE_PAGES>)
+    };
+
+    let mut tables = TableSet::new(storage, pt_area_start, pa_bits_from_pa_range(pa_range)?)?;
+
+    // .text
     map_identity(
         &mut tables,
         link_addr!(__text_start),
@@ -164,6 +171,8 @@ pub fn prepare(
         false,
         true,
     )?;
+
+    // .vectors
     map_identity(
         &mut tables,
         link_addr!(__vectors_start),
@@ -171,6 +180,8 @@ pub fn prepare(
         false,
         true,
     )?;
+
+    // .rodata
     map_identity(
         &mut tables,
         link_addr!(__rodata_start),
@@ -178,6 +189,8 @@ pub fn prepare(
         false,
         false,
     )?;
+
+    // .data, .bss, .got
     map_identity(
         &mut tables,
         link_addr!(__writable_start),
@@ -185,6 +198,8 @@ pub fn prepare(
         true,
         false,
     )?;
+
+    // .stack
     map_identity(
         &mut tables,
         link_addr!(__boot_stack_bottom),
@@ -192,156 +207,139 @@ pub fn prepare(
         true,
         false,
     )?;
-    map_identity_regions_excluding(
+
+    // .bootstrap_tables
+    map_identity(
         &mut tables,
-        memory_map.usable_ram(),
-        &mapping_exclusions,
+        link_addr!(__bootstrap_tables_start),
+        link_addr!(__bootstrap_tables_end),
         true,
         false,
     )?;
+
+    // __payload_start
+    // TODO: This is for test.
     map_identity(
         &mut tables,
-        live_dtb_pages.start().value(),
-        live_dtb_pages.end().value(),
+        link_addr!(__payload_start),
+        link_addr!(__payload_end),
         false,
         false,
     )?;
 
-    let uart_page = uart_register_base & !(PAGE_SIZE - 1);
-    tables.map(Mapping {
-        va: uart_page,
-        pa: uart_page,
-        size: PAGE_SIZE,
-        memory_type: MemoryType::Device,
-        writable: true,
-        executable: false,
-    })?;
+    // Complete live DTB pages are mapped read-only Normal.
+    let dtb_start = live_dtb_pages.start().value();
+    let dtb_end = live_dtb_pages.end().value();
+    map_identity(&mut tables, dtb_start, dtb_end, false, false)?;
 
-    validate(
-        &tables,
-        uart_register_base,
-        arena_start,
-        arena_end,
-        live_dtb_pages,
-    )?;
-    let used_pages = tables.used_pages();
-    let registers = register_values(tables.root_pa(), parange)?;
-    // Publish every descriptor store before TTBR0_EL2 can expose the tables to
-    // the hardware walker. The initial implementation uses coherent Normal
-    // WB/WA memory and identity mappings under both translation regimes.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        asm!("dsb ishst", options(nostack, preserves_flags));
-    }
-    Ok(PreparedTables {
-        registers,
-        arena_start,
-        arena_end,
-        used_pages,
-        allocator_stats: allocator_stats()?,
-        live_dtb_pages,
-    })
-}
+    // UART page is mapped RW Device.
+    map_identity_device(&mut tables, uart_region)?;
+    validate_bootstrap_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
-fn initialize_allocator(
-    memory_map: &MemoryMap,
-    live_dtb: PhysRegion,
-) -> Result<(), AllocatorError> {
-    if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let live_dtb_pages = page_covering(live_dtb)?;
-    // SAFETY: initialization runs once on the boot CPU before any allocator
-    // client or asynchronous exception can access this static state.
-    let allocator = unsafe {
-        PageAllocator::new(
-            memory_map.ram(),
-            memory_map.usable_ram(),
-            memory_map.initial_usable_ram(),
-            &mut *PAGE_ALLOCATOR.managed.get(),
-            &mut *PAGE_ALLOCATOR.in_use.get(),
-        )?
-    };
-    let stats = allocator.stats();
-    // SAFETY: reclamation information is installed before allocator
-    // initialization is published and is consumed only after takeover.
-    unsafe {
-        *RECLAIM_MEMORY_INFO.value.get() = Some(ReclaimMemoryInfo {
-            reclaimable_regions: *memory_map.transition_reserved(),
-            live_dtb,
-            retained_dtb_pages: live_dtb_pages,
-        });
-    }
-    PAGE_ALLOCATOR
-        .ram_pages
-        .store(stats.ram_pages, Ordering::Relaxed);
-    PAGE_ALLOCATOR.initialized.store(true, Ordering::Release);
-    Ok(())
+    let root_pa = tables.root_pa();
+    *TVISOR_TABLES.lock() = Some(tables);
+
+    Ok(BootstrapPageTable { root_pa, pa_range })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TakeoverResult {
-    pub released_pages: usize,
+pub struct AllocatorInitResult {
     pub stats: AllocatorStats,
     pub live_dtb: PhysRegion,
-    /// An unused page from reclaimed U-Boot memory for hardware validation.
-    pub reclaimed_test_page: Option<PhysAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TakeoverError {
+pub enum AllocatorInitError {
     Allocator(AllocatorError),
-    ReclaimMemoryInfoUnavailable,
     InvalidDtb,
+    DtbAllocatable,
 }
 
-impl From<AllocatorError> for TakeoverError {
+impl From<AllocatorError> for AllocatorInitError {
     fn from(error: AllocatorError) -> Self {
         Self::Allocator(error)
     }
 }
 
-/// Reclaim U-Boot handoff RAM while retaining the page-rounded live DTB.
-/// This is valid only after tvisor has crossed its no-return boundary.
-pub fn complete_takeover() -> Result<TakeoverResult, TakeoverError> {
-    let info = take_reclaim_memory_info()?;
-    let live_dtb = info.live_dtb;
-    let live_dtb_pages = info.retained_dtb_pages;
-    let mut released_pages = 0;
-    for region in &info.reclaimable_regions {
-        if region.overlaps(live_dtb_pages) {
-            if region.start() < live_dtb_pages.start() {
-                let before = PhysRegion::from_bounds(region.start(), live_dtb_pages.start())
-                    .map_err(AllocatorError::InvalidRegion)?;
-                released_pages += with_allocator(|allocator| allocator.release(before))?;
-            }
-            if region.end() > live_dtb_pages.end() {
-                let after = PhysRegion::from_bounds(live_dtb_pages.end(), region.end())
-                    .map_err(AllocatorError::InvalidRegion)?;
-                released_pages += with_allocator(|allocator| allocator.release(after))?;
-            }
-        } else {
-            released_pages += with_allocator(|allocator| allocator.release(*region))?;
-        }
+impl fmt::Display for AllocatorInitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
     }
+}
+
+/// Initialize the global physical-page allocator after tvisor has installed
+/// its private stack, vectors, and EL2 stage-1 translation regime.
+///
+/// All `usable_ram` pages start unused. U-Boot runtime allocations require no
+/// explicit reclamation because they are absent from the permanent platform
+/// reservation map. The tvisor image and live DTB remain reserved.
+pub fn initialize_allocator_after_takeover(
+    memory_map: &MemoryMap,
+    live_dtb: PhysRegion,
+) -> Result<AllocatorInitResult, AllocatorInitError> {
+    if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
+        return Err(AllocatorError::DoubleFree.into());
+    }
+
+    validate_live_dtb(live_dtb)?;
+    let live_dtb_pages = page_covering(live_dtb)?;
+
+    // SAFETY: initialization runs once after takeover on the boot CPU before
+    // any allocator client or asynchronous exception can access this state.
+    let allocator = unsafe {
+        PageAllocator::new(
+            memory_map.ram(),
+            memory_map.usable_ram(),
+            memory_map.usable_ram(),
+            &mut *PAGE_ALLOCATOR.managed.get(),
+            &mut *PAGE_ALLOCATOR.in_use.get(),
+        )?
+    };
+
     let mut page = live_dtb_pages.start().value();
     while page < live_dtb_pages.end().value() {
-        let state = with_allocator(|allocator| allocator.state(PhysAddr::new(page)))?;
-        if state == PageState::Unused {
-            return Err(AllocatorError::DoubleFree.into());
+        if allocator.state(PhysAddr::new(page))? != tvisor_util::page_allocator::PageState::Reserved
+        {
+            return Err(AllocatorInitError::DtbAllocatable);
         }
         page = page
             .checked_add(PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
     }
-    validate_live_dtb(live_dtb)?;
-    let reclaimed_test_page = first_unused_page_in(&info.reclaimable_regions, live_dtb_pages);
-    Ok(TakeoverResult {
-        released_pages,
-        stats: allocator_stats()?,
-        live_dtb,
-        reclaimed_test_page,
-    })
+
+    let stats = allocator.stats();
+    PAGE_ALLOCATOR
+        .ram_pages
+        .store(stats.ram_pages, Ordering::Relaxed);
+    PAGE_ALLOCATOR.initialized.store(true, Ordering::Release);
+    Ok(AllocatorInitResult { stats, live_dtb })
+}
+
+pub fn map_usable_ram(
+    memory_map: &MemoryMap,
+    live_dtb_pages: PhysRegion,
+) -> Result<(), PrepareError> {
+    let mut exclusions = FixedList::<PhysRegion, 1>::new();
+    exclusions
+        .push(live_dtb_pages)
+        .map_err(|_| PrepareError::Validation)?;
+
+    with_tables(|tables| {
+        map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
+        Ok(())
+    })?;
+
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi alle2",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+
+    Ok(())
 }
 
 /// Allocate the lowest-addressed unused managed 4 KiB physical page.
@@ -360,43 +358,12 @@ pub fn allocate_high_page() -> Result<PhysAddr, AllocatorError> {
     with_allocator(|allocator| allocator.allocate_high())
 }
 
-/// Allocate the lowest-addressed unused managed 4 KiB page inside `region`.
-///
-/// The search uses only complete pages covered by `region`: its start is
-/// rounded up and its end is rounded down to page boundaries. The region does
-/// not grant allocator ownership; reserved and already-in-use pages within it
-/// are skipped. The returned page is changed to `InUse`.
-pub fn allocate_page_in(region: PhysRegion) -> Result<PhysAddr, AllocatorError> {
-    with_allocator(|allocator| allocator.allocate_in(region))
-}
-
 pub fn free_page(page: PhysAddr) -> Result<(), AllocatorError> {
     with_allocator(|allocator| allocator.free(page))
 }
 
 pub fn allocator_stats() -> Result<AllocatorStats, AllocatorError> {
     with_allocator(|allocator| Ok(allocator.stats()))
-}
-
-fn first_unused_page_in<const N: usize>(
-    regions: &FixedList<PhysRegion, N>,
-    retained_pages: PhysRegion,
-) -> Option<PhysAddr> {
-    for region in regions {
-        let start = align_up(region.start().value(), PAGE_SIZE)?;
-        let end = region.end().value() & !(PAGE_SIZE - 1);
-        let mut page = start;
-        while page < end {
-            let address = PhysAddr::new(page);
-            if !retained_pages.contains_address(address)
-                && with_allocator(|allocator| allocator.state(address)).ok()? == PageState::Unused
-            {
-                return Some(address);
-            }
-            page = page.checked_add(PAGE_SIZE)?;
-        }
-    }
-    None
 }
 
 fn with_allocator<T>(
@@ -418,24 +385,22 @@ fn with_allocator<T>(
     operation(&mut allocator)
 }
 
-fn take_reclaim_memory_info() -> Result<ReclaimMemoryInfo, TakeoverError> {
-    if !PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
-        return Err(AllocatorError::NotInitialized.into());
-    }
-    // SAFETY: Phase 8 is single-core with asynchronous exceptions masked.
-    // Initialization published Some(info), and taking it makes reclamation a
-    // one-shot operation.
-    unsafe { (*RECLAIM_MEMORY_INFO.value.get()).take() }
-        .ok_or(TakeoverError::ReclaimMemoryInfoUnavailable)
+fn with_tables<T>(
+    operation: impl FnOnce(&mut TableSet<'static, MAX_TABLE_PAGES>) -> Result<T, PrepareError>,
+) -> Result<T, PrepareError> {
+    let mut guard = TVISOR_TABLES.lock();
+    let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
+    operation(tables)
 }
 
-fn validate_live_dtb(region: PhysRegion) -> Result<(), TakeoverError> {
+fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {
     if region.size() < 8 {
-        return Err(TakeoverError::InvalidDtb);
+        return Err(AllocatorInitError::InvalidDtb);
     }
     let base = region.start().value() as *const u8;
     // SAFETY: prepare mapped the validated live-DTB region read-only before
-    // switching tables, and complete_takeover retained all covering pages.
+    // switching tables, and the permanent reservation keeps all covering
+    // pages outside the allocator.
     let read_be32 = |offset: usize| unsafe {
         u32::from_be_bytes([
             core::ptr::read_volatile(base.add(offset)),
@@ -445,7 +410,7 @@ fn validate_live_dtb(region: PhysRegion) -> Result<(), TakeoverError> {
         ])
     };
     if read_be32(0) != 0xd00d_feed || u64::from(read_be32(4)) != region.size() {
-        return Err(TakeoverError::InvalidDtb);
+        return Err(AllocatorInitError::InvalidDtb);
     }
     Ok(())
 }
@@ -457,7 +422,7 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 // Create a mapping which VA is same to PA
-fn map_identity<const N: usize>(
+pub fn map_identity<const N: usize>(
     tables: &mut TableSet<'_, N>,
     start: u64,
     end: u64,
@@ -478,7 +443,28 @@ fn map_identity<const N: usize>(
     Ok(())
 }
 
-fn map_identity_regions_excluding<const T: usize, const R: usize, const E: usize>(
+/// Identity-map a page-aligned MMIO region using Device-nGnRE attributes.
+pub fn map_identity_device<const N: usize>(
+    tables: &mut TableSet<'_, N>,
+    region: PhysRegion,
+) -> Result<(), PrepareError> {
+    if region.start().value() & (PAGE_SIZE - 1) != 0 || region.end().value() & (PAGE_SIZE - 1) != 0
+    {
+        return Err(PrepareError::Validation);
+    }
+    tables.map(Mapping {
+        va: region.start().value(),
+        pa: region.start().value(),
+        size: region.size(),
+        memory_type: MemoryType::Device,
+        writable: true,
+        executable: false,
+    })?;
+    Ok(())
+}
+
+// Identity-map regions but excluding the exclusions part.
+pub fn map_identity_regions_excluding<const T: usize, const R: usize, const E: usize>(
     tables: &mut TableSet<'_, T>,
     regions: &FixedList<PhysRegion, R>,
     exclusions: &FixedList<PhysRegion, E>,
@@ -519,15 +505,27 @@ fn map_identity_regions_excluding<const T: usize, const R: usize, const E: usize
     Ok(())
 }
 
-fn validate<const N: usize>(
+pub fn validate_bootstrap_page_table<const N: usize>(
     tables: &TableSet<'_, N>,
     uart: u64,
-    arena_start: u64,
-    arena_end: u64,
     live_dtb_pages: PhysRegion,
 ) -> Result<(), PrepareError> {
+    let arena_start = link_addr!(__bootstrap_tables_start);
+    let arena_end = link_addr!(__bootstrap_tables_end);
     let checks = [
         (link_addr!(__text_start), false, true, MemoryType::Normal),
+        (
+            link_addr!(__payload_start),
+            false,
+            false,
+            MemoryType::Normal,
+        ),
+        (
+            link_addr!(__payload_end) - 1,
+            false,
+            false,
+            MemoryType::Normal,
+        ),
         (link_addr!(__vectors_start), false, true, MemoryType::Normal),
         (link_addr!(__rodata_start), false, false, MemoryType::Normal),
         (

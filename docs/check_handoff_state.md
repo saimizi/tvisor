@@ -1,5 +1,13 @@
 # U-Boot handoff-state diagnostic design
 
+> **Status:** This document records the completed, historical handoff
+> diagnostic milestone. The current tvisor performs an unconditional,
+> no-return takeover and no longer contains `tvisor_util/diag.rs` or constructs
+> a complete register snapshot. It retains the typed accessors in
+> `tvisor_util/aarch64_reg.rs`; `src/main.rs` first validates `CurrentEL`, then
+> reads only the registers required for safe platform discovery and takeover.
+> The register specifications below remain useful architectural reference.
+
 ## 1. Purpose
 
 Before tvisor replaces the execution environment inherited from U-Boot, it
@@ -14,14 +22,15 @@ must observe and document that environment. This diagnostic phase answers:
 - Which architectural features are implemented by the Cortex-A72?
 - Can tvisor report the state and return without changing it?
 
-The result will be evidence for a later, permanent handoff design. It is not
-the permanent handoff itself.
+The result served as evidence for the permanent handoff design. It was not the
+permanent handoff itself.
 
 ## 2. Scope and safety contract
 
-The diagnostic runs as an ELF application invoked by U-Boot `bootelf`. It uses
+At this historical milestone, the diagnostic ran as an ELF application invoked
+by U-Boot `bootelf`. It used
 the U-Boot stack, translation tables, exception vectors, interrupt state, and
-mini-UART configuration, then returns through the normal AArch64 calling
+mini-UART configuration, then returned through the normal AArch64 calling
 convention.
 
 During this phase tvisor may:
@@ -772,9 +781,9 @@ Policy:
 
 #### 6.7.3 Testing
 
-The accessor unit tests in `tvisor_util/diag.rs` build synthetic raw register
-values and can be run on the host, because the bare-metal `aarch64-unknown-none`
-target has no Rust test harness:
+The accessor unit tests now live in `tvisor_util/aarch64_reg.rs`. They build
+synthetic raw register values and can be run on the host, because the bare-metal
+`aarch64-unknown-none` target has no Rust test harness:
 
 ```bash
 cargo test --lib --target x86_64-unknown-linux-gnu
