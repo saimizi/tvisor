@@ -9,7 +9,6 @@ extern crate std;
 pub mod debug_util;
 
 pub mod aarch64_reg;
-pub mod boot_mode;
 pub mod el2_translation;
 pub mod fdt;
 pub mod guest_fdt;

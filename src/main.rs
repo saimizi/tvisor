@@ -4,7 +4,6 @@
 use core::arch::global_asm;
 use dtoolkit::standard::NodeStandard;
 use tvisor_util::aarch64_reg::*;
-use tvisor_util::boot_mode::fault_test_from_args;
 use tvisor_util::debug_util::{debug_init, stop};
 use tvisor_util::el2_translation::PAGE_SIZE;
 use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
@@ -95,14 +94,6 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         console.registers.start().value(),
         console.registers.size()
     );
-
-    let fault_test = match unsafe { fault_test_from_args(argc, argv) } {
-        Ok(fault_test) => fault_test,
-        Err(error) => {
-            println!("Invalid fault test: {}", error);
-            stop();
-        }
-    };
 
     // Validate the execution level before reading any trap-sensitive
     // registers. In particular, ID-group register reads performed at EL1
@@ -287,7 +278,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.
-    unsafe { boot::enter_private_el2(fault_test, tables.root_pa(), pa_range) }
+    unsafe { boot::enter_private_el2(tables.root_pa(), pa_range) }
 }
 
 #[panic_handler]

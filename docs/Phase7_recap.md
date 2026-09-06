@@ -174,25 +174,23 @@ The first Rust checkpoint under tvisor's tables:
 3. compares each value with the constructed value;
 4. verifies a stack-local canary;
 5. reads a canary from read-only image data;
-6. writes and reads a canary in writable image data; and
-7. optionally invokes one explicit exception or translation-fault test.
+6. writes and reads a canary in writable image data.
 
 Success ends in a `WFE` loop. There is intentionally no path back to U-Boot.
 
-## 10. Runtime test arguments
+## 10. Manual fault-injection tests
 
-Tvisor always takes over EL2 and installs its page tables. The parser accepts
-only an optional post-switch fault test:
+Tvisor does not accept a runtime argument for selecting a fault test. During
+development, a test can be enabled by uncommenting its diagnostic block in
+`src/boot.rs` and rebuilding tvisor:
 
-| Argument | Meaning |
+| Test | Meaning |
 | --- | --- |
-| `fault=none` | Do not trigger a deliberate fault |
-| `fault=sync` | Execute `BRK #0x600`; the handler advances `ELR_EL2` and returns with `eret` |
-| `fault=guard` | Write to the unmapped stack-guard page; report and halt |
-| `fault=unmapped` | Read VA `0x2000_0000`; report and halt |
+| Synchronous exception | Execute `BRK #0x600`; the handler advances `ELR_EL2` and returns with `eret` |
+| Stack guard | Write to the unmapped stack-guard page; report and halt |
+| Unmapped address | Read VA `0x2000_0000`; report and halt |
 
-Each run, including a run without a deliberate fault, must begin from a fresh
-board boot.
+Each deliberate-fault test must begin from a fresh board boot.
 
 ## 11. Hardware results
 
@@ -230,13 +228,12 @@ reporting remain usable after the switch.
    mapping conflict rules, walker, and constructed register values.
 3. `src/mm.rs`: review arena selection, mandatory mappings, guard omission,
    validation, and table-publication barrier.
-4. `tvisor_util/boot_mode.rs`: review the explicit switch and fault-test gates.
-5. `src/main.rs`: review all preconditions before entering the no-return path.
-6. `src/boot.rs`: review private entry, the assembly-only critical interval,
-   post-switch readback, canaries, and fault triggers.
-7. `src/exception.rs`: confirm that only the recognized `BRK #0x600` resumes
+4. `src/main.rs`: review all preconditions before entering the no-return path.
+5. `src/boot.rs`: review private entry, the assembly-only critical interval,
+   post-switch readback, canaries, and manual fault-injection snippets.
+6. `src/exception.rs`: confirm that only the recognized `BRK #0x600` resumes
    and all translation faults report and halt.
-8. `docs/tvisor_physical_memory.md`: compare the documented implemented
+7. `docs/tvisor_physical_memory.md`: compare the documented implemented
    regions with the current linker symbols.
 
 The most safety-sensitive review points are EL2 `XN` encoding, architectural

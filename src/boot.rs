@@ -3,7 +3,6 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use tvisor_util::boot_mode::FaultTest;
 use tvisor_util::debug_util::stop;
 use tvisor_util::el2_translation::is_page_aligned;
 use tvisor_util::page_allocator::AllocatorStats;
@@ -42,20 +41,10 @@ __enter_private_el2:
 );
 
 unsafe extern "C" {
-    fn __enter_private_el2(
-        fault_test: u64,
-        mair_el2: u64,
-        tcr_el2: u64,
-        ttbr0_el2: u64,
-        sctlr_el2: u64,
-    ) -> !;
+    fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
 }
 
-pub unsafe fn enter_private_el2(
-    fault_test: FaultTest,
-    bootstrap_table_root: u64,
-    pa_range: u8,
-) -> ! {
+pub unsafe fn enter_private_el2(bootstrap_table_root: u64, pa_range: u8) -> ! {
     if !is_page_aligned(bootstrap_table_root) {
         println!("Bootstrap page table is not page aligned");
         stop()
@@ -80,7 +69,6 @@ pub unsafe fn enter_private_el2(
 
     unsafe {
         __enter_private_el2(
-            fault_test as u64,
             MAIR_EL2_VALUE,
             tcr_el2,
             bootstrap_table_root,
@@ -90,13 +78,7 @@ pub unsafe fn enter_private_el2(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn private_el2_main(
-    fault_test: u64,
-    mair_el2: u64,
-    tcr_el2: u64,
-    ttbr0_el2: u64,
-    sctlr_el2: u64,
-) -> ! {
+extern "C" fn private_el2_main(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> ! {
     println!("Phase 6 private EL2 foundations active");
     println!("    SP: {:#018x}", Sp::dump().value);
     if let Some(spsel) = SpSel::dump() {
@@ -108,7 +90,7 @@ extern "C" fn private_el2_main(
     println!("Phase 7 checkpoint 1: switching EL2 page tables");
     // SAFETY: All values were validated before takeover, table stores were
     // published, and this routine never returns to the inherited regime.
-    unsafe { __switch_el2_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2, fault_test) }
+    unsafe { __switch_el2_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2) }
 }
 
 global_asm!(
@@ -118,7 +100,6 @@ global_asm!(
     .type __switch_el2_page_tables, %function
 __switch_el2_page_tables:
     // x0=MAIR_EL2, x1=TCR_EL2, x2=TTBR0_EL2, x3=SCTLR_EL2,
-    // x4=deliberate fault-test selector. This critical interval is a leaf:
     // it uses no stack, literal pool, call, or return address.
 
     // Disable EL2 stage1 translation
@@ -150,33 +131,18 @@ __switch_el2_page_tables:
     msr  sctlr_el2, x3
     isb
 
-    // Prepare for calling rust phase7_post_switch()
-    // Reorder the still-live expected values into the Rust AAPCS64 argument
-    // order: test, MAIR_EL2, TCR_EL2, TTBR0_EL2, SCTLR_EL2.
-    mov  x9, x0
-    mov  x0, x4
-    mov  x4, x3
-    mov  x3, x2
-    mov  x2, x1
-    mov  x1, x9
+    // Same parameter order  MAIR_EL2, TCR_EL2, TTBR0_EL2, SCTLR_EL2.
     b    phase7_post_switch
     .size __switch_el2_page_tables, . - __switch_el2_page_tables
 "#,
 );
 
 unsafe extern "C" {
-    fn __switch_el2_page_tables(
-        mair_el2: u64,
-        tcr_el2: u64,
-        ttbr0_el2: u64,
-        sctlr_el2: u64,
-        fault_test: u64,
-    ) -> !;
+    fn __switch_el2_page_tables(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn phase7_post_switch(
-    fault_test: u64,
     expected_mair: u64,
     expected_tcr: u64,
     expected_ttbr0: u64,
@@ -219,12 +185,18 @@ extern "C" fn phase7_post_switch(
     phase8_allocator_test(initialized.stats);
     crate::guest::run_phase9_guest_test();
 
-    if fault_test == FaultTest::Sync as u64 {
+    // Test exception vector
+    /*
+    {
         println!("Triggering deliberate synchronous exception under tvisor tables...");
         unsafe { asm!("brk #0x600") };
         println!("Returned from deliberate synchronous exception under tvisor tables");
     }
-    if fault_test == FaultTest::Guard as u64 {
+    */
+
+    // Test guard page
+    /*
+    {
         unsafe extern "C" {
             static __boot_stack_guard_start: u8;
         }
@@ -237,13 +209,19 @@ extern "C" fn phase7_post_switch(
         // returns; the private EL2 handler reports the translation fault.
         unsafe { core::ptr::write_volatile(guard, 0) };
     }
-    if fault_test == FaultTest::Unmapped as u64 {
+    */
+
+    // Test unmapped test va.
+    /*
+    {
         const UNMAPPED_TEST_VA: usize = 0x2000_0000;
         println!("Triggering deliberate unmapped read at {UNMAPPED_TEST_VA:#x}...");
         // SAFETY: This opt-in negative test deliberately faults and never
         // returns; the private EL2 handler reports the translation fault.
         let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
     }
+    */
+
     println!("Phase 9 checkpoint complete; halting");
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };

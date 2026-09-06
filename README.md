@@ -128,16 +128,6 @@ The complete tvisor runtime footprint must not overlap live U-Boot or firmware
 state. Initial EL2 tables come from tvisor's linker-owned bootstrap arena, so
 no `lmb=` or `bootmem=` arguments are accepted or required.
 
-Tvisor always installs its own EL2 stage-1 tables. An optional `fault=`
-argument selects a post-switch test:
-
-```text
-fault=none       no deliberate fault (default)
-fault=sync       execute BRK #0x600 and return through the EL2 handler
-fault=guard      write the unmapped stack guard and halt in the handler
-fault=unmapped   read an unmapped virtual address and halt in the handler
-```
-
 ### 5. Check the result
 
 A successful run should print:

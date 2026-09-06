@@ -173,8 +173,8 @@ The intended U-Boot invocation becomes conceptually:
 go <tvisor-entry> fdt=${fdt_addr}
 ```
 
-Optional diagnostic arguments such as `fault=` may remain. The `lmb=` and
-`bootmem=` arguments are removed.
+The `lmb=`, `bootmem=`, and diagnostic fault-test arguments are not part of
+the handoff interface.
 
 The bootloader-side contract is:
 
