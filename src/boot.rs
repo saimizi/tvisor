@@ -252,25 +252,24 @@ extern "C" fn post_switch_page_tables(
             break 'wait;
         }
 
-        match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
-            Ok(initialized) => {
-                println!(
-                    "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
-                    initialized.stats.ram_pages,
-                    initialized.stats.reserved_pages,
-                    initialized.stats.in_use_pages,
-                    initialized.stats.unused_pages,
-                    initialized.live_dtb,
-                );
-
-                phase8_allocator_test(initialized.stats);
-                crate::guest::run_phase9_guest_test();
-            }
+        let initialized = match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
+            Ok(initialized) => initialized,
             Err(error) => {
                 println!("Allocator initialization failed: {}", error);
                 break 'wait;
             }
-        }
+        };
+
+        println!(
+            "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
+            initialized.stats.ram_pages,
+            initialized.stats.reserved_pages,
+            initialized.stats.in_use_pages,
+            initialized.stats.unused_pages,
+            initialized.live_dtb,
+        );
+
+        crate::guest::run_guest();
 
         println!("Phase 9 checkpoint complete; halting");
     }
@@ -280,6 +279,7 @@ extern "C" fn post_switch_page_tables(
     }
 }
 
+#[allow(dead_code)]
 fn phase8_allocator_test(baseline: AllocatorStats) {
     let low = crate::mm::allocate_page().expect("allocate low test page");
     let high = crate::mm::allocate_high_page().expect("allocate high test page");

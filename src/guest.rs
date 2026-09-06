@@ -300,14 +300,14 @@ unsafe impl Stage2Allocator for &mut GuestResourceManager {
     }
 }
 
-pub fn run_phase9_guest_test() {
+pub fn run_guest() {
     println!("Phase 9: Preparing guest execution environment...");
 
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
 
     // 1. Processor PARange verification
     let mmfr0 = IdAa64Mmfr0El1::dump().expect("ID_AA64MMFR0_EL1 is available at EL2");
-    let parange = mmfr0.pa_range();
+    let pa_range = mmfr0.pa_range();
 
     let mut res_manager = GuestResourceManager::new();
     let mut stage2_active = false;
@@ -400,7 +400,7 @@ pub fn run_phase9_guest_test() {
         // 6. Build Stage-2 translation tables with distinct per-region permissions (4 KiB L3 leaves only).
         // Use the same implemented PA width for software descriptor validation
         // that stage2_register_values() encodes in VTCR_EL2.PS below.
-        let pa_bits = pa_bits_from_pa_range(parange)
+        let pa_bits = pa_bits_from_pa_range(pa_range)
             .map_err(|_| println!("  [ERR] Unsupported physical address range"))?;
         let mut stage2_tables = Stage2TableSet::new(&mut res_manager, pa_bits)
             .map_err(|_| println!("  [ERR] Failed to create Stage2TableSet"))?;
@@ -456,7 +456,7 @@ pub fn run_phase9_guest_test() {
             .map_err(|_| println!("  [ERR] Failed to map DTB page"))?;
 
         let stage2_root_pa = stage2_tables.root_pa();
-        let stage2_regs = stage2_register_values(1, stage2_root_pa, parange)
+        let stage2_regs = stage2_register_values(1, stage2_root_pa, pa_range)
             .map_err(|_| println!("  [ERR] Failed to build stage-2 registers"))?;
 
         println!(
