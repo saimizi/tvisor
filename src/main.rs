@@ -2,13 +2,12 @@
 #![no_main]
 
 use core::arch::global_asm;
-use dtoolkit::standard::NodeStandard;
+use dtoolkit::fdt::Fdt;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::{debug_init, stop};
 use tvisor_util::el2_translation::PAGE_SIZE;
 use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
-use tvisor_util::platform::discover_system_info_builder;
-use tvisor_util::system_info::{ConsoleKind, FixedList, PhysAddr, PhysRegion};
+use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysRegion};
 use tvisor_util::{halt, println};
 
 mod boot;
@@ -16,11 +15,6 @@ mod exception;
 mod guest;
 mod mm;
 mod vcpu;
-
-unsafe extern "C" {
-    static __image_start: u8;
-    static __image_end: u8;
-}
 
 global_asm!(
     r#"
@@ -49,236 +43,109 @@ main:
 "#,
 );
 
-#[unsafe(no_mangle)]
-extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
+fn console_init(
+    argc: isize,
+    argv: *const *const u8,
+) -> Option<(&'static Fdt<'static>, ConsoleInfo)> {
     // Before debug_init, startup must not access UART MMIO.
     let dtb_base = match unsafe { fdt_address_from_uboot_args(argc, argv) } {
         Ok(address) => address,
-        Err(_) => halt(),
+        Err(_) => return None,
     };
 
     // SAFETY: The U-Boot handoff contract requires fdt= to identify a complete,
     // readable DTB that remains unchanged while tvisor uses it.
     let fdt = match unsafe { fdt_init(dtb_base) } {
         Ok(fdt) => fdt,
-        Err(_) => halt(),
+        Err(_) => return None,
     };
 
     let console = match discover_console(*fdt) {
         Ok(console) => console,
-        Err(_) => halt(),
+        Err(_) => return None,
     };
 
     let console_register_base = match usize::try_from(console.registers.start().value()) {
         Ok(address) => address,
-        Err(_) => halt(),
+        Err(_) => return None,
     };
     match console.kind {
         ConsoleKind::MiniUart => debug_init(console_register_base),
     }
 
-    println!(
-        "DTB base={:#x}, version={}, size={:#x}",
-        dtb_base as usize,
-        fdt.version(),
-        fdt.data().len()
-    );
-    match fdt.root().model() {
-        Ok(Some(model)) => println!("DTB model={}", model),
-        Ok(None) => println!("DTB model=<missing>"),
-        Err(error) => println!("DTB model is invalid: {}", error),
-    }
-    println!(
-        "Console: {:?}, register_base={:#x}, register_size={:#x}",
-        console.kind,
-        console.registers.start().value(),
-        console.registers.size()
-    );
+    Some((fdt, console))
+}
 
+fn status_check() -> Result<(), ()> {
     // Validate the execution level before reading any trap-sensitive
     // registers. In particular, ID-group register reads performed at EL1
     // can be redirected to EL2 by HCR_EL2.TID3.
     let current_el = CurrentEL::dump();
     if current_el.current_el() != ExceptionLevel::EL2 {
         println!("CurrentEL: {:#018x}", current_el.value);
-        stop();
+        return Err(());
     }
 
     if SctlrEl2::dump().is_some_and(|s| s.bit_ee()) {
         println!("Handoff validation failed: SCTLR_EL2.EE selects big-endian data accesses");
-        stop();
+        return Err(());
     }
 
     if VbarEl2::dump().is_some_and(|v| !v.is_aligned()) {
         println!("Handoff validation failed: VBAR_EL2 is not 2 KiB aligned");
-        stop();
+        return Err(());
     }
 
     if IdAa64Pfr0El1::dump().is_some_and(|v| v.el2() == 0) {
         println!("Handoff validation failed: EL2 is not implemented");
-        stop();
+        return Err(());
     }
 
-    let Some(mpidr_el1) = MpidrEl1::dump() else {
+    if MpidrEl1::dump().is_none() {
         println!("Platform discovery failed: MPIDR_EL1 is unavailable");
-        stop();
+        return Err(());
     };
 
-    let image_start = core::ptr::addr_of!(__image_start) as u64;
-    let image_end = core::ptr::addr_of!(__image_end) as u64;
-    let tvisor_image =
-        match PhysRegion::from_bounds(PhysAddr::new(image_start), PhysAddr::new(image_end)) {
-            Ok(region) => region,
-            Err(error) => {
-                println!("Platform discovery failed: invalid tvisor image: {}", error);
-                stop();
-            }
-        };
-    let system_info_builder = match discover_system_info_builder(
-        *fdt,
-        PhysAddr::new(dtb_base as usize as u64),
-        tvisor_image,
-        console,
-        mpidr_el1.value,
-    ) {
-        Ok(info) => info,
-        Err(error) => {
-            println!("Platform discovery failed: {}", error);
-            stop();
-        }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
+    let Some((fdt, console)) = console_init(argc, argv) else {
+        halt();
     };
 
-    let system_info = match system_info_builder.finalize() {
-        Ok(info) => info,
-        Err(error) => {
-            println!("Memory-map normalization failed: {}", error);
-            stop();
-        }
+    if status_check().is_err() {
+        halt();
+    }
+
+    let live_dtb: PhysRegion = (*fdt).into();
+    let live_dtb_pages = match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE)
+    {
+        Ok(region) => region,
+        Err(_) => halt(),
     };
-
-    println!("{}", system_info);
-
-    let live_dtb = match PhysRegion::new(
-        PhysAddr::new(dtb_base as usize as u64),
-        fdt.data().len() as u64,
+    let uart_region = match PhysRegion::new_aligned(
+        console.registers.start(),
+        console.registers.size(),
+        PAGE_SIZE,
     ) {
         Ok(region) => region,
-        Err(error) => {
-            println!("Phase 8 allocator preparation failed: invalid DTB region: {error}");
-            stop();
-        }
+        Err(_) => halt(),
     };
-
-    // Check whether 4 KiB translation granules are supported.
-    let Some(mmfr0) = IdAa64Mmfr0El1::dump() else {
-        println!("Phase 7 table preparation failed: PARange is unavailable");
-        stop();
-    };
-    if mmfr0.tgran4() != 0 {
-        println!("Phase 7 requires 4 KiB translation-granule support");
-        stop();
-    }
-
-    let Some(hcr) = HcrEl2::dump() else {
-        println!("Phase 7 cannot validate HCR_EL2");
-        stop();
-    };
-    // The initial translation regime suppose
-    // * stage 2 translation is disabled
-    // * VHE is disabled.
-    if hcr.bit_vm() || hcr.bit_e2h() {
-        println!(
-            "Phase 7 requires HCR_EL2.VM=0 and E2H=0 (VM={} E2H={})",
-            hcr.bit_vm(),
-            hcr.bit_e2h()
-        );
-        stop();
-    }
 
     // Set up bootstrap page table
-    let pa_range = mmfr0.pa_range();
-    let Ok(mut tables) = mm::setup_bootstrap_page_table(pa_range) else {
-        println!("Failed to setup bootstrap page tables");
-        stop();
+    let bootstrap = match mm::setup_bootstrap_page_table(live_dtb_pages, uart_region) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            println!("Failed to setup bootstrap page tables: {}", error);
+            stop();
+        }
     };
 
-    // Map usable memory and DTB
-    {
-        // Map usable RAM to RW
-        let mut exclusive_list = FixedList::<PhysRegion, 1>::new();
-        let Ok(live_dtb_region) =
-            PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE)
-        else {
-            println!("Failed to remap live dtb region to page aligned.");
-            stop();
-        };
-
-        if exclusive_list.push(live_dtb_region).is_err() {
-            println!("Failed to create exclusive list");
-            stop();
-        }
-
-        if mm::map_identity_regions_excluding(
-            &mut tables,
-            system_info.memory().usable_ram(),
-            &exclusive_list,
-            true,
-            false,
-        )
-        .is_err()
-        {
-            println!("Failed to map useable memory region");
-            stop();
-        }
-
-        // Map live DTB region to R
-        if mm::map_identity(
-            &mut tables,
-            live_dtb_region.start().value(),
-            live_dtb_region.end().value(),
-            false,
-            false,
-        )
-        .is_err()
-        {
-            println!("Failed to map live dtb region");
-            stop();
-        };
-
-        let Ok(console_registers) = PhysRegion::new_aligned(
-            console.registers.start(),
-            console.registers.size(),
-            PAGE_SIZE,
-        ) else {
-            println!("Failed to align console MMIO region");
-            stop();
-        };
-        if mm::map_identity_device(&mut tables, console_registers).is_err() {
-            println!("Failed to map console MMIO region");
-            stop();
-        }
-
-        if mm::validate_bootstrap_page_table(
-            &tables,
-            console.registers.start().value(),
-            live_dtb_region,
-        )
-        .is_err()
-        {
-            println!("Bootstrap page-table validation failed");
-            stop();
-        }
-    }
-
-    if mm::prepare_allocator_after_takeover(system_info.into_memory(), live_dtb).is_err() {
-        println!("Failed to retain memory map for allocator initialization");
-        stop();
-    }
-
-    println!("Entering private EL2 no-return path...");
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.
-    unsafe { boot::enter_private_el2(tables.root_pa(), pa_range) }
+    unsafe { boot::enter_private_el2(bootstrap) }
 }
 
 #[panic_handler]

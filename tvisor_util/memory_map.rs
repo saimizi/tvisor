@@ -1,30 +1,28 @@
 use core::fmt;
 
-use crate::system_info::{
-    FixedList, MAX_DYNAMIC_ALLOC_RANGES, MAX_DYNAMIC_RESERVATIONS, MAX_MMIO_REGIONS,
-    MAX_RAM_REGIONS, MAX_RESERVED_REGIONS, PhysRegion, RamSource, RegionError, SystemInfoBuilder,
-};
+use crate::system_info::{FixedList, PhysRegion, RegionError};
 
-pub const MAX_NORMALIZED_RESERVED_REGIONS: usize =
-    MAX_RESERVED_REGIONS + MAX_DYNAMIC_RESERVATIONS * MAX_DYNAMIC_ALLOC_RANGES + MAX_RAM_REGIONS;
+pub const MAX_RAM_REGIONS: usize = 8;
+pub const MAX_MMIO_REGIONS: usize = 64;
+pub const MAX_NORMALIZED_RESERVED_REGIONS: usize = 192;
 pub const MAX_USABLE_RAM_REGIONS: usize = MAX_RAM_REGIONS + MAX_NORMALIZED_RESERVED_REGIONS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryMapError {
-    Capacity,
+    Capacity { capacity: usize },
     InvalidRegion(RegionError),
-    UnboundedDynamicReservation,
     RamMmioConflict { ram: PhysRegion, mmio: PhysRegion },
 }
 
 impl fmt::Display for MemoryMapError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Capacity => formatter.write_str("normalized memory-map capacity is insufficient"),
-            Self::InvalidRegion(error) => write!(formatter, "invalid normalized region: {error}"),
-            Self::UnboundedDynamicReservation => formatter.write_str(
-                "a dynamic reservation has no alloc-ranges; its possible placement is unknown",
+            Self::Capacity { capacity } => write!(
+                formatter,
+                "normalized memory-map capacity is insufficient (capacity {})",
+                capacity
             ),
+            Self::InvalidRegion(error) => write!(formatter, "invalid normalized region: {error}"),
             Self::RamMmioConflict { ram, mmio } => {
                 write!(formatter, "RAM {ram} overlaps MMIO {mmio}")
             }
@@ -33,105 +31,70 @@ impl fmt::Display for MemoryMapError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-/// Normalized physical-address classification derived from temporary platform
-/// discovery records.
+/// Final physical-address classification built in place during DTB discovery.
 ///
-/// Every list is sorted and has overlapping or adjacent regions merged. The
-/// usable-RAM view is the allocator input after tvisor has installed its own
-/// EL2 execution environment.
+/// Each list remains sorted and merged as entries are inserted. This permits
+/// the boot path to construct one statically stored map without raw-list or
+/// normalized-map temporaries.
 pub struct MemoryMap {
-    /// Physical RAM reported by the platform, including firmware carve-outs.
-    ///
-    /// This is the containing RAM inventory, not an allocation list; regions
-    /// in either reservation list must still be excluded before use.
+    /// All physical RAM reported by the platform, including firmware
+    /// carve-outs that are represented separately as permanent reservations.
     ram: FixedList<PhysRegion, MAX_RAM_REGIONS>,
-    /// RAM that remains unavailable after tvisor takes ownership.
-    ///
-    /// This includes permanent DTB/firmware reservations and the possible
-    /// placement windows of dynamic reservations whose placement tvisor does
-    /// not yet control. These regions are subtracted from usable RAM.
+    /// RAM that tvisor must not allocate after takeover.
     permanent_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS>,
-    /// CPU physical-address windows classified as MMIO rather than RAM.
-    ///
-    /// These regions are never allocator input and must be mapped with Device
-    /// attributes when tvisor needs to access them.
+    /// Physical device windows. These addresses are not allocator input.
     mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS>,
-    /// RAM allocatable after tvisor has completed takeover.
-    ///
-    /// It is `ram` minus every permanent reservation. Bootstrap table storage
-    /// comes from the linker-owned tvisor image rather than this list.
+    /// `ram` minus every permanent reservation, rebuilt by `finalize()`.
     usable_ram: FixedList<PhysRegion, MAX_USABLE_RAM_REGIONS>,
 }
 
 impl MemoryMap {
-    pub(crate) fn from_builder(info: &SystemInfoBuilder) -> Result<Self, MemoryMapError> {
-        let mut raw_ram: FixedList<PhysRegion, MAX_RAM_REGIONS> = FixedList::new();
-        for ram in info.ram() {
-            raw_ram
-                .push(ram.region)
-                .map_err(|_| MemoryMapError::Capacity)?;
+    pub const fn empty() -> Self {
+        Self {
+            ram: FixedList::new(),
+            permanent_reserved: FixedList::new(),
+            mmio: FixedList::new(),
+            usable_ram: FixedList::new(),
         }
-        let ram: FixedList<PhysRegion, MAX_RAM_REGIONS> = normalize(&raw_ram)?;
+    }
 
-        let mut raw_permanent: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            FixedList::new();
-        for ram in info.ram() {
-            if ram.source == RamSource::FirmwareCarveout {
-                raw_permanent
-                    .push(ram.region)
-                    .map_err(|_| MemoryMapError::Capacity)?;
-            }
-        }
-        for reserved in info.reserved() {
-            raw_permanent
-                .push(reserved.region)
-                .map_err(|_| MemoryMapError::Capacity)?;
-        }
-        for dynamic in info.dynamic_reserved() {
-            if dynamic.alloc_ranges().is_empty() {
-                return Err(MemoryMapError::UnboundedDynamicReservation);
-            }
-            // Until tvisor owns a placement policy, any address in an
-            // allocation range might be selected for this reservation.
-            for range in dynamic.alloc_ranges() {
-                raw_permanent
-                    .push(*range)
-                    .map_err(|_| MemoryMapError::Capacity)?;
-            }
-        }
-        let permanent_reserved: FixedList<PhysRegion, MAX_NORMALIZED_RESERVED_REGIONS> =
-            normalize(&raw_permanent)?;
+    pub fn clear(&mut self) {
+        self.ram.clear();
+        self.permanent_reserved.clear();
+        self.mmio.clear();
+        self.usable_ram.clear();
+    }
 
-        let mut raw_mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS> = FixedList::new();
-        for mmio in info.mmio() {
-            raw_mmio
-                .push(mmio.region)
-                .map_err(|_| MemoryMapError::Capacity)?;
-        }
-        let mmio: FixedList<PhysRegion, MAX_MMIO_REGIONS> = normalize(&raw_mmio)?;
+    pub fn insert_ram(&mut self, region: PhysRegion) -> Result<(), MemoryMapError> {
+        insert_sorted_merged(&mut self.ram, region)
+    }
 
-        for ram_region in &ram {
-            for mmio_region in &mmio {
-                if ram_region.overlaps(*mmio_region) {
+    pub fn insert_reserved(&mut self, region: PhysRegion) -> Result<(), MemoryMapError> {
+        insert_sorted_merged(&mut self.permanent_reserved, region)
+    }
+
+    pub fn insert_mmio(&mut self, region: PhysRegion) -> Result<(), MemoryMapError> {
+        insert_sorted_merged(&mut self.mmio, region)
+    }
+
+    pub fn finalize(&mut self) -> Result<(), MemoryMapError> {
+        for ram in &self.ram {
+            for mmio in &self.mmio {
+                if ram.overlaps(*mmio) {
                     return Err(MemoryMapError::RamMmioConflict {
-                        ram: *ram_region,
-                        mmio: *mmio_region,
+                        ram: *ram,
+                        mmio: *mmio,
                     });
                 }
             }
         }
 
-        let mut usable_ram = FixedList::new();
-        for ram_region in &ram {
-            subtract_all(*ram_region, &permanent_reserved, &mut usable_ram)?;
+        self.usable_ram.clear();
+        for ram in &self.ram {
+            subtract_all(*ram, &self.permanent_reserved, &mut self.usable_ram)?;
         }
 
-        Ok(Self {
-            ram,
-            permanent_reserved,
-            mmio,
-            usable_ram,
-        })
+        Ok(())
     }
 
     pub const fn ram(&self) -> &FixedList<PhysRegion, MAX_RAM_REGIONS> {
@@ -148,37 +111,73 @@ impl MemoryMap {
     }
 }
 
-fn normalize<const IN: usize, const OUT: usize>(
-    input: &FixedList<PhysRegion, IN>,
-) -> Result<FixedList<PhysRegion, OUT>, MemoryMapError> {
-    let mut output: FixedList<PhysRegion, OUT> = FixedList::new();
-    let mut consumed = [false; IN];
-    for _ in 0..input.len() {
-        let (index, region) = input
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !consumed[*index])
-            .min_by_key(|(_, region)| region.start())
-            .expect("one unconsumed input region");
-        let mut region = *region;
-        consumed[index] = true;
+fn merge_regions(a: PhysRegion, b: PhysRegion) -> Result<PhysRegion, MemoryMapError> {
+    let start = if a.start().value() < b.start().value() {
+        a.start()
+    } else {
+        b.start()
+    };
+    let end = if a.end().value() > b.end().value() {
+        a.end()
+    } else {
+        b.end()
+    };
+    PhysRegion::from_bounds(start, end).map_err(MemoryMapError::InvalidRegion)
+}
 
-        if let Some(last) = output.get_mut(output.len().saturating_sub(1))
-            && (last.overlaps(region) || last.is_adjacent(region))
-        {
-            let end = if last.end() > region.end() {
-                last.end()
-            } else {
-                region.end()
-            };
-            region = PhysRegion::from_bounds(last.start(), end)
-                .map_err(MemoryMapError::InvalidRegion)?;
-            *last = region;
-        } else {
-            output.push(region).map_err(|_| MemoryMapError::Capacity)?;
+fn insert_sorted_merged<const N: usize>(
+    list: &mut FixedList<PhysRegion, N>,
+    region: PhysRegion,
+) -> Result<(), MemoryMapError> {
+    let mut index = 0;
+    while index < list.len() && list.get(index).unwrap().start().value() < region.start().value() {
+        index += 1;
+    }
+
+    if index > 0 {
+        let prev = *list.get(index - 1).unwrap();
+        if prev.overlaps(region) || prev.is_adjacent(region) {
+            let merged = merge_regions(prev, region)?;
+            *list.get_mut(index - 1).unwrap() = merged;
+            while index < list.len() {
+                let previous = *list.get(index - 1).unwrap();
+                let current = *list.get(index).unwrap();
+                if previous.overlaps(current) || previous.is_adjacent(current) {
+                    let new_merged = merge_regions(previous, current)?;
+                    *list.get_mut(index - 1).unwrap() = new_merged;
+                    list.remove(index);
+                } else {
+                    break;
+                }
+            }
+            return Ok(());
         }
     }
-    Ok(output)
+
+    if index < list.len() {
+        let current = *list.get(index).unwrap();
+        if current.overlaps(region) || current.is_adjacent(region) {
+            let merged = merge_regions(current, region)?;
+            *list.get_mut(index).unwrap() = merged;
+
+            let next_index = index + 1;
+            while next_index < list.len() {
+                let previous = *list.get(next_index - 1).unwrap();
+                let current = *list.get(next_index).unwrap();
+                if previous.overlaps(current) || previous.is_adjacent(current) {
+                    let new_merged = merge_regions(previous, current)?;
+                    *list.get_mut(next_index - 1).unwrap() = new_merged;
+                    list.remove(next_index);
+                } else {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    list.insert(index, region)
+        .map_err(|_| MemoryMapError::Capacity { capacity: N })
 }
 
 fn subtract_all(
@@ -197,7 +196,9 @@ fn subtract_all(
                     PhysRegion::from_bounds(cursor, reservation.start())
                         .map_err(MemoryMapError::InvalidRegion)?,
                 )
-                .map_err(|_| MemoryMapError::Capacity)?;
+                .map_err(|_| MemoryMapError::Capacity {
+                    capacity: output.capacity(),
+                })?;
         }
         if reservation.end() >= ram.end() {
             return Ok(());
@@ -210,7 +211,9 @@ fn subtract_all(
                 PhysRegion::from_bounds(cursor, ram.end())
                     .map_err(MemoryMapError::InvalidRegion)?,
             )
-            .map_err(|_| MemoryMapError::Capacity)?;
+            .map_err(|_| MemoryMapError::Capacity {
+                capacity: output.capacity(),
+            })?;
     }
     Ok(())
 }
@@ -237,39 +240,23 @@ impl fmt::Display for MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_info::{
-        DynamicReservation, MmioKind, MmioRegion, PhysAddr, RamRegion, ReservationAttributes,
-        ReservationOrigin, ReservationOwner, ReservedRegion,
-    };
+    use crate::system_info::PhysAddr;
 
     fn region(start: u64, size: u64) -> PhysRegion {
         PhysRegion::new(PhysAddr::new(start), size).unwrap()
     }
 
-    fn reserve(info: &mut SystemInfoBuilder, start: u64, size: u64) {
-        info.add_reserved(ReservedRegion {
-            region: region(start, size),
-            origin: ReservationOrigin::Unknown,
-            owner: ReservationOwner::Unknown,
-            attributes: ReservationAttributes::default(),
-        })
-        .unwrap();
-    }
-
     #[test]
     fn sorts_merges_and_subtracts_all_overlap_shapes() {
-        let mut info = SystemInfoBuilder::new();
-        info.add_ram(RamRegion {
-            region: region(0x1000, 0x9000),
-            source: RamSource::DeviceTree,
-        })
-        .unwrap();
-        reserve(&mut info, 0x7000, 0x1000);
-        reserve(&mut info, 0x3000, 0x1000);
-        reserve(&mut info, 0x3800, 0x1800);
-        reserve(&mut info, 0x9000, 0x2000);
+        let mut map = MemoryMap::empty();
+        map.insert_ram(region(0x1000, 0x9000)).unwrap();
+        map.insert_reserved(region(0x7000, 0x1000)).unwrap();
+        map.insert_reserved(region(0x3000, 0x1000)).unwrap();
+        map.insert_reserved(region(0x3800, 0x1800)).unwrap();
+        map.insert_reserved(region(0x9000, 0x2000)).unwrap();
 
-        let map = MemoryMap::from_builder(&info).unwrap();
+        map.finalize().unwrap();
+
         assert_eq!(map.reserved().len(), 3);
         assert_eq!(
             map.usable_ram()
@@ -286,31 +273,14 @@ mod tests {
 
     #[test]
     fn inventories_firmware_carveout_but_excludes_it_from_usable_ram() {
-        let mut info = SystemInfoBuilder::new();
-        info.add_ram(RamRegion {
-            region: region(0, 0x8000),
-            source: RamSource::DeviceTree,
-        })
-        .unwrap();
-        info.add_ram(RamRegion {
-            region: region(0x8000, 0x1000),
-            source: RamSource::FirmwareCarveout,
-        })
-        .unwrap();
-        let mut dynamic = DynamicReservation::new(
-            0x1000,
-            Some(0x1000),
-            ReservationOrigin::ReservedMemoryNode,
-            ReservationOwner::HostPolicy,
-            ReservationAttributes {
-                no_map: false,
-                reusable: true,
-            },
-        )
-        .unwrap();
-        dynamic.add_alloc_range(region(0x2000, 0x3000)).unwrap();
-        info.add_dynamic_reserved(dynamic).unwrap();
-        let map = MemoryMap::from_builder(&info).unwrap();
+        let mut map = MemoryMap::empty();
+        map.insert_ram(region(0, 0x8000)).unwrap();
+        map.insert_ram(region(0x8000, 0x1000)).unwrap();
+        map.insert_reserved(region(0x2000, 0x3000)).unwrap();
+        map.insert_reserved(region(0x8000, 0x1000)).unwrap();
+
+        map.finalize().unwrap();
+
         assert_eq!(
             map.ram().iter().copied().collect::<std::vec::Vec<_>>(),
             [region(0, 0x9000)]
@@ -329,62 +299,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbounded_dynamic_reservation_and_ram_mmio_conflict() {
-        let mut info = SystemInfoBuilder::new();
-        info.add_ram(RamRegion {
-            region: region(0x1_0000_0000, 0x4000),
-            source: RamSource::DeviceTree,
-        })
-        .unwrap();
-        let dynamic = DynamicReservation::new(
-            0x1000,
-            None,
-            ReservationOrigin::ReservedMemoryNode,
-            ReservationOwner::HostPolicy,
-            ReservationAttributes::default(),
-        )
-        .unwrap();
-        info.add_dynamic_reserved(dynamic).unwrap();
-        assert_eq!(
-            MemoryMap::from_builder(&info),
-            Err(MemoryMapError::UnboundedDynamicReservation)
-        );
+    fn rejects_ram_mmio_conflict() {
+        let mut map = MemoryMap::empty();
+        map.insert_ram(region(0x1_0000_0000, 0x4000)).unwrap();
+        map.insert_mmio(region(0x1_0000_1000, 0x1000)).unwrap();
 
-        let mut info = SystemInfoBuilder::new();
-        info.add_ram(RamRegion {
-            region: region(0x1_0000_0000, 0x4000),
-            source: RamSource::DeviceTree,
-        })
-        .unwrap();
-        info.add_mmio(MmioRegion {
-            region: region(0x1_0000_1000, 0x1000),
-            kind: MmioKind::Device,
-        })
-        .unwrap();
         assert!(matches!(
-            MemoryMap::from_builder(&info),
+            map.finalize(),
             Err(MemoryMapError::RamMmioConflict { .. })
         ));
     }
 
     #[test]
     fn every_explicit_reservation_is_excluded_from_usable_ram() {
-        let mut info = SystemInfoBuilder::new();
-        info.add_ram(RamRegion {
-            region: region(0, 0x10_000),
-            source: RamSource::DeviceTree,
-        })
-        .unwrap();
-        reserve(&mut info, 0x2000, 0x1000);
-        info.add_reserved(ReservedRegion {
-            region: region(0x8000, 0x2000),
-            origin: ReservationOrigin::Bootloader,
-            owner: ReservationOwner::Bootloader,
-            attributes: ReservationAttributes::default(),
-        })
-        .unwrap();
+        let mut map = MemoryMap::empty();
+        map.insert_ram(region(0, 0x10_000)).unwrap();
+        map.insert_reserved(region(0x2000, 0x1000)).unwrap();
+        map.insert_reserved(region(0x8000, 0x2000)).unwrap();
 
-        let map = MemoryMap::from_builder(&info).unwrap();
+        map.finalize().unwrap();
+
         assert_eq!(
             map.reserved().iter().copied().collect::<std::vec::Vec<_>>(),
             [region(0x2000, 0x1000), region(0x8000, 0x2000)]

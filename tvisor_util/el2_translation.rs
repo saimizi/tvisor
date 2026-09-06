@@ -214,13 +214,17 @@ impl<'a, const N: usize> TableSet<'a, N> {
         base_pa: u64,
         pa_bits: u8,
     ) -> Result<Self, TranslationError> {
+        if !(32..=48).contains(&pa_bits) {
+            return Err(TranslationError::InvalidPaBits);
+        }
+
         // Check `base_pa` is PAGE_SIZE aligned.
-        if base_pa & (PAGE_SIZE - 1) != 0 {
+        if !is_page_aligned(base_pa) {
             return Err(TranslationError::InvalidTableBase);
         }
 
-        if !(32..=48).contains(&pa_bits) {
-            return Err(TranslationError::InvalidPaBits);
+        if base_pa >= 1_u64 << pa_bits {
+            return Err(TranslationError::InvalidTableBase);
         }
 
         // Page numbers included in the page table
@@ -247,7 +251,7 @@ impl<'a, const N: usize> TableSet<'a, N> {
             pa_bits,
         };
 
-        // Allocat L1 root table page. It is the first page of the page table.
+        // Allocate L1 root table page. It is the first page of the page table.
         set.allocate_page()?;
         Ok(set)
     }

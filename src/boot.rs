@@ -3,14 +3,31 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use spin::Mutex;
+use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::stop;
-use tvisor_util::el2_translation::is_page_aligned;
+use tvisor_util::el2_translation::{PAGE_SIZE, is_page_aligned};
+use tvisor_util::fdt::fdt;
+use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::AllocatorStats;
+use tvisor_util::platform::discover_memory_map;
 use tvisor_util::println;
-use tvisor_util::{aarch64_reg::*, el2_translation::is_in_physical_address_range};
+use tvisor_util::system_info::{PhysAddr, PhysRegion};
+
+use crate::mm;
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
+// Boot-time memory discovery writes directly into this tvisor-owned `.bss`
+// object so the private EL2 stack holds only a mutex guard and references.
+static MEMORY_MAP: Mutex<MemoryMap> = Mutex::new(MemoryMap::empty());
+
+unsafe extern "C" {
+    fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
+    fn __switch_el2_page_tables(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
+    static __image_start: u8;
+    static __image_end: u8;
+}
 
 global_asm!(
     r#"
@@ -40,18 +57,9 @@ __enter_private_el2:
 "#,
 );
 
-unsafe extern "C" {
-    fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
-}
-
-pub unsafe fn enter_private_el2(bootstrap_table_root: u64, pa_range: u8) -> ! {
-    if !is_page_aligned(bootstrap_table_root) {
+pub unsafe fn enter_private_el2(bootstrap: mm::BootstrapPageTable) -> ! {
+    if !is_page_aligned(bootstrap.root_pa) {
         println!("Bootstrap page table is not page aligned");
-        stop()
-    }
-
-    if is_in_physical_address_range(bootstrap_table_root, pa_range) != Ok(true) {
-        println!("Bootstrap page table is not in physical address range");
         stop()
     }
 
@@ -60,21 +68,14 @@ pub unsafe fn enter_private_el2(bootstrap_table_root: u64, pa_range: u8) -> ! {
         | TCR_EL2_IRGN0_MEM_WB_RA_WA
         | TCR_EL2_ORGN0_MEM_WB_RA_WA
         | TCR_EL2_SH0_INNER_SHAREABLE
-        | ((pa_range as u64) << 16);
+        | ((bootstrap.pa_range as u64) << 16);
 
     const SCTLR_EL2_RES1: u64 =
         (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
     const SCTLR_EL2_VALUE: u64 =
         SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
 
-    unsafe {
-        __enter_private_el2(
-            MAIR_EL2_VALUE,
-            tcr_el2,
-            bootstrap_table_root,
-            SCTLR_EL2_VALUE,
-        )
-    }
+    unsafe { __enter_private_el2(MAIR_EL2_VALUE, tcr_el2, bootstrap.root_pa, SCTLR_EL2_VALUE) }
 }
 
 #[unsafe(no_mangle)]
@@ -132,22 +133,17 @@ __switch_el2_page_tables:
     isb
 
     // Same parameter order  MAIR_EL2, TCR_EL2, TTBR0_EL2, SCTLR_EL2.
-    b    phase7_post_switch
+    b    post_switch_page_tables
     .size __switch_el2_page_tables, . - __switch_el2_page_tables
 "#,
 );
 
-unsafe extern "C" {
-    fn __switch_el2_page_tables(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn phase7_post_switch(
+fn check_switched_environment(
     expected_mair: u64,
     expected_tcr: u64,
     expected_ttbr0: u64,
     expected_sctlr: u64,
-) -> ! {
+) {
     let stack_canary = 0x7476_6973_6f72_5037_u64;
     println!("Phase 7 checkpoint 2: tvisor EL2 page tables active");
     let actual_mair = MairEl2::dump().expect("EL2 MAIR readback").value;
@@ -170,59 +166,115 @@ extern "C" fn phase7_post_switch(
         0x5037_7772_6974_6162
     );
     println!("Phase 7 checkpoint 3: register, stack, and image validation passed");
+}
 
-    let initialized =
-        crate::mm::initialize_allocator_after_takeover().expect("Phase 8 allocator initialization");
+#[allow(dead_code)]
+fn exception_vector_test() {
+    println!("Triggering deliberate synchronous exception under tvisor tables...");
+    unsafe { asm!("brk #0x600") };
+    println!("Returned from deliberate synchronous exception under tvisor tables");
+}
+
+#[allow(dead_code)]
+fn guard_page_test() {
+    unsafe extern "C" {
+        static __boot_stack_guard_start: u8;
+    }
+    let guard = core::ptr::addr_of!(__boot_stack_guard_start).cast_mut();
     println!(
-        "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
-        initialized.stats.ram_pages,
-        initialized.stats.reserved_pages,
-        initialized.stats.in_use_pages,
-        initialized.stats.unused_pages,
-        initialized.live_dtb,
+        "Triggering deliberate guard-page write at {:#x}...",
+        guard.addr()
     );
+    // SAFETY: This opt-in negative test deliberately faults and never
+    // returns; the private EL2 handler reports the translation fault.
+    unsafe { core::ptr::write_volatile(guard, 0) };
+}
 
-    phase8_allocator_test(initialized.stats);
-    crate::guest::run_phase9_guest_test();
+#[allow(dead_code)]
+fn unmap_test() {
+    const UNMAPPED_TEST_VA: usize = 0x2000_0000;
+    println!("Triggering deliberate unmapped read at {UNMAPPED_TEST_VA:#x}...");
+    // SAFETY: This opt-in negative test deliberately faults and never
+    // returns; the private EL2 handler reports the translation fault.
+    let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
+}
 
-    // Test exception vector
-    /*
-    {
-        println!("Triggering deliberate synchronous exception under tvisor tables...");
-        unsafe { asm!("brk #0x600") };
-        println!("Returned from deliberate synchronous exception under tvisor tables");
-    }
-    */
+#[unsafe(no_mangle)]
+extern "C" fn post_switch_page_tables(
+    expected_mair: u64,
+    expected_tcr: u64,
+    expected_ttbr0: u64,
+    expected_sctlr: u64,
+) -> ! {
+    'wait: {
+        check_switched_environment(expected_mair, expected_tcr, expected_ttbr0, expected_sctlr);
 
-    // Test guard page
-    /*
-    {
-        unsafe extern "C" {
-            static __boot_stack_guard_start: u8;
+        let image_start = core::ptr::addr_of!(__image_start) as u64;
+        let image_end = core::ptr::addr_of!(__image_end) as u64;
+        let tvisor_image =
+            match PhysRegion::from_bounds(PhysAddr::new(image_start), PhysAddr::new(image_end)) {
+                Ok(region) => region,
+                Err(error) => {
+                    println!("Platform discovery failed: invalid tvisor image: {}", error);
+                    break 'wait;
+                }
+            };
+
+        let Some(fdt) = fdt() else {
+            println!("No fdt found");
+            break 'wait;
+        };
+
+        let live_dtb: PhysRegion = (*fdt).into();
+        let live_dtb_pages =
+            match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE) {
+                Ok(region) => region,
+                Err(error) => {
+                    println!("Failed to page-align live DTB: {}", error);
+                    break 'wait;
+                }
+            };
+
+        let mut memory_map_guard = MEMORY_MAP.lock();
+        if let Err(error) = discover_memory_map(
+            *fdt,
+            PhysAddr::new(fdt.data().as_ptr() as usize as u64),
+            tvisor_image,
+            &mut memory_map_guard,
+        ) {
+            println!("Platform discovery failed: {}", error);
+            break 'wait;
         }
-        let guard = core::ptr::addr_of!(__boot_stack_guard_start).cast_mut();
-        println!(
-            "Triggering deliberate guard-page write at {:#x}...",
-            guard.addr()
-        );
-        // SAFETY: This opt-in negative test deliberately faults and never
-        // returns; the private EL2 handler reports the translation fault.
-        unsafe { core::ptr::write_volatile(guard, 0) };
-    }
-    */
 
-    // Test unmapped test va.
-    /*
-    {
-        const UNMAPPED_TEST_VA: usize = 0x2000_0000;
-        println!("Triggering deliberate unmapped read at {UNMAPPED_TEST_VA:#x}...");
-        // SAFETY: This opt-in negative test deliberately faults and never
-        // returns; the private EL2 handler reports the translation fault.
-        let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
-    }
-    */
+        let memory_map: &MemoryMap = &memory_map_guard;
+        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb_pages) {
+            println!("Failed to map usable RAM: {}", error);
+            break 'wait;
+        }
 
-    println!("Phase 9 checkpoint complete; halting");
+        match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
+            Ok(initialized) => {
+                println!(
+                    "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
+                    initialized.stats.ram_pages,
+                    initialized.stats.reserved_pages,
+                    initialized.stats.in_use_pages,
+                    initialized.stats.unused_pages,
+                    initialized.live_dtb,
+                );
+
+                phase8_allocator_test(initialized.stats);
+                crate::guest::run_phase9_guest_test();
+            }
+            Err(error) => {
+                println!("Allocator initialization failed: {}", error);
+                break 'wait;
+            }
+        }
+
+        println!("Phase 9 checkpoint complete; halting");
+    }
+
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
