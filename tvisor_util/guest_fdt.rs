@@ -1,4 +1,8 @@
-//! Allocation-free Device Tree (DTB/FDT v17) serializer for guest EL1 execution.
+//! Guest Device Tree (DTB/FDT v17) construction for EL1 execution.
+//!
+//! Uses dtoolkit's mutable model to describe the guest platform and serialize
+//! it into the caller-provided guest-memory buffer. Building the intermediate
+//! tree requires the global Rust heap to have been initialized.
 //!
 //! Generates a minimal, valid Devicetree Blob describing:
 //! - `/` (root node with `#address-cells = <2>`, `#size-cells = <2>`)
@@ -6,20 +10,10 @@
 //! - `/cpus/cpu@0` (compatible `"arm,cortex-a72"`, `reg = <0>`)
 //! - `/memory@<base>` (memory regions covering exact mapped guest RAM)
 
+use alloc::{format, vec::Vec};
 use core::fmt;
 
-const FDT_MAGIC: u32 = 0xd00dfeed;
-const FDT_VERSION: u32 = 17;
-const FDT_LAST_COMP_VERSION: u32 = 16;
-const FDT_BOOT_CPUID_PHYS: u32 = 0;
-
-const FDT_BEGIN_NODE: u32 = 0x00000001;
-const FDT_END_NODE: u32 = 0x00000002;
-const FDT_PROP: u32 = 0x00000003;
-const FDT_END: u32 = 0x00000009;
-
-const HEADER_SIZE: usize = 40;
-const MEM_RSVMAP_SIZE: usize = 16; // One terminating empty reservation (2 x u64 zeros)
+use dtoolkit::model::{DeviceTree, DeviceTreeNode, DeviceTreeProperty};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestFdtError {
@@ -54,217 +48,30 @@ pub struct GuestFdtConfig<'a> {
     pub bootargs: Option<&'a str>,
 }
 
-struct FdtWriter<'a> {
-    buf: &'a mut [u8],
-    struct_pos: usize,
+fn property(name: &str, value: impl Into<Vec<u8>>) -> DeviceTreeProperty {
+    // All property names in this module are compile-time constants known to
+    // satisfy the Devicetree naming rules.
+    DeviceTreeProperty::new_unchecked(name, value)
 }
 
-impl<'a> FdtWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Result<Self, GuestFdtError> {
-        if buf.len() < HEADER_SIZE + MEM_RSVMAP_SIZE + 64 {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-        let struct_pos = HEADER_SIZE + MEM_RSVMAP_SIZE;
-        Ok(Self { buf, struct_pos })
-    }
-
-    fn write_u32_be(&mut self, offset: usize, val: u32) -> Result<(), GuestFdtError> {
-        if offset + 4 > self.buf.len() {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-        self.buf[offset..offset + 4].copy_from_slice(&val.to_be_bytes());
-        Ok(())
-    }
-
-    fn write_u64_be(&mut self, offset: usize, val: u64) -> Result<(), GuestFdtError> {
-        if offset + 8 > self.buf.len() {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-        self.buf[offset..offset + 8].copy_from_slice(&val.to_be_bytes());
-        Ok(())
-    }
-
-    fn emit_struct_u32(&mut self, val: u32) -> Result<(), GuestFdtError> {
-        let pos = self.struct_pos;
-        self.write_u32_be(pos, val)?;
-        self.struct_pos += 4;
-        Ok(())
-    }
-
-    fn emit_struct_bytes(&mut self, bytes: &[u8]) -> Result<(), GuestFdtError> {
-        let len = bytes.len();
-        let padded = (len + 3) & !3;
-        if self.struct_pos + padded > self.buf.len() {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-        self.buf[self.struct_pos..self.struct_pos + len].copy_from_slice(bytes);
-        for b in &mut self.buf[self.struct_pos + len..self.struct_pos + padded] {
-            *b = 0;
-        }
-        self.struct_pos += padded;
-        Ok(())
-    }
-
-    fn begin_node(&mut self, name: &str) -> Result<(), GuestFdtError> {
-        self.emit_struct_u32(FDT_BEGIN_NODE)?;
-        let mut name_buf = [0_u8; 64];
-        if name.len() >= name_buf.len() {
-            return Err(GuestFdtError::NameTooLong);
-        }
-        name_buf[..name.len()].copy_from_slice(name.as_bytes());
-        name_buf[name.len()] = 0;
-        self.emit_struct_bytes(&name_buf[..name.len() + 1])
-    }
-
-    fn end_node(&mut self) -> Result<(), GuestFdtError> {
-        self.emit_struct_u32(FDT_END_NODE)
-    }
-
-    fn prop_str_name(
-        &mut self,
-        name: &str,
-        val: &[u8],
-        string_table: &mut StringTable,
-    ) -> Result<(), GuestFdtError> {
-        let nameoff = string_table.add_string(name)?;
-        self.emit_struct_u32(FDT_PROP)?;
-        self.emit_struct_u32(val.len() as u32)?;
-        self.emit_struct_u32(nameoff)?;
-        self.emit_struct_bytes(val)
-    }
-
-    fn prop_u32(
-        &mut self,
-        name: &str,
-        val: u32,
-        string_table: &mut StringTable,
-    ) -> Result<(), GuestFdtError> {
-        self.prop_str_name(name, &val.to_be_bytes(), string_table)
-    }
-
-    fn prop_string(
-        &mut self,
-        name: &str,
-        val: &str,
-        string_table: &mut StringTable,
-    ) -> Result<(), GuestFdtError> {
-        let mut str_buf = [0_u8; 128];
-        if val.len() >= str_buf.len() {
-            return Err(GuestFdtError::PropertyTooLarge);
-        }
-        str_buf[..val.len()].copy_from_slice(val.as_bytes());
-        str_buf[val.len()] = 0;
-        self.prop_str_name(name, &str_buf[..val.len() + 1], string_table)
-    }
-
-    fn prop_string_list(
-        &mut self,
-        name: &str,
-        strings: &[&str],
-        string_table: &mut StringTable,
-    ) -> Result<(), GuestFdtError> {
-        let mut list_buf = [0_u8; 128];
-        let mut pos = 0;
-        for s in strings {
-            if pos + s.len() + 1 > list_buf.len() {
-                return Err(GuestFdtError::PropertyTooLarge);
-            }
-            list_buf[pos..pos + s.len()].copy_from_slice(s.as_bytes());
-            list_buf[pos + s.len()] = 0;
-            pos += s.len() + 1;
-        }
-        self.prop_str_name(name, &list_buf[..pos], string_table)
-    }
-
-    fn finish(mut self, string_table: &StringTable) -> Result<usize, GuestFdtError> {
-        self.emit_struct_u32(FDT_END)?;
-
-        let off_dt_struct = (HEADER_SIZE + MEM_RSVMAP_SIZE) as u32;
-        let size_dt_struct = (self.struct_pos - off_dt_struct as usize) as u32;
-
-        let off_dt_strings = self.struct_pos;
-        let strings_bytes = string_table.as_bytes();
-        let size_dt_strings = strings_bytes.len() as u32;
-
-        if off_dt_strings + size_dt_strings as usize > self.buf.len() {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-        self.buf[off_dt_strings..off_dt_strings + size_dt_strings as usize]
-            .copy_from_slice(strings_bytes);
-
-        let totalsize = (off_dt_strings + size_dt_strings as usize) as u32;
-
-        // Populate FDT Header
-        self.write_u32_be(0, FDT_MAGIC)?;
-        self.write_u32_be(4, totalsize)?;
-        self.write_u32_be(8, off_dt_struct)?;
-        self.write_u32_be(12, off_dt_strings as u32)?;
-        self.write_u32_be(16, HEADER_SIZE as u32)?; // off_mem_rsvmap
-        self.write_u32_be(20, FDT_VERSION)?;
-        self.write_u32_be(24, FDT_LAST_COMP_VERSION)?;
-        self.write_u32_be(28, FDT_BOOT_CPUID_PHYS)?;
-        self.write_u32_be(32, size_dt_strings)?;
-        self.write_u32_be(36, size_dt_struct)?;
-
-        // Populate empty Memory Reservation Map (terminating entry)
-        self.write_u64_be(HEADER_SIZE, 0)?;
-        self.write_u64_be(HEADER_SIZE + 8, 0)?;
-
-        Ok(totalsize as usize)
-    }
+fn string_value(value: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(value.len() + 1);
+    encoded.extend_from_slice(value.as_bytes());
+    encoded.push(0);
+    encoded
 }
 
-struct StringTable {
-    buf: [u8; 256],
-    len: usize,
+fn string_list_value(values: &[&str]) -> Vec<u8> {
+    let size = values.iter().map(|value| value.len() + 1).sum();
+    let mut encoded = Vec::with_capacity(size);
+    for value in values {
+        encoded.extend_from_slice(value.as_bytes());
+        encoded.push(0);
+    }
+    encoded
 }
 
-impl StringTable {
-    fn new() -> Self {
-        Self {
-            buf: [0; 256],
-            len: 0,
-        }
-    }
-
-    fn add_string(&mut self, s: &str) -> Result<u32, GuestFdtError> {
-        let bytes = s.as_bytes();
-        let target_len = bytes.len() + 1;
-
-        // Search for existing string in table
-        if self.len >= target_len {
-            let mut i = 0;
-            while i + target_len <= self.len {
-                if &self.buf[i..i + bytes.len()] == bytes && self.buf[i + bytes.len()] == 0 {
-                    return Ok(i as u32);
-                }
-                while i < self.len && self.buf[i] != 0 {
-                    i += 1;
-                }
-                i += 1; // Skip NUL
-            }
-        }
-
-        if self.len + target_len > self.buf.len() {
-            return Err(GuestFdtError::BufferTooSmall);
-        }
-
-        let nameoff = self.len as u32;
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.buf[self.len + bytes.len()] = 0;
-        self.len += target_len;
-        Ok(nameoff)
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-
-/// Serializes a minimal, valid guest FDT (DTB) into `buffer`.
-///
-/// Returns the number of bytes written to `buffer`.
-pub fn build_guest_dtb(buffer: &mut [u8], config: &GuestFdtConfig) -> Result<usize, GuestFdtError> {
+fn validate_config(config: &GuestFdtConfig<'_>) -> Result<(), GuestFdtError> {
     if config.memory_regions.is_empty() || config.memory_regions.len() > MAX_GUEST_MEMORY_REGIONS {
         return Err(GuestFdtError::InvalidConfiguration);
     }
@@ -279,89 +86,87 @@ pub fn build_guest_dtb(buffer: &mut [u8], config: &GuestFdtConfig) -> Result<usi
         }
     }
 
-    let mut string_table = StringTable::new();
-    let mut writer = FdtWriter::new(buffer)?;
-
-    // / (root node)
-    writer.begin_node("")?;
-    writer.prop_u32("#address-cells", 2, &mut string_table)?;
-    writer.prop_u32("#size-cells", 2, &mut string_table)?;
-    writer.prop_string("model", "tvisor-virt-v1", &mut string_table)?;
-    writer.prop_string_list(
-        "compatible",
-        &["tvisor,virt", "linux,dummy-virt"],
-        &mut string_table,
-    )?;
-
-    // /chosen
-    writer.begin_node("chosen")?;
-    if let Some(bootargs) = config.bootargs {
-        writer.prop_string("bootargs", bootargs, &mut string_table)?;
+    // Preserve the limit enforced by the former fixed-size serializer.
+    if config
+        .bootargs
+        .is_some_and(|bootargs| bootargs.len() >= 128)
+    {
+        return Err(GuestFdtError::PropertyTooLarge);
     }
-    writer.end_node()?; // /chosen
 
-    // /cpus
-    writer.begin_node("cpus")?;
-    writer.prop_u32("#address-cells", 1, &mut string_table)?;
-    writer.prop_u32("#size-cells", 0, &mut string_table)?;
-
-    // /cpus/cpu@0
-    writer.begin_node("cpu@0")?;
-    writer.prop_string("device_type", "cpu", &mut string_table)?;
-    writer.prop_string("compatible", "arm,cortex-a72", &mut string_table)?;
-    writer.prop_u32("reg", 0, &mut string_table)?;
-    writer.end_node()?; // /cpus/cpu@0
-    writer.end_node()?; // /cpus
-
-    // /memory@<base>
-    let primary_base = config.memory_regions[0].base;
-    let mut mem_node_name = [0_u8; 32];
-    let mem_name = format_mem_node_name(primary_base, &mut mem_node_name);
-    writer.begin_node(mem_name)?;
-    writer.prop_string("device_type", "memory", &mut string_table)?;
-
-    // reg = <base0 size0 base1 size1 ...> (16 bytes per region)
-    let mut reg_bytes = [0_u8; 64];
-    let total_len = config.memory_regions.len() * 16;
-    for (i, region) in config.memory_regions.iter().enumerate() {
-        let offset = i * 16;
-        reg_bytes[offset..offset + 8].copy_from_slice(&region.base.to_be_bytes());
-        reg_bytes[offset + 8..offset + 16].copy_from_slice(&region.size.to_be_bytes());
-    }
-    writer.prop_str_name("reg", &reg_bytes[..total_len], &mut string_table)?;
-    writer.end_node()?; // /memory@<base>
-
-    writer.end_node()?; // / (root)
-
-    writer.finish(&string_table)
+    Ok(())
 }
 
-fn format_mem_node_name(base: u64, buf: &mut [u8; 32]) -> &str {
-    const PREFIX: &[u8] = b"memory@";
-    buf[..PREFIX.len()].copy_from_slice(PREFIX);
-    let mut pos = PREFIX.len();
+fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
+    let mut tree = DeviceTree::new();
+    tree.root
+        .add_property(property("#address-cells", 2_u32.to_be_bytes().to_vec()));
+    tree.root
+        .add_property(property("#size-cells", 2_u32.to_be_bytes().to_vec()));
+    tree.root
+        .add_property(property("model", string_value("tvisor-virt-v1")));
+    tree.root.add_property(property(
+        "compatible",
+        string_list_value(&["tvisor,virt", "linux,dummy-virt"]),
+    ));
 
-    let hex_digits = b"0123456789abcdef";
-    let mut started = false;
-    for shift in (0..16).rev() {
-        let nibble = ((base >> (shift * 4)) & 0xf) as usize;
-        if nibble != 0 || started || shift == 0 {
-            started = true;
-            buf[pos] = hex_digits[nibble];
-            pos += 1;
-        }
+    let mut chosen = DeviceTreeNode::new_unchecked("chosen");
+    if let Some(bootargs) = config.bootargs {
+        chosen.add_property(property("bootargs", string_value(bootargs)));
+    }
+    tree.root.add_child(chosen);
+
+    let mut cpu = DeviceTreeNode::new_unchecked("cpu@0");
+    cpu.add_property(property("device_type", string_value("cpu")));
+    cpu.add_property(property("compatible", string_value("arm,cortex-a72")));
+    cpu.add_property(property("reg", 0_u32.to_be_bytes().to_vec()));
+
+    let mut cpus = DeviceTreeNode::new_unchecked("cpus");
+    cpus.add_property(property("#address-cells", 1_u32.to_be_bytes().to_vec()));
+    cpus.add_property(property("#size-cells", 0_u32.to_be_bytes().to_vec()));
+    cpus.add_child(cpu);
+    tree.root.add_child(cpus);
+
+    let primary_base = config.memory_regions[0].base;
+    let mut memory = DeviceTreeNode::new_unchecked(format!("memory@{primary_base:x}"));
+    memory.add_property(property("device_type", string_value("memory")));
+
+    let mut reg = Vec::with_capacity(config.memory_regions.len() * 16);
+    for region in config.memory_regions {
+        reg.extend_from_slice(&region.base.to_be_bytes());
+        reg.extend_from_slice(&region.size.to_be_bytes());
+    }
+    memory.add_property(property("reg", reg));
+    tree.root.add_child(memory);
+
+    tree
+}
+
+/// Serializes a minimal guest FDT into `buffer`.
+///
+/// Returns the number of bytes written. The global Rust allocator must be
+/// initialized before calling this function on the target.
+pub fn build_guest_dtb(
+    buffer: &mut [u8],
+    config: &GuestFdtConfig<'_>,
+) -> Result<usize, GuestFdtError> {
+    validate_config(config)?;
+
+    let dtb = build_tree(config).to_dtb();
+    if dtb.len() > buffer.len() {
+        return Err(GuestFdtError::BufferTooSmall);
     }
 
-    core::str::from_utf8(&buf[..pos]).unwrap_or("memory")
+    buffer[..dtb.len()].copy_from_slice(&dtb);
+    Ok(dtb.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dtoolkit::Node;
-    use dtoolkit::Property;
     use dtoolkit::fdt::Fdt;
     use dtoolkit::standard::NodeStandard;
+    use dtoolkit::{Node, Property};
 
     #[test]
     fn builds_valid_guest_dtb_parseable_by_fdt() {
@@ -388,55 +193,93 @@ mod tests {
         let size = build_guest_dtb(&mut buf, &config).expect("build guest dtb");
         assert!(size > 0 && size <= buf.len());
 
-        let dtb_slice = &buf[..size];
-        let fdt = Fdt::new(dtb_slice).expect("valid FDT blob");
+        let fdt = Fdt::new(&buf[..size]).expect("valid FDT blob");
         let root = fdt.root();
 
-        // Check root properties
         assert_eq!(root.address_cells().unwrap(), 2);
         assert_eq!(root.size_cells().unwrap(), 2);
-        let model = root.property("model").expect("model prop");
-        assert_eq!(model.as_str().unwrap(), "tvisor-virt-v1");
+        assert_eq!(
+            root.property("model").unwrap().as_str().unwrap(),
+            "tvisor-virt-v1"
+        );
+        let compatible: Vec<_> = root.property("compatible").unwrap().as_str_list().collect();
+        assert_eq!(compatible, ["tvisor,virt", "linux,dummy-virt"]);
 
-        // /chosen
         let chosen = root.child("chosen").expect("/chosen node");
         assert!(chosen.property("bootargs").is_none());
 
-        // /cpus/cpu@0
         let cpus = root.child("cpus").expect("/cpus node");
         let cpu0 = cpus.child("cpu@0").expect("/cpus/cpu@0");
-        let cpu_compat = cpu0.property("compatible").expect("cpu compatible");
-        assert_eq!(cpu_compat.as_str().unwrap(), "arm,cortex-a72");
+        assert_eq!(
+            cpu0.property("compatible").unwrap().as_str().unwrap(),
+            "arm,cortex-a72"
+        );
         assert!(cpu0.property("enable-method").is_none());
 
-        // Memory
         let mem = root
             .child("memory@40000000")
             .expect("/memory@40000000 node");
-        let device_type = mem.property("device_type").expect("device_type prop");
-        assert_eq!(device_type.as_str().unwrap(), "memory");
+        assert_eq!(
+            mem.property("device_type").unwrap().as_str().unwrap(),
+            "memory"
+        );
 
         let reg = mem.property("reg").expect("reg prop");
         assert_eq!(reg.value().len(), 48);
-        // Region 0
-        let base0 = u64::from_be_bytes(reg.value()[0..8].try_into().unwrap());
-        let size0 = u64::from_be_bytes(reg.value()[8..16].try_into().unwrap());
-        assert_eq!(base0, 0x4000_0000);
-        assert_eq!(size0, 0x0000_2000);
-        // Region 1
-        let base1 = u64::from_be_bytes(reg.value()[16..24].try_into().unwrap());
-        let size1 = u64::from_be_bytes(reg.value()[24..32].try_into().unwrap());
-        assert_eq!(base1, 0x4000_3000);
-        assert_eq!(size1, 0x0000_1000);
-        // Region 2
-        let base2 = u64::from_be_bytes(reg.value()[32..40].try_into().unwrap());
-        let size2 = u64::from_be_bytes(reg.value()[40..48].try_into().unwrap());
-        assert_eq!(base2, 0x4010_0000);
-        assert_eq!(size2, 0x0000_1000);
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[0..8].try_into().unwrap()),
+            0x4000_0000
+        );
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[8..16].try_into().unwrap()),
+            0x0000_2000
+        );
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[16..24].try_into().unwrap()),
+            0x4000_3000
+        );
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[24..32].try_into().unwrap()),
+            0x0000_1000
+        );
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[32..40].try_into().unwrap()),
+            0x4010_0000
+        );
+        assert_eq!(
+            u64::from_be_bytes(reg.value()[40..48].try_into().unwrap()),
+            0x0000_1000
+        );
     }
 
     #[test]
-    fn rejects_unaligned_ram_config() {
+    fn includes_bootargs() {
+        let mut buf = [0_u8; 1024];
+        let mem_regions = [GuestMemoryRegion {
+            base: 0x4000_0000,
+            size: 0x0020_0000,
+        }];
+        let config = GuestFdtConfig {
+            memory_regions: &mem_regions,
+            bootargs: Some("console=hvc0"),
+        };
+
+        let size = build_guest_dtb(&mut buf, &config).expect("build guest dtb");
+        let fdt = Fdt::new(&buf[..size]).expect("valid FDT blob");
+        assert_eq!(
+            fdt.root()
+                .child("chosen")
+                .unwrap()
+                .property("bootargs")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "console=hvc0"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ram_config() {
         let mut buf = [0_u8; 1024];
         let invalid_regions = [GuestMemoryRegion {
             base: 0x4000_0001,
