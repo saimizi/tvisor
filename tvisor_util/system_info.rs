@@ -1,5 +1,6 @@
 use core::fmt;
 
+use crate::{align_down, align_up};
 use dtoolkit::fdt::Fdt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,17 +52,6 @@ impl fmt::Display for RegionError {
 pub struct PhysRegion {
     start: PhysAddr,
     size: u64,
-}
-
-pub const fn align_down(value: u64, alignment: u64) -> u64 {
-    value & !(alignment - 1)
-}
-
-pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    match value.checked_add(alignment - 1) {
-        Some(value) => Some(align_down(value, alignment)),
-        None => None,
-    }
 }
 
 impl PhysRegion {

@@ -13,8 +13,8 @@ use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
 };
-use tvisor_util::println;
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
+use tvisor_util::{align_up, println};
 
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = MAX_TABLE_PAGES as u64 * PAGE_SIZE;
@@ -422,12 +422,6 @@ fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {
         return Err(AllocatorInitError::InvalidDtb);
     }
     Ok(())
-}
-
-fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
 }
 
 // Create a mapping which VA is same to PA
