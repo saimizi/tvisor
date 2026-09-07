@@ -1,8 +1,10 @@
 //! Guest platform initialization, Stage-2 translation setup, and Phase 9 test runner.
 
+use alloc::vec::Vec;
 use core::arch::global_asm;
 
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
+use tvisor_util::align_up;
 use tvisor_util::el2_translation::{PAGE_SIZE, TranslationError, pa_bits_from_pa_range};
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
 use tvisor_util::page_allocator::AllocatorError;
@@ -16,6 +18,10 @@ use tvisor_util::system_info::PhysAddr;
 use crate::mm;
 use crate::vcpu::{__vcpu_run, VcpuContext, VcpuExit, VcpuExitReason};
 
+pub const MAX_GUEST_MEM_BYTES: usize = 1024 * 1024;
+pub const MAX_GUEST_MEM_PAGES: usize = (align_up(MAX_GUEST_MEM_BYTES as u64, PAGE_SIZE)
+    .expect("MAX_GUEST_MEM_BYTES is overflowed")
+    / (PAGE_SIZE)) as usize;
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
 pub const GUEST_GUARD_IPA: u64 = 0x4000_2000;
@@ -242,54 +248,54 @@ unsafe fn deactivate_stage2() {
 
 /// Resource tracker that records every allocated guest page and provides transactional rollback.
 pub struct GuestResourceManager {
-    allocated_pages: [u64; 32],
-    allocated_count: usize,
+    allocated_pages: Vec<u64>,
 }
 
 impl GuestResourceManager {
     pub const fn new() -> Self {
         Self {
-            allocated_pages: [0; 32],
-            allocated_count: 0,
+            allocated_pages: Vec::new(),
         }
     }
 
     pub fn allocate_page(&mut self) -> Result<u64, AllocatorError> {
-        if self.allocated_count >= self.allocated_pages.len() {
+        if self.allocated_pages.len() >= MAX_GUEST_MEM_PAGES {
             return Err(AllocatorError::Exhausted);
         }
+
         let page = mm::allocate_page()?;
         let pa = page.value();
         unsafe {
             core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
         }
-        self.allocated_pages[self.allocated_count] = pa;
-        self.allocated_count += 1;
+        self.allocated_pages.push(pa);
         Ok(pa)
     }
 
     pub fn allocated_pages(&self) -> &[u64] {
-        &self.allocated_pages[..self.allocated_count]
+        &self.allocated_pages
     }
 
     pub fn allocated_count(&self) -> usize {
-        self.allocated_count
+        self.allocated_pages.len()
+    }
+
+    pub fn free_page(&mut self, pa: u64) {
+        if let Some(pos) = self.allocated_pages.iter().position(|&v| v == pa) {
+            self.allocated_pages.remove(pos);
+            if let Err(e) = mm::free_page(PhysAddr::new(pa)) {
+                println!("Free page error: {}", e);
+            }
+        }
     }
 
     /// Releases all tracked pages in reverse allocation order (LIFO).
-    ///
-    /// Decrements `allocated_count` only after each page is successfully returned
-    /// to the page allocator. If a free operation fails, the error is immediately
-    /// returned and the remaining pages remain recorded in `allocated_pages`.
-    pub fn rollback(&mut self) -> Result<(), AllocatorError> {
-        while self.allocated_count > 0 {
-            let last_idx = self.allocated_count - 1;
-            let pa = self.allocated_pages[last_idx];
-            mm::free_page(PhysAddr::new(pa))?;
-            self.allocated_pages[last_idx] = 0;
-            self.allocated_count -= 1;
+    pub fn rollback(&mut self) {
+        while let Some(pa) = self.allocated_pages.pop() {
+            if let Err(e) = mm::free_page(PhysAddr::new(pa)) {
+                println!("Free page error: {}", e);
+            }
         }
-        Ok(())
     }
 }
 
@@ -579,19 +585,12 @@ pub fn run_guest() {
     }
 
     if setup_result.is_err() {
-        if let Err(cleanup_err) = res_manager.rollback() {
-            panic!(
-                "Phase 9 setup failed, and rollback also failed: {:?}",
-                cleanup_err
-            );
-        }
+        res_manager.rollback();
         panic!("Phase 9 guest execution failed during setup");
     }
 
     // 10. Release guest and Stage-2 table resources only after translation context is cleanly deactivated
-    res_manager
-        .rollback()
-        .expect("rollback guest resources after teardown");
+    res_manager.rollback();
 
     let final_stats = mm::allocator_stats().expect("get allocator stats after teardown");
     assert_eq!(

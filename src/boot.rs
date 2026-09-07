@@ -273,7 +273,7 @@ extern "C" fn post_switch_page_tables(
             initialized.live_dtb,
         );
 
-        // Initialize heap allocator.
+        // Initialize heap allocator
         let heap = match heap::initialize(None) {
             Ok(heap) => heap,
             Err(error) => {
