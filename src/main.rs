@@ -5,9 +5,9 @@ extern crate alloc;
 
 use core::arch::global_asm;
 use dtoolkit::fdt::Fdt;
+use tvisor_util::PAGE_SIZE;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::{debug_init, stop};
-use tvisor_util::el2_translation::PAGE_SIZE;
 use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
 use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysRegion};
 use tvisor_util::{halt, println};
@@ -18,6 +18,7 @@ mod guest;
 mod heap;
 mod mm;
 mod vcpu;
+mod vmctl;
 
 global_asm!(
     r#"
@@ -123,15 +124,15 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     }
 
     let live_dtb: PhysRegion = (*fdt).into();
-    let live_dtb_pages = match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE)
-    {
-        Ok(region) => region,
-        Err(_) => halt(),
-    };
+    let live_dtb_pages =
+        match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64) {
+            Ok(region) => region,
+            Err(_) => halt(),
+        };
     let uart_region = match PhysRegion::new_aligned(
         console.registers.start(),
         console.registers.size(),
-        PAGE_SIZE,
+        PAGE_SIZE as u64,
     ) {
         Ok(region) => region,
         Err(_) => halt(),

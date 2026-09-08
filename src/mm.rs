@@ -7,17 +7,17 @@ use core::{
 use spin::Mutex;
 use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_translation::{
-    Mapping, MemoryType, PAGE_SIZE, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
+    Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
 };
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
-use tvisor_util::{align_up, println};
+use tvisor_util::*;
 
 const MAX_TABLE_PAGES: usize = 16;
-const TABLE_ARENA_SIZE: u64 = MAX_TABLE_PAGES as u64 * PAGE_SIZE;
+const TABLE_ARENA_SIZE: u64 = (MAX_TABLE_PAGES * PAGE_SIZE) as u64;
 
 static TVISOR_TABLES: Mutex<Option<TableSet<'static, MAX_TABLE_PAGES>>> = Mutex::new(None);
 
@@ -145,9 +145,7 @@ pub fn setup_bootstrap_page_table(
     let pt_area_start = link_addr!(__bootstrap_tables_start);
     let pt_area_end = link_addr!(__bootstrap_tables_end);
 
-    let is_page_aligned = |addr: u64| -> bool { addr & (PAGE_SIZE - 1) == 0 };
-
-    if !is_page_aligned(pt_area_start) || !is_page_aligned(pt_area_end) {
+    if !is_page_aligned(pt_area_start as usize) || !is_page_aligned(pt_area_end as usize) {
         return Err(PrepareError::Validation);
     }
 
@@ -303,7 +301,7 @@ pub fn initialize_allocator_after_takeover(
             return Err(AllocatorInitError::DtbAllocatable);
         }
         page = page
-            .checked_add(PAGE_SIZE)
+            .checked_add(PAGE_SIZE as u64)
             .ok_or(AllocatorError::AddressOverflow)?;
     }
 
@@ -432,7 +430,7 @@ pub fn map_identity<const N: usize>(
     writable: bool,
     executable: bool,
 ) -> Result<(), PrepareError> {
-    if start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 || start >= end {
+    if !is_page_aligned(start as usize) || !is_page_aligned(end as usize) || start >= end {
         return Err(PrepareError::Validation);
     }
     tables.map(Mapping {
@@ -451,7 +449,8 @@ pub fn map_identity_device<const N: usize>(
     tables: &mut TableSet<'_, N>,
     region: PhysRegion,
 ) -> Result<(), PrepareError> {
-    if region.start().value() & (PAGE_SIZE - 1) != 0 || region.end().value() & (PAGE_SIZE - 1) != 0
+    if !is_page_aligned(region.start().value() as usize)
+        || !is_page_aligned(region.end().value() as usize)
     {
         return Err(PrepareError::Validation);
     }
@@ -475,29 +474,29 @@ pub fn map_identity_regions_excluding<const T: usize, const R: usize, const E: u
     executable: bool,
 ) -> Result<(), PrepareError> {
     for region in regions {
-        let start =
-            align_up(region.start().value(), PAGE_SIZE).ok_or(PrepareError::AddressOverflow)?;
-        let end = region.end().value() & !(PAGE_SIZE - 1);
+        let start = align_up(region.start().value() as usize, PAGE_SIZE)
+            .ok_or(PrepareError::AddressOverflow)?;
+        let end = page_address(region.end().value() as usize);
         let mut cursor = start;
         while cursor < end {
             let next = exclusions
                 .iter()
                 .filter_map(|excluded| {
-                    let excluded_start = excluded.start().value() & !(PAGE_SIZE - 1);
-                    let excluded_end = align_up(excluded.end().value(), PAGE_SIZE)?;
+                    let excluded_start = page_address(excluded.start().value() as usize);
+                    let excluded_end = align_up(excluded.end().value() as usize, PAGE_SIZE)?;
                     (excluded_end > cursor && excluded_start < end)
                         .then_some((excluded_start, excluded_end))
                 })
                 .min_by_key(|(excluded_start, _)| *excluded_start);
             let Some((excluded_start, excluded_end)) = next else {
-                map_identity(tables, cursor, end, writable, executable)?;
+                map_identity(tables, cursor as u64, end as u64, writable, executable)?;
                 break;
             };
             if excluded_start > cursor {
                 map_identity(
                     tables,
-                    cursor,
-                    excluded_start.min(end),
+                    cursor as u64,
+                    excluded_start.min(end) as u64,
                     writable,
                     executable,
                 )?;

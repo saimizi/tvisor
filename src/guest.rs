@@ -3,30 +3,25 @@
 use alloc::vec::Vec;
 use core::arch::global_asm;
 
+use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
-use tvisor_util::align_up;
-use tvisor_util::el2_translation::{PAGE_SIZE, TranslationError, pa_bits_from_pa_range};
+use tvisor_util::el2_translation::TranslationError;
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
 use tvisor_util::page_allocator::AllocatorError;
-use tvisor_util::println;
 use tvisor_util::stage2_translation::{
-    Stage2Access, Stage2Allocator, Stage2Exec, Stage2Mapping, Stage2MemoryType,
-    Stage2RegisterValues, Stage2TableSet, stage2_register_values,
+    Stage2Access, Stage2Allocator, Stage2Exec, Stage2MemoryType, Stage2RegisterValues,
+    stage2_register_values,
 };
 use tvisor_util::system_info::PhysAddr;
+use tvisor_util::{PAGE_SIZE, align_up, is_page_aligned, println};
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, VcpuContext, VcpuExit, VcpuExitReason};
 
-pub const MAX_GUEST_MEM_BYTES: usize = 1024 * 1024;
-pub const MAX_GUEST_MEM_PAGES: usize = (align_up(MAX_GUEST_MEM_BYTES as u64, PAGE_SIZE)
-    .expect("MAX_GUEST_MEM_BYTES is overflowed")
-    / (PAGE_SIZE)) as usize;
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
 pub const GUEST_GUARD_IPA: u64 = 0x4000_2000;
 pub const GUEST_STACK_IPA: u64 = 0x4000_3000;
-pub const GUEST_STACK_TOP_IPA: u64 = 0x4000_4000;
 pub const GUEST_DTB_IPA: u64 = 0x4010_0000;
 
 unsafe extern "C" {
@@ -246,20 +241,63 @@ unsafe fn deactivate_stage2() {
     }
 }
 
+pub struct Chunk {
+    start: AddressType,
+    pages: usize,
+}
+
+impl Chunk {
+    pub fn new(start: AddressType, pages: usize) -> Option<Self> {
+        if is_page_aligned(start.value() as usize) {
+            Some(Self { start, pages })
+        } else {
+            None
+        }
+    }
+
+    pub fn start(&self) -> AddressType {
+        self.start
+    }
+
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+}
+
 /// Resource tracker that records every allocated guest page and provides transactional rollback.
+#[derive(Default)]
 pub struct GuestResourceManager {
-    allocated_pages: Vec<u64>,
+    chunks: Vec<Chunk>,
 }
 
 impl GuestResourceManager {
     pub const fn new() -> Self {
-        Self {
-            allocated_pages: Vec::new(),
+        Self { chunks: Vec::new() }
+    }
+
+    pub fn allocate(&mut self, size: usize) -> Result<(AddressType, usize), AllocatorError> {
+        let aligned_size =
+            align_up(size, PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)? as usize;
+
+        let pages = aligned_size / PAGE_SIZE;
+
+        if self.allocated_count() + pages > MAX_GUEST_MEM_PAGES {
+            return Err(AllocatorError::Exhausted);
         }
+
+        let phy = mm::allocate_contiguous_pages(pages)?;
+        let pa = phy.value();
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, pages * PAGE_SIZE);
+        }
+
+        self.chunks.push(Chunk::new(phy, pages).unwrap());
+
+        Ok((phy, aligned_size))
     }
 
     pub fn allocate_page(&mut self) -> Result<u64, AllocatorError> {
-        if self.allocated_pages.len() >= MAX_GUEST_MEM_PAGES {
+        if self.allocated_count() + 1 > MAX_GUEST_MEM_PAGES {
             return Err(AllocatorError::Exhausted);
         }
 
@@ -268,33 +306,45 @@ impl GuestResourceManager {
         unsafe {
             core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
         }
-        self.allocated_pages.push(pa);
+        self.chunks.push(Chunk::new(page, 1).unwrap());
         Ok(pa)
     }
 
-    pub fn allocated_pages(&self) -> &[u64] {
-        &self.allocated_pages
+    pub fn allocated_chunks(&self) -> &[Chunk] {
+        &self.chunks
     }
 
     pub fn allocated_count(&self) -> usize {
-        self.allocated_pages.len()
+        let mut pages = 0;
+
+        for c in self.chunks.iter() {
+            pages += c.pages;
+        }
+
+        pages
     }
 
-    pub fn free_page(&mut self, pa: u64) {
-        if let Some(pos) = self.allocated_pages.iter().position(|&v| v == pa) {
-            self.allocated_pages.remove(pos);
+    pub fn free_chunk(&mut self, chunk: Chunk) {
+        for page in 0..chunk.pages() {
+            let pa = chunk.start().value() + (page * PAGE_SIZE) as u64;
+
             if let Err(e) = mm::free_page(PhysAddr::new(pa)) {
                 println!("Free page error: {}", e);
             }
         }
     }
 
+    pub fn free_chunk_by_addr(&mut self, pa: u64) {
+        if let Some(pos) = self.chunks.iter().position(|v| v.start().value() == pa) {
+            let chunk = self.chunks.remove(pos);
+            self.free_chunk(chunk);
+        }
+    }
+
     /// Releases all tracked pages in reverse allocation order (LIFO).
     pub fn rollback(&mut self) {
-        while let Some(pa) = self.allocated_pages.pop() {
-            if let Err(e) = mm::free_page(PhysAddr::new(pa)) {
-                println!("Free page error: {}", e);
-            }
+        while let Some(pa) = self.chunks.pop() {
+            self.free_chunk(pa);
         }
     }
 }
@@ -306,291 +356,325 @@ unsafe impl Stage2Allocator for &mut GuestResourceManager {
     }
 }
 
-pub fn run_guest() {
+fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
 
+    let mut alloc_ipa_pa = |usage: VmMemUsage,
+                            ipa: Option<AddressType>,
+                            size: usize|
+     -> Result<(u64, u64, usize), TranslationError> {
+        vm_ctl
+            .vm_mem_alloc(usage, ipa, size)
+            .and_then(|t| {
+                if let VmMem::IpaPa(v) = t {
+                    Ok((v.pa.value(), v.ipa.value(), v.size))
+                } else {
+                    Err(AllocatorError::Unexpected)
+                }
+            })
+            .map_err(|_| TranslationError::Unexpected)
+    };
+
+    // 2. Allocate individual 4 KiB physical backing pages for guest regions
+    let (payload_pa, payload_ipa, payload_size) = alloc_ipa_pa(
+        VmMemUsage::Image,
+        Some(AddressType::new(GUEST_PAYLOAD_IPA)),
+        PAGE_SIZE,
+    )?;
+
+    let (scratch_pa, scratch_ipa, scratch_size) = alloc_ipa_pa(
+        VmMemUsage::Scratch,
+        Some(AddressType::new(GUEST_SCRATCH_IPA)),
+        PAGE_SIZE,
+    )?;
+
+    let (stack_pa, stack_ipa, stack_size) = alloc_ipa_pa(
+        VmMemUsage::Stack,
+        Some(AddressType::new(GUEST_STACK_IPA)),
+        PAGE_SIZE,
+    )?;
+
+    let (dtb_pa, dtb_ipa, dtb_size) = alloc_ipa_pa(
+        VmMemUsage::DTB,
+        Some(AddressType::new(GUEST_DTB_IPA)),
+        PAGE_SIZE,
+    )?;
+
+    vm_ctl
+        .vm_mem_alloc(
+            VmMemUsage::Guard,
+            Some(AddressType::new(GUEST_GUARD_IPA)),
+            PAGE_SIZE,
+        )
+        .map_err(|_| TranslationError::Unexpected)?;
+
+    println!("{}", vm_ctl);
+
+    // 3. Copy test payload into payload backing page
+    let (payload_start, payload_end) = {
+        (
+            core::ptr::addr_of!(__payload_start) as usize,
+            core::ptr::addr_of!(__payload_end) as usize,
+        )
+    };
+    let payload_len = payload_end.saturating_sub(payload_start);
+    assert!(payload_len > 0, "payload must not be empty");
+    assert!(
+        payload_len <= PAGE_SIZE as usize,
+        "payload must fit in one page"
+    );
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload_start as *const u8,
+            payload_pa as *mut u8,
+            payload_len,
+        );
+    }
+
+    // 4. Generate minimal Guest DTB describing exact backed memory regions
+    let guest_mem_regions = [
+        GuestMemoryRegion {
+            base: payload_ipa,
+            size: payload_size as u64,
+        },
+        GuestMemoryRegion {
+            base: scratch_ipa,
+            size: scratch_size as u64,
+        },
+        GuestMemoryRegion {
+            base: stack_ipa,
+            size: stack_size as u64,
+        },
+        GuestMemoryRegion {
+            base: dtb_ipa,
+            size: dtb_size as u64,
+        },
+    ];
+
+    let dtb_slice = unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_size) };
+
+    let dtb_config = GuestFdtConfig {
+        memory_regions: &guest_mem_regions,
+        bootargs: None,
+    };
+    let dtb_real_size =
+        build_guest_dtb(dtb_slice, &dtb_config).map_err(|_| TranslationError::Unexpected)?;
+
+    println!(
+        "  Generated guest DTB at IPA {} ({} bytes)",
+        dtb_ipa, dtb_real_size
+    );
+
+    // 5. Clean Data Cache to PoC for payload and DTB, and invalidate Instruction Cache
+    // Note: for EL2 stage1, PA=VA
+    unsafe {
+        clean_dcache_poc(payload_pa as usize, payload_pa as usize + payload_size);
+        clean_dcache_poc(scratch_pa as usize, scratch_pa as usize + scratch_size);
+        clean_dcache_poc(stack_pa as usize, stack_pa as usize + stack_size);
+        clean_dcache_poc(dtb_pa as usize, dtb_pa as usize + dtb_real_size);
+        invalidate_icache_all();
+    }
+
+    // 6. Build Stage-2 translation tables with distinct per-region permissions (4 KiB L3 leaves only).
+    // Use the same implemented PA width for software descriptor validation
+    // that stage2_register_values() encodes in VTCR_EL2.PS below.
+    vm_ctl
+        .vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+        .map_err(|_| TranslationError::Unexpected)?;
+
+    // Code page: ReadOnly, Executable
+    vm_ctl.map(
+        VmMemUsage::Image,
+        Stage2MemoryType::NormalWbWa,
+        Stage2Access::ReadOnly,
+        Stage2Exec::Executable,
+    )?;
+
+    // Scratch data page: ReadWrite, ExecuteNever
+    vm_ctl.map(
+        VmMemUsage::Scratch,
+        Stage2MemoryType::NormalWbWa,
+        Stage2Access::ReadWrite,
+        Stage2Exec::ExecuteNever,
+    )?;
+
+    // Stack guard page at GUEST_GUARD_IPA (0x4000_2000) is intentionally left UNMAPPED!
+    // Stack page: ReadWrite, ExecuteNever
+    vm_ctl.map(
+        VmMemUsage::Stack,
+        Stage2MemoryType::NormalWbWa,
+        Stage2Access::ReadWrite,
+        Stage2Exec::ExecuteNever,
+    )?;
+
+    // DTB page: ReadOnly, ExecuteNever
+    vm_ctl.map(
+        VmMemUsage::DTB,
+        Stage2MemoryType::NormalWbWa,
+        Stage2Access::ReadOnly,
+        Stage2Exec::ExecuteNever,
+    )?;
+
+    let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
+    let stage2_root_pa = vm_ctl.page_table_root().unwrap().value();
+    let stage2_regs = stage2_register_values(1, stage2_root_pa, pa_range)?;
+
+    let used_pages = vm_ctl
+        .vm_mem(VmMemUsage::PageTable)
+        .and_then(|t| {
+            if let VmMem::PaOnly(v) = t {
+                Some(v.pa.len())
+            } else {
+                None
+            }
+        })
+        .ok_or(TranslationError::Unexpected)?;
+
+    println!(
+        "  Stage-2 translation tables initialized: root_pa={:#018x} used_pages={}",
+        stage2_root_pa, used_pages,
+    );
+
+    // 7. Publish descriptors and activate Stage-2 translation
+    unsafe {
+        activate_stage2(&stage2_regs);
+    }
+    *stage2_active = true;
+
+    // 8. Initialize vCPU Context
+    // Stack grows from high to low, so initial stack pointer is set to the stack_ipa + stack_size
+    let mut context = VcpuContext::new(payload_ipa, stack_ipa + stack_size as u64);
+    context.x[0] = dtb_ipa;
+    let mut exit = VcpuExit::default();
+
+    println!("Phase 9: Entering guest EL1 execution loop...");
+    // Checkpoint 1 (Guest RAM read/write test)
+    println!(
+        "  Starting guest execution at IPA {:#018x}...",
+        context.elr_el2
+    );
+
+    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
+
+    let reason = exit.decode_reason(&context);
+    println!(
+        "  Guest exit 1: ESR_EL2={:#018x} reason={:?}",
+        exit.esr_el2, reason
+    );
+
+    match reason {
+        VcpuExitReason::Hvc { imm: 0, arg0: 1 } => {
+            println!("  [OK] Guest Checkpoint 1: RAM read/write verification passed");
+        }
+        VcpuExitReason::Hvc { imm, arg0 } => {
+            panic!(
+                "Guest failure exit at Checkpoint 1: HVC #{} with x0={:#x} x1={:#x}",
+                imm, arg0, context.x[1]
+            );
+        }
+        other => panic!("Unexpected exit at Checkpoint 1: {:?}", other),
+    }
+
+    // Checkpoint 2 (System register verification)
+    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    assert_eq!(vector, 8);
+    let reason = exit.decode_reason(&context);
+    println!(
+        "  Guest exit 2: ESR_EL2={:#018x} reason={:?}",
+        exit.esr_el2, reason
+    );
+    match reason {
+        VcpuExitReason::Hvc { imm: 0, arg0: 2 } => {
+            println!(
+                "  [OK] Guest Checkpoint 2: System registers verified (CurrentEL=EL1, MPIDR_EL1={:#010x})",
+                context.x[1]
+            );
+        }
+        VcpuExitReason::Hvc { imm, arg0 } => {
+            panic!(
+                "Guest failure exit at Checkpoint 2: HVC #{} with x0={:#x} x1={:#x}",
+                imm, arg0, context.x[1]
+            );
+        }
+        other => panic!("Unexpected exit at Checkpoint 2: {:?}", other),
+    }
+
+    // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
+    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    assert_eq!(vector, 8);
+    let reason = exit.decode_reason(&context);
+    let fault_ipa = exit.fault_ipa();
+    println!(
+        "  Guest exit 3: ESR_EL2={:#018x} FAR_EL2={:#018x} HPFAR_EL2={:#018x} fault_ipa={:#018x}",
+        exit.esr_el2, exit.far_el2, exit.hpfar_el2, fault_ipa
+    );
+
+    match reason {
+        VcpuExitReason::Stage2DataAbort {
+            ipa,
+            is_write,
+            dfsc,
+        } => {
+            assert_eq!(
+                ipa, 0x3000_0000,
+                "Fault IPA must match unmapped 0x3000_0000"
+            );
+            assert!(!is_write, "Test performed read from unmapped address");
+            assert!(
+                (0x04..=0x07).contains(&dfsc),
+                "Expected translation fault DFSC, got {:#x}",
+                dfsc
+            );
+            println!(
+                "  [OK] Guest Checkpoint 3: Deliberate Stage-2 Data Abort successfully trapped and decoded at IPA {:#018x}",
+                ipa
+            );
+        }
+        VcpuExitReason::Hvc { imm, arg0 } => {
+            panic!(
+                "Guest reported failure before Stage-2 abort: HVC #{} with x0={:#x} x1={:#x}",
+                imm, arg0, context.x[1]
+            );
+        }
+        other => panic!("Unexpected exit at Checkpoint 3: {:?}", other),
+    }
+
+    Ok(())
+}
+
+pub fn run_guest() -> Result<(), TranslationError> {
+    println!("Phase 9: Preparing guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
 
-    // 1. Processor PARange verification
-    let mmfr0 = IdAa64Mmfr0El1::dump().expect("ID_AA64MMFR0_EL1 is available at EL2");
-    let pa_range = mmfr0.pa_range();
-
-    let mut res_manager = GuestResourceManager::new();
+    let mut vm_ctl = VmCtl::new();
     let mut stage2_active = false;
 
-    // Helper closure to build and run guest environment, rolling back on error
-    let setup_result = (|| -> Result<(), ()> {
-        // 2. Allocate individual 4 KiB physical backing pages for guest regions
-        let payload_pa = res_manager
-            .allocate_page()
-            .map_err(|_| println!("  [ERR] Failed to allocate payload backing page"))?;
-        let scratch_pa = res_manager
-            .allocate_page()
-            .map_err(|_| println!("  [ERR] Failed to allocate scratch backing page"))?;
-        let stack_pa = res_manager
-            .allocate_page()
-            .map_err(|_| println!("  [ERR] Failed to allocate stack backing page"))?;
-        let dtb_pa = res_manager
-            .allocate_page()
-            .map_err(|_| println!("  [ERR] Failed to allocate DTB backing page"))?;
-
-        println!("  Allocated individual backing pages:");
-        println!("    Payload PA: {:#018x}", payload_pa);
-        println!("    Scratch PA: {:#018x}", scratch_pa);
-        println!("    Stack PA:   {:#018x}", stack_pa);
-        println!("    DTB PA:     {:#018x}", dtb_pa);
-        println!("    Guard Page: unmapped (IPA {:#018x})", GUEST_GUARD_IPA);
-
-        // 3. Copy test payload into payload backing page
-        let payload_start = core::ptr::addr_of!(__payload_start) as usize;
-        let payload_end = core::ptr::addr_of!(__payload_end) as usize;
-        let payload_len = payload_end.saturating_sub(payload_start);
-        assert!(payload_len > 0, "payload must not be empty");
-        assert!(
-            payload_len <= PAGE_SIZE as usize,
-            "payload must fit in one page"
-        );
-
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                payload_start as *const u8,
-                payload_pa as *mut u8,
-                payload_len,
-            );
+    {
+        struct Stage2DeactivationGuard<'a> {
+            active: &'a mut bool,
         }
 
-        // 4. Generate minimal Guest DTB describing exact backed memory regions
-        let guest_mem_regions = [
-            GuestMemoryRegion {
-                base: GUEST_PAYLOAD_IPA,
-                size: 2 * PAGE_SIZE, // covers payload page and scratch page
-            },
-            GuestMemoryRegion {
-                base: GUEST_STACK_IPA,
-                size: PAGE_SIZE, // guest stack page
-            },
-            GuestMemoryRegion {
-                base: GUEST_DTB_IPA,
-                size: PAGE_SIZE, // guest DTB page
-            },
-        ];
+        impl Drop for Stage2DeactivationGuard<'_> {
+            fn drop(&mut self) {
+                if *self.active {
+                    unsafe {
+                        deactivate_stage2();
+                    }
+                    *self.active = false;
+                }
+            }
+        }
 
-        let dtb_slice =
-            unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, PAGE_SIZE as usize) };
-        let dtb_config = GuestFdtConfig {
-            memory_regions: &guest_mem_regions,
-            bootargs: None,
+        let guard = Stage2DeactivationGuard {
+            active: &mut stage2_active,
         };
-        let dtb_size = build_guest_dtb(dtb_slice, &dtb_config)
-            .map_err(|_| println!("  [ERR] Failed to generate guest DTB"))?;
-        println!(
-            "  Generated guest DTB at IPA {:#018x} ({} bytes)",
-            GUEST_DTB_IPA, dtb_size
-        );
 
-        // 5. Clean Data Cache to PoC for payload and DTB, and invalidate Instruction Cache
-        unsafe {
-            clean_dcache_poc(
-                payload_pa as usize,
-                payload_pa as usize + PAGE_SIZE as usize,
-            );
-            clean_dcache_poc(
-                scratch_pa as usize,
-                scratch_pa as usize + PAGE_SIZE as usize,
-            );
-            clean_dcache_poc(stack_pa as usize, stack_pa as usize + PAGE_SIZE as usize);
-            clean_dcache_poc(dtb_pa as usize, dtb_pa as usize + PAGE_SIZE as usize);
-            invalidate_icache_all();
-        }
-
-        // 6. Build Stage-2 translation tables with distinct per-region permissions (4 KiB L3 leaves only).
-        // Use the same implemented PA width for software descriptor validation
-        // that stage2_register_values() encodes in VTCR_EL2.PS below.
-        let pa_bits = pa_bits_from_pa_range(pa_range)
-            .map_err(|_| println!("  [ERR] Unsupported physical address range"))?;
-        let mut stage2_tables = Stage2TableSet::new(&mut res_manager, pa_bits)
-            .map_err(|_| println!("  [ERR] Failed to create Stage2TableSet"))?;
-
-        // Code page: ReadOnly, Executable
-        stage2_tables
-            .map(Stage2Mapping {
-                ipa: GUEST_PAYLOAD_IPA,
-                pa: payload_pa,
-                size: PAGE_SIZE,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadOnly,
-                exec: Stage2Exec::Executable,
-            })
-            .map_err(|_| println!("  [ERR] Failed to map payload page"))?;
-
-        // Scratch data page: ReadWrite, ExecuteNever
-        stage2_tables
-            .map(Stage2Mapping {
-                ipa: GUEST_SCRATCH_IPA,
-                pa: scratch_pa,
-                size: PAGE_SIZE,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadWrite,
-                exec: Stage2Exec::ExecuteNever,
-            })
-            .map_err(|_| println!("  [ERR] Failed to map scratch page"))?;
-
-        // Stack guard page at GUEST_GUARD_IPA (0x4000_2000) is intentionally left UNMAPPED!
-
-        // Stack page: ReadWrite, ExecuteNever
-        stage2_tables
-            .map(Stage2Mapping {
-                ipa: GUEST_STACK_IPA,
-                pa: stack_pa,
-                size: PAGE_SIZE,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadWrite,
-                exec: Stage2Exec::ExecuteNever,
-            })
-            .map_err(|_| println!("  [ERR] Failed to map stack page"))?;
-
-        // DTB page: ReadOnly, ExecuteNever
-        stage2_tables
-            .map(Stage2Mapping {
-                ipa: GUEST_DTB_IPA,
-                pa: dtb_pa,
-                size: PAGE_SIZE,
-                mem_type: Stage2MemoryType::NormalWbWa,
-                access: Stage2Access::ReadOnly,
-                exec: Stage2Exec::ExecuteNever,
-            })
-            .map_err(|_| println!("  [ERR] Failed to map DTB page"))?;
-
-        let stage2_root_pa = stage2_tables.root_pa();
-        let stage2_regs = stage2_register_values(1, stage2_root_pa, pa_range)
-            .map_err(|_| println!("  [ERR] Failed to build stage-2 registers"))?;
-
-        println!(
-            "  Stage-2 translation tables initialized: root_pa={:#018x} used_pages={}",
-            stage2_root_pa,
-            stage2_tables.used_pages()
-        );
-
-        // 7. Publish descriptors and activate Stage-2 translation
-        unsafe {
-            activate_stage2(&stage2_regs);
-        }
-        stage2_active = true;
-
-        // 8. Initialize vCPU Context
-        let mut context = VcpuContext::new(GUEST_PAYLOAD_IPA, GUEST_STACK_TOP_IPA);
-        context.x[0] = GUEST_DTB_IPA;
-        let mut exit = VcpuExit::default();
-
-        println!("Phase 9: Entering guest EL1 execution loop...");
-
-        // Checkpoint 1 (Guest RAM read/write test)
-        println!(
-            "  Starting guest execution at IPA {:#018x}...",
-            context.elr_el2
-        );
-        let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
-        assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
-        let reason = exit.decode_reason(&context);
-        println!(
-            "  Guest exit 1: ESR_EL2={:#018x} reason={:?}",
-            exit.esr_el2, reason
-        );
-        match reason {
-            VcpuExitReason::Hvc { imm: 0, arg0: 1 } => {
-                println!("  [OK] Guest Checkpoint 1: RAM read/write verification passed");
-            }
-            VcpuExitReason::Hvc { imm, arg0 } => {
-                panic!(
-                    "Guest failure exit at Checkpoint 1: HVC #{} with x0={:#x} x1={:#x}",
-                    imm, arg0, context.x[1]
-                );
-            }
-            other => panic!("Unexpected exit at Checkpoint 1: {:?}", other),
-        }
-
-        // Checkpoint 2 (System register verification)
-        let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
-        assert_eq!(vector, 8);
-        let reason = exit.decode_reason(&context);
-        println!(
-            "  Guest exit 2: ESR_EL2={:#018x} reason={:?}",
-            exit.esr_el2, reason
-        );
-        match reason {
-            VcpuExitReason::Hvc { imm: 0, arg0: 2 } => {
-                println!(
-                    "  [OK] Guest Checkpoint 2: System registers verified (CurrentEL=EL1, MPIDR_EL1={:#010x})",
-                    context.x[1]
-                );
-            }
-            VcpuExitReason::Hvc { imm, arg0 } => {
-                panic!(
-                    "Guest failure exit at Checkpoint 2: HVC #{} with x0={:#x} x1={:#x}",
-                    imm, arg0, context.x[1]
-                );
-            }
-            other => panic!("Unexpected exit at Checkpoint 2: {:?}", other),
-        }
-
-        // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-        let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
-        assert_eq!(vector, 8);
-        let reason = exit.decode_reason(&context);
-        let fault_ipa = exit.fault_ipa();
-        println!(
-            "  Guest exit 3: ESR_EL2={:#018x} FAR_EL2={:#018x} HPFAR_EL2={:#018x} fault_ipa={:#018x}",
-            exit.esr_el2, exit.far_el2, exit.hpfar_el2, fault_ipa
-        );
-        match reason {
-            VcpuExitReason::Stage2DataAbort {
-                ipa,
-                is_write,
-                dfsc,
-            } => {
-                assert_eq!(
-                    ipa, 0x3000_0000,
-                    "Fault IPA must match unmapped 0x3000_0000"
-                );
-                assert!(!is_write, "Test performed read from unmapped address");
-                assert!(
-                    (0x04..=0x07).contains(&dfsc),
-                    "Expected translation fault DFSC, got {:#x}",
-                    dfsc
-                );
-                println!(
-                    "  [OK] Guest Checkpoint 3: Deliberate Stage-2 Data Abort successfully trapped and decoded at IPA {:#018x}",
-                    ipa
-                );
-            }
-            VcpuExitReason::Hvc { imm, arg0 } => {
-                panic!(
-                    "Guest reported failure before Stage-2 abort: HVC #{} with x0={:#x} x1={:#x}",
-                    imm, arg0, context.x[1]
-                );
-            }
-            other => panic!("Unexpected exit at Checkpoint 3: {:?}", other),
-        }
-
-        Ok(())
-    })();
-
-    // 9. Teardown only after activation. A setup error returned through `?`
-    // occurs before activate_stage2(), so no inherited virtualization context
-    // should be invalidated or overwritten on that path.
-    if stage2_active {
-        unsafe {
-            deactivate_stage2();
-        }
+        run_guest_inner(&mut vm_ctl, &mut *guard.active)?;
     }
 
-    if setup_result.is_err() {
-        res_manager.rollback();
-        panic!("Phase 9 guest execution failed during setup");
-    }
-
-    // 10. Release guest and Stage-2 table resources only after translation context is cleanly deactivated
-    res_manager.rollback();
+    vm_ctl.release_all();
 
     let final_stats = mm::allocator_stats().expect("get allocator stats after teardown");
     assert_eq!(
@@ -601,4 +685,6 @@ pub fn run_guest() {
     println!("============================================================");
     println!("Phase 9 Guest Preparation & Execution Verification: PASSED");
     println!("============================================================");
+
+    Ok(())
 }

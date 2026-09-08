@@ -21,6 +21,32 @@ impl PhysAddr {
             None => None,
         }
     }
+
+    /// # Safety
+    ///
+    /// The caller must ensure the physical address is valid and mapped for
+    /// mutable access in the current address space.
+    pub unsafe fn as_ptr(self) -> *mut u8 {
+        self.0 as *mut u8
+    }
+}
+
+impl From<PhysAddr> for *mut u8 {
+    fn from(value: PhysAddr) -> Self {
+        value.0 as *mut u8
+    }
+}
+
+impl From<PhysAddr> for usize {
+    fn from(value: PhysAddr) -> Self {
+        value.0 as usize
+    }
+}
+
+impl From<PhysAddr> for u64 {
+    fn from(value: PhysAddr) -> Self {
+        value.0
+    }
 }
 
 impl fmt::Display for PhysAddr {
@@ -77,17 +103,20 @@ impl PhysRegion {
         if !alignment.is_power_of_two() {
             return Err(RegionError::InvalidAlignment);
         }
-        let aligned_start = align_down(start.value(), alignment);
+        let aligned_start = match align_down(start.value() as usize, alignment as usize) {
+            Some(value) => value,
+            None => return Err(RegionError::InvalidAlignment),
+        };
         let Some(end) = start.value().checked_add(size) else {
             return Err(RegionError::AddressOverflow);
         };
-        let Some(aligned_end) = align_up(end, alignment) else {
+        let Some(aligned_end) = align_up(end as usize, alignment as usize) else {
             return Err(RegionError::AddressOverflow);
         };
 
         Ok(Self {
-            start: PhysAddr::new(aligned_start),
-            size: aligned_end - aligned_start,
+            start: PhysAddr::new(aligned_start as u64),
+            size: (aligned_end - aligned_start) as u64,
         })
     }
 

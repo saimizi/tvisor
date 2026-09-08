@@ -845,6 +845,18 @@ impl IdAa64Mmfr0El1 {
         (self.value & 0xf) as u8
     }
 
+    pub fn pa_bits(&self) -> Option<u8> {
+        match self.pa_range() {
+            0 => Some(32),
+            1 => Some(36),
+            2 => Some(40),
+            3 => Some(42),
+            4 => Some(44),
+            5 => Some(48),
+            _ => None,
+        }
+    }
+
     // Supported ASID width (0 = 8-bit, 2 = 16-bit)
     pub fn asidbits(&self) -> u8 {
         ((self.value >> 4) & 0xf) as u8

@@ -1,12 +1,13 @@
+use crate::*;
 use core::fmt;
 
 use crate::{
-    el2_translation::PAGE_SIZE,
+    PAGE_SIZE,
     system_info::{FixedList, PhysAddr, PhysRegion, RegionError},
 };
 
 pub const MAX_PHYSICAL_ADDRESS: u64 = 1 << 32;
-pub const PAGE_BITMAP_BYTES: usize = (MAX_PHYSICAL_ADDRESS / PAGE_SIZE / 8) as usize;
+pub const PAGE_BITMAP_BYTES: usize = (MAX_PHYSICAL_ADDRESS as usize) / PAGE_SIZE / 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageState {
@@ -25,6 +26,9 @@ pub enum AllocatorError {
     UnalignedPage,
     ReservedPage,
     DoubleFree,
+    AlreadyAllocated,
+    InvalidateParameter,
+    Unexpected,
 }
 
 impl fmt::Display for AllocatorError {
@@ -176,7 +180,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
         for index in (0..BITMAP_BYTES * 8).rev() {
             if self.managed.is_set(index) && !self.in_use.is_set(index) {
                 self.in_use.set_bit(index, true);
-                return Ok(PhysAddr::new(index as u64 * PAGE_SIZE));
+                return Ok(PhysAddr::new((index * PAGE_SIZE) as u64));
             }
         }
         Err(AllocatorError::Exhausted)
@@ -197,7 +201,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
                     for page in run_start..run_start + pages {
                         self.in_use.set_bit(page, true);
                     }
-                    return Ok(PhysAddr::new(run_start as u64 * PAGE_SIZE));
+                    return Ok(PhysAddr::new((run_start * PAGE_SIZE) as u64));
                 }
             } else {
                 run_len = 0;
@@ -207,15 +211,17 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     pub fn allocate_in(&mut self, requested: PhysRegion) -> Result<PhysAddr, AllocatorError> {
-        let start = align_up(requested.start().value(), PAGE_SIZE)
+        let start = align_up(requested.start().value() as usize, PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
-        let end = align_down(requested.end().value(), PAGE_SIZE).min(self.aperture_end());
+        let end = align_down(requested.end().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?
+            .min(self.aperture_end() as usize);
         let mut page = start;
         while page < end {
-            if self.state(PhysAddr::new(page))? == PageState::Unused {
-                let index = self.bitmap_index(page)?;
+            if self.state(PhysAddr::new(page as u64))? == PageState::Unused {
+                let index = self.bitmap_index(page as u64)?;
                 self.in_use.set_bit(index, true);
-                return Ok(PhysAddr::new(page));
+                return Ok(PhysAddr::new(page as u64));
             }
             page = page
                 .checked_add(PAGE_SIZE)
@@ -238,13 +244,15 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
 
     /// Change managed pages fully covered by `region` to Unused.
     pub fn release(&mut self, region: PhysRegion) -> Result<usize, AllocatorError> {
-        let start =
-            align_up(region.start().value(), PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)?;
-        let end = align_down(region.end().value(), PAGE_SIZE).min(self.aperture_end());
+        let start = align_up(region.start().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        let end = align_down(region.end().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?
+            .min(self.aperture_end() as usize);
         let mut released = 0;
         let mut page = start;
         while page < end {
-            let index = self.bitmap_index(page)?;
+            let index = self.bitmap_index(page as u64)?;
             if self.managed.is_set(index) && self.in_use.is_set(index) {
                 self.in_use.set_bit(index, false);
                 released += 1;
@@ -257,7 +265,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     pub fn state(&self, page: PhysAddr) -> Result<PageState, AllocatorError> {
-        if page.value() & (PAGE_SIZE - 1) != 0 {
+        if !is_page_aligned(page.value() as usize) {
             return Err(AllocatorError::UnalignedPage);
         }
         let index = self.bitmap_index(page.value())?;
@@ -280,15 +288,16 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     fn mark_managed(&mut self, region: PhysRegion) -> Result<(), AllocatorError> {
-        let start =
-            align_up(region.start().value(), PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)?;
-        let end = align_down(region.end().value(), PAGE_SIZE);
-        if end > self.aperture_end() {
+        let start = align_up(region.start().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        let end = align_down(region.end().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        if end > self.aperture_end() as usize {
             return Err(AllocatorError::PhysicalAddressOutOfRange);
         }
         let mut page = start;
         while page < end {
-            let index = self.bitmap_index(page)?;
+            let index = self.bitmap_index(page as u64)?;
             self.managed.set_bit(index, true);
             page = page
                 .checked_add(PAGE_SIZE)
@@ -306,11 +315,11 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     fn aperture_end(&self) -> u64 {
-        BITMAP_BYTES as u64 * 8 * PAGE_SIZE
+        (BITMAP_BYTES * 8 * PAGE_SIZE) as u64
     }
 
     fn bitmap_index(&self, address: u64) -> Result<usize, AllocatorError> {
-        let page = usize::try_from(address / PAGE_SIZE)
+        let page = usize::try_from(address / PAGE_SIZE as u64)
             .map_err(|_| AllocatorError::PhysicalAddressOutOfRange)?;
         if page >= BITMAP_BYTES * 8 {
             return Err(AllocatorError::PhysicalAddressOutOfRange);
@@ -335,40 +344,30 @@ fn count_pages<const N: usize>(
 ) -> Result<usize, AllocatorError> {
     let mut pages = 0_usize;
     for region in regions {
-        let start =
-            align_up(region.start().value(), PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)?;
-        let end = align_down(region.end().value(), PAGE_SIZE);
-        if end > MAX_PHYSICAL_ADDRESS {
+        let start = align_up(region.start().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        let end = align_down(region.end().value() as usize, PAGE_SIZE)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        if end as u64 > MAX_PHYSICAL_ADDRESS {
             return Err(AllocatorError::PhysicalAddressOutOfRange);
         }
         pages = pages
-            .checked_add(
-                usize::try_from((end - start) / PAGE_SIZE)
-                    .map_err(|_| AllocatorError::AddressOverflow)?,
-            )
+            .checked_add((end - start) / PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
     }
     Ok(pages)
 }
 
 pub fn page_covering(region: PhysRegion) -> Result<PhysRegion, AllocatorError> {
-    let start = align_down(region.start().value(), PAGE_SIZE);
-    let end = align_up(region.end().value(), PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)?;
-    if end > MAX_PHYSICAL_ADDRESS {
+    let start = align_down(region.start().value() as usize, PAGE_SIZE)
+        .ok_or(AllocatorError::AddressOverflow)?;
+    let end = align_up(region.end().value() as usize, PAGE_SIZE)
+        .ok_or(AllocatorError::AddressOverflow)?;
+    if end as u64 > MAX_PHYSICAL_ADDRESS {
         return Err(AllocatorError::PhysicalAddressOutOfRange);
     }
-    PhysRegion::from_bounds(PhysAddr::new(start), PhysAddr::new(end))
+    PhysRegion::from_bounds(PhysAddr::new(start as u64), PhysAddr::new(end as u64))
         .map_err(AllocatorError::InvalidRegion)
-}
-
-fn align_down(value: u64, alignment: u64) -> u64 {
-    value & !(alignment - 1)
-}
-
-fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| align_down(value, alignment))
 }
 
 fn bit_is_set(bitmap: &[u8], index: usize) -> bool {
