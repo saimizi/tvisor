@@ -27,28 +27,29 @@
 //! [54:53]  XN         00 = Executable; 10 = Execute-Never (XN)
 //! ```
 
-use crate::el2_translation::{PAGE_SIZE, TablePage, TranslationError, pa_bits_from_pa_range};
+use crate::el2_translation::{TablePage, TranslationError, pa_bits_from_pa_range};
+use crate::{PAGE_SIZE, is_page_aligned, page_offset};
 
 pub const IPA_BITS: u8 = 39;
 
-const L1_SHIFT: u32 = 30;
-const L2_SHIFT: u32 = 21;
-const L3_SHIFT: u32 = 12;
-const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
+pub const L1_SHIFT: u32 = 30;
+pub const L2_SHIFT: u32 = 21;
+pub const L3_SHIFT: u32 = 12;
+pub const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
-const VALID: u64 = 1 << 0;
-const TABLE_OR_PAGE: u64 = 1 << 1;
-const MEM_ATTR_NORMAL_WB_WA: u64 = 0b1111 << 2;
-const MEM_ATTR_DEVICE_NGNRE: u64 = 0b0001 << 2;
-const S2AP_NONE: u64 = 0b00 << 6;
-const S2AP_READ_ONLY: u64 = 0b01 << 6;
-const S2AP_WRITE_ONLY: u64 = 0b10 << 6;
-const S2AP_READ_WRITE: u64 = 0b11 << 6;
-const SH_NONE: u64 = 0b00 << 8;
-const SH_INNER: u64 = 0b11 << 8;
-const ACCESS_FLAG: u64 = 1 << 10;
-const XN_EXEC: u64 = 0b00 << 53;
-const XN_NON_EXEC: u64 = 0b10 << 53;
+pub const VALID: u64 = 1 << 0;
+pub const TABLE_OR_PAGE: u64 = 1 << 1;
+pub const MEM_ATTR_NORMAL_WB_WA: u64 = 0b1111 << 2;
+pub const MEM_ATTR_DEVICE_NGNRE: u64 = 0b0001 << 2;
+pub const S2AP_NONE: u64 = 0b00 << 6;
+pub const S2AP_READ_ONLY: u64 = 0b01 << 6;
+pub const S2AP_WRITE_ONLY: u64 = 0b10 << 6;
+pub const S2AP_READ_WRITE: u64 = 0b11 << 6;
+pub const SH_NONE: u64 = 0b00 << 8;
+pub const SH_INNER: u64 = 0b11 << 8;
+pub const ACCESS_FLAG: u64 = 1 << 10;
+pub const XN_EXEC: u64 = 0b00 << 53;
+pub const XN_NON_EXEC: u64 = 0b10 << 53;
 
 pub const VTCR_EL2_T0SZ_39_BIT: u64 = 25;
 pub const VTCR_EL2_SL0_LEVEL_1: u64 = 0b01 << 6;
@@ -154,7 +155,7 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
         }
         let root_pa = allocator.allocate_table_page()?;
         let max_pa = (1_u64 << pa_bits) - 1;
-        if root_pa & (PAGE_SIZE - 1) != 0 || root_pa > max_pa {
+        if !is_page_aligned(root_pa as usize) || root_pa > max_pa {
             return Err(TranslationError::InvalidTableBase);
         }
 
@@ -188,7 +189,7 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
         }
         let page_pa = self.allocator.allocate_table_page()?;
         let max_pa = (1_u64 << self.pa_bits) - 1;
-        if page_pa & (PAGE_SIZE - 1) != 0 || page_pa > max_pa {
+        if !is_page_aligned(page_pa as usize) || page_pa > max_pa {
             return Err(TranslationError::InvalidTableBase);
         }
         self.allocated_tables[self.allocated_count] = page_pa;
@@ -203,9 +204,9 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
         if mapping.size == 0 {
             return Err(TranslationError::EmptyMapping);
         }
-        if mapping.ipa & (PAGE_SIZE - 1) != 0
-            || mapping.pa & (PAGE_SIZE - 1) != 0
-            || mapping.size & (PAGE_SIZE - 1) != 0
+        if !is_page_aligned(mapping.ipa as usize)
+            || !is_page_aligned(mapping.pa as usize)
+            || !is_page_aligned(mapping.size as usize)
         {
             return Err(TranslationError::UnalignedMapping);
         }
@@ -237,8 +238,8 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
                 mapping.access,
                 mapping.exec,
             )?;
-            current_ipa += PAGE_SIZE;
-            current_pa += PAGE_SIZE;
+            current_ipa += PAGE_SIZE as u64;
+            current_pa += PAGE_SIZE as u64;
         }
 
         Ok(())
@@ -308,7 +309,7 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
         let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
         let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
         let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
-        let page_offset = ipa & (PAGE_SIZE - 1);
+        let page_offset = page_offset(ipa as usize);
 
         let root_table = unsafe { &*(self.root_pa as *const TablePage) };
         let l1_entry = root_table.entries()[l1_idx];
@@ -334,7 +335,7 @@ impl<A: Stage2Allocator> Stage2TableSet<A> {
         let base_pa = l3_entry & ADDRESS_MASK;
 
         Some(Stage2Translation {
-            pa: base_pa | page_offset,
+            pa: base_pa | page_offset as u64,
             mem_type,
             access,
             exec,
@@ -395,7 +396,7 @@ pub fn stage2_register_values(
 ) -> Result<Stage2RegisterValues, TranslationError> {
     let pa_bits = pa_bits_from_pa_range(parange)?;
     let max_root_pa = (1_u64 << pa_bits) - 1;
-    if root_table_pa & (PAGE_SIZE - 1) != 0 || root_table_pa > max_root_pa {
+    if !is_page_aligned(root_table_pa as usize) || root_table_pa > max_root_pa {
         return Err(TranslationError::InvalidTableBase);
     }
 
@@ -644,7 +645,7 @@ mod tests {
                     .translate(page)
                     .unwrap_or_else(|| panic!("Page {:#x} advertised in DTB is unmapped", page));
                 assert_eq!(trans.mem_type, Stage2MemoryType::NormalWbWa);
-                page += PAGE_SIZE;
+                page += PAGE_SIZE as u64;
             }
         }
 

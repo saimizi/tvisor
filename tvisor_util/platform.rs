@@ -7,8 +7,8 @@ use dtoolkit::{Node, Property, ToCellInt};
 
 use crate::memory_map::{MemoryMap, MemoryMapError};
 use crate::system_info::{PhysAddr, PhysRegion, RegionError};
+use crate::*;
 
-const PAGE_SIZE: u64 = 0x1000;
 const BCM2711_COMPATIBLE: &str = "brcm,bcm2711";
 const BCM2711_LOW_MEMORY_LIMIT: u64 = 0x4000_0000;
 
@@ -316,12 +316,12 @@ fn page_rounded_region(start: PhysAddr, size: u64) -> Result<PhysRegion, RegionE
     let end = start
         .checked_add(size)
         .ok_or(RegionError::AddressOverflow)?;
-    let rounded_start = start.value() & !(PAGE_SIZE - 1);
-    let rounded_end = end
-        .value()
-        .checked_add(PAGE_SIZE - 1)
-        .ok_or(RegionError::AddressOverflow)?
-        & !(PAGE_SIZE - 1);
+    let rounded_start = page_address(start.value() as usize) as u64;
+    let rounded_end = page_address(
+        end.value()
+            .checked_add(PAGE_SIZE as u64 - 1)
+            .ok_or(RegionError::AddressOverflow)? as usize,
+    ) as u64;
     PhysRegion::from_bounds(PhysAddr::new(rounded_start), PhysAddr::new(rounded_end))
 }
 

@@ -57,8 +57,8 @@
 use core::fmt;
 
 use crate::aarch64_reg::{MAIR_INDEX_DEVICE_NGNRE, MAIR_INDEX_NORMAL_WB_WA};
+use crate::{PAGE_SIZE, is_page_aligned};
 
-pub const PAGE_SIZE: u64 = 4096;
 pub const ENTRIES_PER_TABLE: usize = 512;
 pub const VA_BITS: u8 = 39;
 
@@ -79,16 +79,8 @@ const ACCESS_FLAG: u64 = 1 << 10;
 // EL0/EL1 regime, but is not the execute permission used by this regime.
 const XN: u64 = 1 << 54;
 
-pub fn is_page_aligned(addr: u64) -> bool {
-    is_aligned(addr, PAGE_SIZE)
-}
-
-pub fn is_aligned(addr: u64, alignment: u64) -> bool {
-    alignment.is_power_of_two() && addr & (alignment - 1) == 0
-}
-
-pub fn pa_bits_from_pa_range(parange: u8) -> Result<u8, TranslationError> {
-    match parange {
+pub fn pa_bits_from_pa_range(pa_range: u8) -> Result<u8, TranslationError> {
+    match pa_range {
         0 => Ok(32),
         1 => Ok(36),
         2 => Ok(40),
@@ -141,6 +133,8 @@ pub enum TranslationError {
     TableExhausted,
     ConflictingEntry,
     CorruptTable,
+    InvalidateParameter,
+    Unexpected,
 }
 
 impl fmt::Display for TranslationError {
@@ -219,7 +213,7 @@ impl<'a, const N: usize> TableSet<'a, N> {
         }
 
         // Check `base_pa` is PAGE_SIZE aligned.
-        if !is_page_aligned(base_pa) {
+        if !is_page_aligned(base_pa as usize) {
             return Err(TranslationError::InvalidTableBase);
         }
 
@@ -233,7 +227,7 @@ impl<'a, const N: usize> TableSet<'a, N> {
         }
 
         let byte_len = (N as u64)
-            .checked_mul(PAGE_SIZE)
+            .checked_mul(PAGE_SIZE as u64)
             .ok_or(TranslationError::AddressOverflow)?;
 
         let end = base_pa
@@ -279,7 +273,7 @@ impl<'a, const N: usize> TableSet<'a, N> {
             } else if aligned_for(va, pa, L2_SIZE) && remaining >= L2_SIZE {
                 (2, L2_SIZE)
             } else {
-                (3, PAGE_SIZE)
+                (3, PAGE_SIZE as u64)
             };
             self.map_leaf(level, va, pa, mapping)?;
             va += chunk;
@@ -332,7 +326,7 @@ impl<'a, const N: usize> TableSet<'a, N> {
         if mapping.size == 0 {
             return Err(TranslationError::EmptyMapping);
         }
-        if (mapping.va | mapping.pa | mapping.size) & (PAGE_SIZE - 1) != 0 {
+        if !is_page_aligned((mapping.va | mapping.pa | mapping.size) as usize) {
             return Err(TranslationError::UnalignedMapping);
         }
         let va_end = mapping
@@ -396,18 +390,18 @@ impl<'a, const N: usize> TableSet<'a, N> {
     }
 
     fn table_pa(&self, index: usize) -> u64 {
-        self.base_pa + index as u64 * PAGE_SIZE
+        self.base_pa + (index * PAGE_SIZE) as u64
     }
 
     fn table_index(&self, pa: u64) -> Result<usize, TranslationError> {
         let offset = pa
             .checked_sub(self.base_pa)
             .ok_or(TranslationError::CorruptTable)?;
-        if offset & (PAGE_SIZE - 1) != 0 {
+        if !is_page_aligned(offset as usize) {
             return Err(TranslationError::CorruptTable);
         }
-        let index =
-            usize::try_from(offset / PAGE_SIZE).map_err(|_| TranslationError::CorruptTable)?;
+        let index = usize::try_from(offset / PAGE_SIZE as u64)
+            .map_err(|_| TranslationError::CorruptTable)?;
         if index >= self.used {
             return Err(TranslationError::CorruptTable);
         }
@@ -433,7 +427,7 @@ fn level_size(level: u8) -> u64 {
     match level {
         1 => L1_SIZE,
         2 => L2_SIZE,
-        3 => PAGE_SIZE,
+        3 => PAGE_SIZE as u64,
         _ => unreachable!(),
     }
 }
@@ -472,6 +466,7 @@ fn leaf_descriptor(level: u8, pa: u64, mapping: Mapping) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::is_aligned;
 
     #[test]
     fn validates_alignment_and_physical_address_width() {
@@ -507,7 +502,7 @@ mod tests {
             .map(mapping(0x4000_0000, 0x4000_0000, L2_SIZE))
             .unwrap();
         tables
-            .map(mapping(0x5000_1000, 0x6000_1000, PAGE_SIZE))
+            .map(mapping(0x5000_1000, 0x6000_1000, PAGE_SIZE as u64))
             .unwrap();
 
         assert_eq!(tables.walk(0x1234).unwrap().unwrap().level, 1);
@@ -532,7 +527,7 @@ mod tests {
             .map(Mapping {
                 va: 0xfe21_5000,
                 pa: 0xfe21_5000,
-                size: PAGE_SIZE,
+                size: PAGE_SIZE as u64,
                 memory_type: MemoryType::Device,
                 writable: true,
                 executable: false,
@@ -548,9 +543,9 @@ mod tests {
     fn encodes_el2_xn_in_bit_54() {
         let executable = Mapping {
             executable: true,
-            ..mapping(0x400_1000, 0x400_1000, PAGE_SIZE)
+            ..mapping(0x400_1000, 0x400_1000, PAGE_SIZE as u64)
         };
-        let non_executable = mapping(0x400_2000, 0x400_2000, PAGE_SIZE);
+        let non_executable = mapping(0x400_2000, 0x400_2000, PAGE_SIZE as u64);
         let executable_descriptor = leaf_descriptor(3, executable.pa, executable);
         let non_executable_descriptor = leaf_descriptor(3, non_executable.pa, non_executable);
 
@@ -565,11 +560,11 @@ mod tests {
         let mut storage = TableStorage::<4>::zeroed();
         let mut tables = TableSet::new(&mut storage, 0x3000_0000, 44).unwrap();
         tables
-            .map(mapping(0x405a_000, 0x405a_000, PAGE_SIZE))
+            .map(mapping(0x405a_000, 0x405a_000, PAGE_SIZE as u64))
             .unwrap();
         assert_eq!(tables.walk(0x4059_000).unwrap(), None);
         assert_eq!(
-            tables.map(mapping(0x405a_000, 0x505a_000, PAGE_SIZE)),
+            tables.map(mapping(0x405a_000, 0x505a_000, PAGE_SIZE as u64)),
             Err(TranslationError::ConflictingEntry)
         );
     }
@@ -579,21 +574,21 @@ mod tests {
         let mut one_storage = TableStorage::<1>::zeroed();
         let mut one = TableSet::new(&mut one_storage, 0x3000_0000, 44).unwrap();
         assert_eq!(
-            one.map(mapping(0x1000, 0x1000, PAGE_SIZE)),
+            one.map(mapping(0x1000, 0x1000, PAGE_SIZE as u64)),
             Err(TranslationError::TableExhausted)
         );
         let mut storage = TableStorage::<4>::zeroed();
         let mut tables = TableSet::new(&mut storage, 0x3000_0000, 36).unwrap();
         assert_eq!(
-            tables.map(mapping(1 << VA_BITS, 0, PAGE_SIZE)),
+            tables.map(mapping(1 << VA_BITS, 0, PAGE_SIZE as u64)),
             Err(TranslationError::VirtualAddressOutOfRange)
         );
         assert_eq!(
-            tables.map(mapping(0, 1 << 36, PAGE_SIZE)),
+            tables.map(mapping(0, 1 << 36, PAGE_SIZE as u64)),
             Err(TranslationError::PhysicalAddressOutOfRange)
         );
         assert_eq!(
-            tables.map(mapping(1, 0, PAGE_SIZE)),
+            tables.map(mapping(1, 0, PAGE_SIZE as u64)),
             Err(TranslationError::UnalignedMapping)
         );
     }

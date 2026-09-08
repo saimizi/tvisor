@@ -3,7 +3,7 @@
 use core::fmt;
 
 use tvisor_util::{
-    el2_translation::PAGE_SIZE,
+    PAGE_SIZE,
     heap_allocator::{HeapError, HeapStats, TvisorHeap},
     page_allocator::AllocatorError,
     system_info::PhysAddr,

@@ -7,13 +7,12 @@ use core::{
 use spin::Mutex;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::stop;
-use tvisor_util::el2_translation::{PAGE_SIZE, is_page_aligned};
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::AllocatorStats;
 use tvisor_util::platform::discover_memory_map;
-use tvisor_util::println;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
+use tvisor_util::*;
 
 use crate::{
     heap::{self, InitializedHeap, stats},
@@ -62,7 +61,7 @@ __enter_private_el2:
 );
 
 pub unsafe fn enter_private_el2(bootstrap: mm::BootstrapPageTable) -> ! {
-    if !is_page_aligned(bootstrap.root_pa) {
+    if !is_page_aligned(bootstrap.root_pa as usize) {
         println!("Bootstrap page table is not page aligned");
         stop()
     }
@@ -231,7 +230,7 @@ extern "C" fn post_switch_page_tables(
 
         let live_dtb: PhysRegion = (*fdt).into();
         let live_dtb_pages =
-            match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE) {
+            match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64) {
                 Ok(region) => region,
                 Err(error) => {
                     println!("Failed to page-align live DTB: {}", error);
@@ -302,9 +301,10 @@ extern "C" fn post_switch_page_tables(
         );
         println!("{}", current_heap_state);
 
-        crate::guest::run_guest();
-
-        println!("Phase 9 checkpoint complete; halting");
+        match crate::guest::run_guest() {
+            Ok(()) => println!("Phase 9 checkpoint complete; halting"),
+            Err(error) => println!("Phase 9 guest execution failed: {}", error),
+        }
     }
 
     loop {
