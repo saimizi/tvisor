@@ -152,11 +152,19 @@ impl VmMem {
         }
     }
 
-    pub fn size(&self) -> usize {
+    fn physical_pages(&self) -> usize {
         match self {
-            VmMem::IpaPa(v) => v.size,
-            VmMem::PaOnly(v) => v.pa.len() * PAGE_SIZE,
-            VmMem::IpaOnly(v) => v.size,
+            Self::IpaOnly(_) => 0,
+            Self::IpaPa(region) => region.size / PAGE_SIZE,
+            Self::PaOnly(region) => region.pa.len(),
+        }
+    }
+
+    fn ipa_range(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::IpaPa(region) => Some((region.ipa.value(), region.ipa_end()?.value())),
+            Self::IpaOnly(region) => Some((region.base.value(), region.end()?.value())),
+            Self::PaOnly(_) => None,
         }
     }
 }
@@ -310,12 +318,32 @@ impl VmCtl {
         Self::default()
     }
 
-    pub fn total_memory(&self) -> usize {
-        let mut size = 0;
-        for v in &self.vm_mem {
-            size += v.size();
+    fn allocated_physical_pages(&self) -> usize {
+        self.vm_mem.iter().map(VmMem::physical_pages).sum()
+    }
+
+    fn validate_ipa_range(&self, ipa: AddressType, size: usize) -> Result<(), AllocatorError> {
+        let start = ipa.value();
+        if size == 0 || !is_page_aligned(start as usize) {
+            return Err(AllocatorError::InvalidIpa);
         }
-        size
+        let end = start
+            .checked_add(size as u64)
+            .ok_or(AllocatorError::AddressOverflow)?;
+        if end - 1 > (1_u64 << IPA_BITS) - 1 {
+            return Err(AllocatorError::InvalidIpa);
+        }
+
+        if self
+            .vm_mem
+            .iter()
+            .filter_map(VmMem::ipa_range)
+            .any(|(existing_start, existing_end)| start < existing_end && existing_start < end)
+        {
+            return Err(AllocatorError::OverlappingIpa);
+        }
+
+        Ok(())
     }
 
     pub fn vm_mem_alloc(
@@ -342,10 +370,22 @@ impl VmCtl {
         if needs_ipa && ipa.is_none() {
             return Err(AllocatorError::InvalidateParameter);
         }
+        if !needs_ipa && ipa.is_some() {
+            return Err(AllocatorError::InvalidateParameter);
+        }
+        if let Some(ipa) = ipa {
+            self.validate_ipa_range(ipa, size_aligned)?;
+        }
 
         let mut phy = AddressType::new(0);
         if usage.need_physical_memory() {
-            if round_up_to_page(self.total_memory() + size_aligned) > MAX_GUEST_MEM_PAGES {
+            let pages = size_aligned / PAGE_SIZE;
+            if self
+                .allocated_physical_pages()
+                .checked_add(pages)
+                .ok_or(AllocatorError::AddressOverflow)?
+                > MAX_GUEST_MEM_PAGES
+            {
                 return Err(AllocatorError::Exhausted);
             }
 
@@ -391,6 +431,10 @@ impl VmCtl {
     }
 
     fn vm_mem_alloc_sub_page_table(&mut self) -> Result<AddressType, AllocatorError> {
+        if self.allocated_physical_pages() >= MAX_GUEST_MEM_PAGES {
+            return Err(AllocatorError::Exhausted);
+        }
+
         let Some(VmMem::PaOnly(pt)) = self
             .vm_mem
             .iter_mut()

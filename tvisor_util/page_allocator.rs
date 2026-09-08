@@ -28,6 +28,8 @@ pub enum AllocatorError {
     DoubleFree,
     AlreadyAllocated,
     InvalidateParameter,
+    InvalidIpa,
+    OverlappingIpa,
     Unexpected,
 }
 

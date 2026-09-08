@@ -301,8 +301,9 @@ extern "C" fn post_switch_page_tables(
         );
         println!("{}", current_heap_state);
 
-        if let Ok(_) = crate::guest::run_guest() {
-            println!("Phase 9 checkpoint complete; halting");
+        match crate::guest::run_guest() {
+            Ok(()) => println!("Phase 9 checkpoint complete; halting"),
+            Err(error) => println!("Phase 9 guest execution failed: {}", error),
         }
     }
 
