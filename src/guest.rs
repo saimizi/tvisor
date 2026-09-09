@@ -304,7 +304,7 @@ impl GuestResourceManager {
         let page = mm::allocate_page()?;
         let pa = page.value();
         unsafe {
-            core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
         }
         self.chunks.push(Chunk::new(page, 1).unwrap());
         Ok(pa)
@@ -360,50 +360,40 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     println!("Phase 9: Preparing guest execution environment...");
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
-                            ipa: Option<AddressType>,
+                            ipa: IpaAddr,
                             size: usize|
      -> Result<(u64, u64, usize), TranslationError> {
-        vm_ctl
-            .vm_mem_alloc(usage, ipa, size)
-            .and_then(|t| {
-                if let VmMem::IpaPa(v) = t {
-                    Ok((v.pa.value(), v.ipa.value(), v.size))
-                } else {
-                    Err(AllocatorError::Unexpected)
-                }
-            })
-            .map_err(|_| TranslationError::Unexpected)
+        let pa = vm_ctl
+            .vm_mem_alloc(usage, Some(ipa), size)
+            .map_err(|_| TranslationError::Unexpected)?
+            .ok_or(TranslationError::Unexpected)?;
+
+        Ok((pa.value(), ipa.value(), size))
     };
 
     // 2. Allocate individual 4 KiB physical backing pages for guest regions
     let (payload_pa, payload_ipa, payload_size) = alloc_ipa_pa(
         VmMemUsage::Image,
-        Some(AddressType::new(GUEST_PAYLOAD_IPA)),
+        IpaAddr::new(GUEST_PAYLOAD_IPA),
         PAGE_SIZE,
     )?;
 
     let (scratch_pa, scratch_ipa, scratch_size) = alloc_ipa_pa(
         VmMemUsage::Scratch,
-        Some(AddressType::new(GUEST_SCRATCH_IPA)),
+        IpaAddr::new(GUEST_SCRATCH_IPA),
         PAGE_SIZE,
     )?;
 
-    let (stack_pa, stack_ipa, stack_size) = alloc_ipa_pa(
-        VmMemUsage::Stack,
-        Some(AddressType::new(GUEST_STACK_IPA)),
-        PAGE_SIZE,
-    )?;
+    let (stack_pa, stack_ipa, stack_size) =
+        alloc_ipa_pa(VmMemUsage::Stack, IpaAddr::new(GUEST_STACK_IPA), PAGE_SIZE)?;
 
-    let (dtb_pa, dtb_ipa, dtb_size) = alloc_ipa_pa(
-        VmMemUsage::DTB,
-        Some(AddressType::new(GUEST_DTB_IPA)),
-        PAGE_SIZE,
-    )?;
+    let (dtb_pa, dtb_ipa, dtb_size) =
+        alloc_ipa_pa(VmMemUsage::Dtb, IpaAddr::new(GUEST_DTB_IPA), PAGE_SIZE)?;
 
     vm_ctl
         .vm_mem_alloc(
             VmMemUsage::Guard,
-            Some(AddressType::new(GUEST_GUARD_IPA)),
+            Some(IpaAddr::new(GUEST_GUARD_IPA)),
             PAGE_SIZE,
         )
         .map_err(|_| TranslationError::Unexpected)?;
@@ -419,10 +409,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     };
     let payload_len = payload_end.saturating_sub(payload_start);
     assert!(payload_len > 0, "payload must not be empty");
-    assert!(
-        payload_len <= PAGE_SIZE as usize,
-        "payload must fit in one page"
-    );
+    assert!(payload_len <= PAGE_SIZE, "payload must fit in one page");
 
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -510,7 +497,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
 
     // DTB page: ReadOnly, ExecuteNever
     vm_ctl.map(
-        VmMemUsage::DTB,
+        VmMemUsage::Dtb,
         Stage2MemoryType::NormalWbWa,
         Stage2Access::ReadOnly,
         Stage2Exec::ExecuteNever,
@@ -518,18 +505,12 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
     let stage2_root_pa = vm_ctl.page_table_root().unwrap().value();
-    let stage2_regs = stage2_register_values(1, stage2_root_pa, pa_range)?;
+    let stage2_regs = stage2_register_values(vm_ctl.vm_id(), stage2_root_pa, pa_range)?;
 
     let used_pages = vm_ctl
-        .vm_mem(VmMemUsage::PageTable)
-        .and_then(|t| {
-            if let VmMem::PaOnly(v) = t {
-                Some(v.pa.len())
-            } else {
-                None
-            }
-        })
-        .ok_or(TranslationError::Unexpected)?;
+        .entry_pa(VmMemUsage::PageTable)
+        .map(|v| v.size() / PAGE_SIZE as u64)
+        .sum::<u64>();
 
     println!(
         "  Stage-2 translation tables initialized: root_pa={:#018x} used_pages={}",
@@ -648,7 +629,7 @@ pub fn run_guest() -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
 
-    let mut vm_ctl = VmCtl::new();
+    let mut vm_ctl = VmCtl::new(1);
     let mut stage2_active = false;
 
     {

@@ -63,13 +63,13 @@ pub const HCR_EL2_VM: u64 = 1 << 0;
 pub const HCR_EL2_SWIO: u64 = 1 << 1;
 pub const HCR_EL2_TSC: u64 = 1 << 19;
 pub const HCR_EL2_RW: u64 = 1 << 31;
-pub const HCR_EL2_PHASE9_VALUE: u64 = HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | HCR_EL2_VM;
+pub const HCR_EL2_STAGE2_VALUE: u64 = HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | HCR_EL2_VM;
 
 pub const CPTR_EL2_TFP: u64 = 1 << 10;
 pub const CPTR_EL2_RES1: u64 = (0b11 << 12) | 0x3ff;
 /// CPTR_EL2 value used while tvisor executes at EL2. TFP remains clear because
 /// Rust and compiler-generated routines may use FP/Advanced SIMD instructions.
-pub const CPTR_EL2_PHASE9_VALUE: u64 = CPTR_EL2_RES1;
+pub const CPTR_EL2_STAGE2_VALUE: u64 = CPTR_EL2_RES1;
 
 /// Virtual MPIDR_EL1 for vCPU 0 on a virtual uniprocessor system.
 /// Bit 31 = RES1 (1)
@@ -390,17 +390,17 @@ fn decode_l3_page_attributes(desc: u64) -> (Stage2MemoryType, Stage2Access, Stag
 }
 
 pub fn stage2_register_values(
-    vmid: u8,
+    vm_id: u8,
     root_table_pa: u64,
-    parange: u8,
+    pa_range: u8,
 ) -> Result<Stage2RegisterValues, TranslationError> {
-    let pa_bits = pa_bits_from_pa_range(parange)?;
+    let pa_bits = pa_bits_from_pa_range(pa_range)?;
     let max_root_pa = (1_u64 << pa_bits) - 1;
     if !is_page_aligned(root_table_pa as usize) || root_table_pa > max_root_pa {
         return Err(TranslationError::InvalidTableBase);
     }
 
-    let ps_field = ((parange & 0x7) as u64) << 16;
+    let ps_field = ((pa_range & 0x7) as u64) << 16;
     let vtcr_el2 = VTCR_EL2_RES1
         | VTCR_EL2_TG0_4KB
         | VTCR_EL2_SH0_INNER
@@ -410,13 +410,13 @@ pub fn stage2_register_values(
         | ps_field
         | VTCR_EL2_T0SZ_39_BIT;
 
-    let vttbr_el2 = ((vmid as u64) << 48) | (root_table_pa & ADDRESS_MASK);
+    let vttbr_el2 = ((vm_id as u64) << 48) | (root_table_pa & ADDRESS_MASK);
 
     Ok(Stage2RegisterValues {
         vtcr_el2,
         vttbr_el2,
-        hcr_el2: HCR_EL2_PHASE9_VALUE,
-        cptr_el2: CPTR_EL2_PHASE9_VALUE,
+        hcr_el2: HCR_EL2_STAGE2_VALUE,
+        cptr_el2: CPTR_EL2_STAGE2_VALUE,
         vmpidr_el2: VMPIDR_EL2_VCPU0,
     })
 }
