@@ -1,5 +1,6 @@
 use crate::alloc::string::ToString;
 use crate::mm;
+use crate::vcpu::Vcpu;
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
@@ -315,6 +316,7 @@ impl Display for VmMem {
 pub struct VmCtl {
     vm_id: u8,
     vm_mem: Vec<VmMem>,
+    vcpus: Vec<Vcpu>,
 }
 
 impl VmCtl {
@@ -465,7 +467,19 @@ impl VmCtl {
         Self {
             vm_id,
             vm_mem: Vec::new(),
+            vcpus: Vec::new(),
         }
+    }
+
+    /// Adds a VM-owned vCPU and returns its VM-local identifier.
+    pub fn add_vcpu(&mut self, vcpu: Vcpu) -> usize {
+        let id = self.vcpus.len();
+        self.vcpus.push(vcpu);
+        id
+    }
+
+    pub fn vcpu_mut(&mut self, id: usize) -> Option<&mut Vcpu> {
+        self.vcpus.get_mut(id)
     }
 
     pub fn vm_id(&self) -> u8 {

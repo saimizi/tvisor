@@ -12,7 +12,7 @@ use tvisor_util::stage2_translation::{
 use tvisor_util::{PAGE_SIZE, println};
 
 use crate::mm;
-use crate::vcpu::{__vcpu_run, VcpuContext, VcpuExit, VcpuExitReason};
+use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
 
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
@@ -404,26 +404,29 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
     *stage2_active = true;
 
-    // 8. Initialize vCPU Context
+    // 8. Create the VM-owned vCPU. The pCPU associates with it only while
+    // entering guest execution.
     // Stack grows from high to low, so initial stack pointer is set to the stack_ipa + stack_size
-    let mut context = VcpuContext::new(payload_ipa, stack_ipa + stack_size as u64);
-    context.x[0] = dtb_ipa;
-    let mut exit = VcpuExit::default();
+    let mut vcpu = Vcpu::new(payload_ipa, stack_ipa + stack_size as u64);
+    vcpu.context_mut().x[0] = dtb_ipa;
+    let vcpu_id = vm_ctl.add_vcpu(vcpu);
+    let vcpu = vm_ctl.vcpu_mut(vcpu_id).expect("new vCPU must be present");
 
     println!("Phase 9: Entering guest EL1 execution loop...");
     // Checkpoint 1 (Guest RAM read/write test)
     println!(
         "  Starting guest execution at IPA {:#018x}...",
-        context.elr_el2
+        vcpu.context().elr_el2
     );
 
-    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    let vector = unsafe { __vcpu_run(vcpu) };
     assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
 
-    let reason = exit.decode_reason(&context);
+    let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
         "  Guest exit 1: ESR_EL2={:#018x} reason={:?}",
-        exit.esr_el2, reason
+        vcpu.exit().esr_el2,
+        reason
     );
 
     match reason {
@@ -433,44 +436,52 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         VcpuExitReason::Hvc { imm, arg0 } => {
             panic!(
                 "Guest failure exit at Checkpoint 1: HVC #{} with x0={:#x} x1={:#x}",
-                imm, arg0, context.x[1]
+                imm,
+                arg0,
+                vcpu.context().x[1]
             );
         }
         other => panic!("Unexpected exit at Checkpoint 1: {:?}", other),
     }
 
     // Checkpoint 2 (System register verification)
-    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    let vector = unsafe { __vcpu_run(vcpu) };
     assert_eq!(vector, 8);
-    let reason = exit.decode_reason(&context);
+    let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
         "  Guest exit 2: ESR_EL2={:#018x} reason={:?}",
-        exit.esr_el2, reason
+        vcpu.exit().esr_el2,
+        reason
     );
     match reason {
         VcpuExitReason::Hvc { imm: 0, arg0: 2 } => {
             println!(
                 "  [OK] Guest Checkpoint 2: System registers verified (CurrentEL=EL1, MPIDR_EL1={:#010x})",
-                context.x[1]
+                vcpu.context().x[1]
             );
         }
         VcpuExitReason::Hvc { imm, arg0 } => {
             panic!(
                 "Guest failure exit at Checkpoint 2: HVC #{} with x0={:#x} x1={:#x}",
-                imm, arg0, context.x[1]
+                imm,
+                arg0,
+                vcpu.context().x[1]
             );
         }
         other => panic!("Unexpected exit at Checkpoint 2: {:?}", other),
     }
 
     // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-    let vector = unsafe { __vcpu_run(&mut context, &mut exit) };
+    let vector = unsafe { __vcpu_run(vcpu) };
     assert_eq!(vector, 8);
-    let reason = exit.decode_reason(&context);
-    let fault_ipa = exit.fault_ipa();
+    let reason = vcpu.exit().decode_reason(vcpu.context());
+    let fault_ipa = vcpu.exit().fault_ipa();
     println!(
         "  Guest exit 3: ESR_EL2={:#018x} FAR_EL2={:#018x} HPFAR_EL2={:#018x} fault_ipa={:#018x}",
-        exit.esr_el2, exit.far_el2, exit.hpfar_el2, fault_ipa
+        vcpu.exit().esr_el2,
+        vcpu.exit().far_el2,
+        vcpu.exit().hpfar_el2,
+        fault_ipa
     );
 
     match reason {
@@ -497,7 +508,9 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         VcpuExitReason::Hvc { imm, arg0 } => {
             panic!(
                 "Guest reported failure before Stage-2 abort: HVC #{} with x0={:#x} x1={:#x}",
-                imm, arg0, context.x[1]
+                imm,
+                arg0,
+                vcpu.context().x[1]
             );
         }
         other => panic!("Unexpected exit at Checkpoint 3: {:?}", other),
