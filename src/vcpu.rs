@@ -150,6 +150,19 @@ impl Vcpu {
         }
     }
 
+    /// Constructs the initial EL1 state required by the standard arm64 Linux
+    /// boot ABI. Linux establishes its own stack and translation regime after
+    /// entry, so no Phase-9 test stack or HVC protocol is carried into it.
+    #[allow(dead_code)] // Used by the Phase 10 Linux image-loader path.
+    pub const fn new_linux(entry_pc: u64, dtb_ipa: u64) -> Self {
+        let mut vcpu = Self::new(entry_pc, 0);
+        vcpu.context.x[0] = dtb_ipa;
+        vcpu.context.x[1] = 0;
+        vcpu.context.x[2] = 0;
+        vcpu.context.x[3] = 0;
+        vcpu
+    }
+
     pub fn context(&self) -> &VcpuContext {
         &self.context
     }
