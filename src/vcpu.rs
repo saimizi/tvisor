@@ -1,6 +1,26 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
 use core::arch::global_asm;
+use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcpuMmioError {
+    Decode(MmioDecodeError),
+    Emulation(MmioEmulationError),
+    ProgramCounterOverflow,
+}
+
+impl core::fmt::Display for VcpuMmioError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(f, "cannot decode trapped MMIO: {error}"),
+            Self::Emulation(error) => write!(f, "cannot emulate trapped MMIO: {error}"),
+            Self::ProgramCounterOverflow => {
+                f.write_str("cannot advance guest PC after MMIO emulation")
+            }
+        }
+    }
+}
 
 #[repr(C, align(16))]
 #[derive(Debug, Clone)]
@@ -50,6 +70,26 @@ impl VcpuContext {
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
+    }
+
+    /// Emulates a successfully decoded stage-2 MMIO abort. The guest PC is
+    /// advanced only after the device has completed the access and any read
+    /// result is safely present in the target guest register.
+    pub fn emulate_stage2_mmio(
+        &mut self,
+        exit: &VcpuExit,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<Option<u8>, VcpuMmioError> {
+        let access = MmioAccess::decode_data_abort(exit.esr_el2, exit.fault_ipa())
+            .map_err(VcpuMmioError::Decode)?;
+        let transmit = dispatcher
+            .emulate(access, &mut self.x)
+            .map_err(VcpuMmioError::Emulation)?;
+        self.elr_el2 = self
+            .elr_el2
+            .checked_add(4)
+            .ok_or(VcpuMmioError::ProgramCounterOverflow)?;
+        Ok(transmit)
     }
 }
 

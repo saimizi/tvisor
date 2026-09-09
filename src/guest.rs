@@ -13,6 +13,7 @@ use tvisor_util::{PAGE_SIZE, println};
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
+use tvisor_util::mmio::{MmioDispatcher, VIRTUAL_PL011_IPA, VIRTUAL_PL011_SIZE};
 
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
@@ -237,6 +238,35 @@ unsafe fn deactivate_stage2() {
     }
 }
 
+/// Runs a vCPU until a non-emulated exit. A virtual-PL011 stage-2 abort is
+/// completed and resumed here, keeping the physical Mini UART host-owned.
+fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
+    loop {
+        let vector = unsafe { __vcpu_run(vcpu) };
+        if vector != 8 {
+            return vector;
+        }
+
+        let reason = vcpu.exit().decode_reason(vcpu.context());
+        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
+            return vector;
+        };
+        if !(VIRTUAL_PL011_IPA..VIRTUAL_PL011_IPA + VIRTUAL_PL011_SIZE).contains(&ipa) {
+            return vector;
+        }
+
+        let exit = *vcpu.exit();
+        let transmit = vcpu
+            .context_mut()
+            .emulate_stage2_mmio(&exit, dispatcher)
+            .unwrap_or_else(|error| panic!("Virtual PL011 MMIO emulation failed: {error}"));
+        if let Some(byte) = transmit {
+            tvisor_util::debug_util::write_byte(byte)
+                .unwrap_or_else(|_| panic!("Virtual PL011 transmit could not reach host console"));
+        }
+    }
+}
+
 fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
 
@@ -413,13 +443,14 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     let vcpu = vm_ctl.vcpu_mut(vcpu_id).expect("new vCPU must be present");
 
     println!("Phase 9: Entering guest EL1 execution loop...");
+    let mut mmio_dispatcher = MmioDispatcher::default();
     // Checkpoint 1 (Guest RAM read/write test)
     println!(
         "  Starting guest execution at IPA {:#018x}...",
         vcpu.context().elr_el2
     );
 
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
     assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
 
     let reason = vcpu.exit().decode_reason(vcpu.context());
@@ -445,7 +476,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 2 (System register verification)
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
@@ -472,7 +503,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     let fault_ipa = vcpu.exit().fault_ipa();
