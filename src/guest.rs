@@ -1,19 +1,15 @@
 //! Guest platform initialization, Stage-2 translation setup, and Phase 9 test runner.
 
-use alloc::vec::Vec;
 use core::arch::global_asm;
 
 use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
 use tvisor_util::el2_translation::TranslationError;
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
-use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::stage2_translation::{
-    Stage2Access, Stage2Allocator, Stage2Exec, Stage2MemoryType, Stage2RegisterValues,
-    stage2_register_values,
+    Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
 };
-use tvisor_util::system_info::PhysAddr;
-use tvisor_util::{PAGE_SIZE, align_up, is_page_aligned, println};
+use tvisor_util::{PAGE_SIZE, println};
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, VcpuContext, VcpuExit, VcpuExitReason};
@@ -238,121 +234,6 @@ unsafe fn deactivate_stage2() {
             out("x9") _,
             options(nostack, preserves_flags),
         );
-    }
-}
-
-pub struct Chunk {
-    start: AddressType,
-    pages: usize,
-}
-
-impl Chunk {
-    pub fn new(start: AddressType, pages: usize) -> Option<Self> {
-        if is_page_aligned(start.value() as usize) {
-            Some(Self { start, pages })
-        } else {
-            None
-        }
-    }
-
-    pub fn start(&self) -> AddressType {
-        self.start
-    }
-
-    pub fn pages(&self) -> usize {
-        self.pages
-    }
-}
-
-/// Resource tracker that records every allocated guest page and provides transactional rollback.
-#[derive(Default)]
-pub struct GuestResourceManager {
-    chunks: Vec<Chunk>,
-}
-
-impl GuestResourceManager {
-    pub const fn new() -> Self {
-        Self { chunks: Vec::new() }
-    }
-
-    pub fn allocate(&mut self, size: usize) -> Result<(AddressType, usize), AllocatorError> {
-        let aligned_size =
-            align_up(size, PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)? as usize;
-
-        let pages = aligned_size / PAGE_SIZE;
-
-        if self.allocated_count() + pages > MAX_GUEST_MEM_PAGES {
-            return Err(AllocatorError::Exhausted);
-        }
-
-        let phy = mm::allocate_contiguous_pages(pages)?;
-        let pa = phy.value();
-        unsafe {
-            core::ptr::write_bytes(pa as *mut u8, 0, pages * PAGE_SIZE);
-        }
-
-        self.chunks.push(Chunk::new(phy, pages).unwrap());
-
-        Ok((phy, aligned_size))
-    }
-
-    pub fn allocate_page(&mut self) -> Result<u64, AllocatorError> {
-        if self.allocated_count() + 1 > MAX_GUEST_MEM_PAGES {
-            return Err(AllocatorError::Exhausted);
-        }
-
-        let page = mm::allocate_page()?;
-        let pa = page.value();
-        unsafe {
-            core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
-        }
-        self.chunks.push(Chunk::new(page, 1).unwrap());
-        Ok(pa)
-    }
-
-    pub fn allocated_chunks(&self) -> &[Chunk] {
-        &self.chunks
-    }
-
-    pub fn allocated_count(&self) -> usize {
-        let mut pages = 0;
-
-        for c in self.chunks.iter() {
-            pages += c.pages;
-        }
-
-        pages
-    }
-
-    pub fn free_chunk(&mut self, chunk: Chunk) {
-        for page in 0..chunk.pages() {
-            let pa = chunk.start().value() + (page * PAGE_SIZE) as u64;
-
-            if let Err(e) = mm::free_page(PhysAddr::new(pa)) {
-                println!("Free page error: {}", e);
-            }
-        }
-    }
-
-    pub fn free_chunk_by_addr(&mut self, pa: u64) {
-        if let Some(pos) = self.chunks.iter().position(|v| v.start().value() == pa) {
-            let chunk = self.chunks.remove(pos);
-            self.free_chunk(chunk);
-        }
-    }
-
-    /// Releases all tracked pages in reverse allocation order (LIFO).
-    pub fn rollback(&mut self) {
-        while let Some(pa) = self.chunks.pop() {
-            self.free_chunk(pa);
-        }
-    }
-}
-
-unsafe impl Stage2Allocator for &mut GuestResourceManager {
-    fn allocate_table_page(&mut self) -> Result<u64, TranslationError> {
-        self.allocate_page()
-            .map_err(|_| TranslationError::TableExhausted)
     }
 }
 
