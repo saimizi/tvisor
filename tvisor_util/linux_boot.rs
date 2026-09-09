@@ -5,7 +5,7 @@
 
 use core::fmt;
 
-use crate::PAGE_SIZE;
+use crate::{PAGE_SIZE, is_aligned, is_page_aligned};
 
 pub const LINUX_GUEST_RAM_IPA: u64 = 0x4000_0000;
 pub const LINUX_GUEST_RAM_SIZE: u64 = 512 * 1024 * 1024;
@@ -38,6 +38,32 @@ impl fmt::Display for LinuxImageError {
 }
 
 /// The Linux arm64 Image header fields that affect loading and entry.
+/// all fields are little endian unless stated otherwise.
+///
+/// u32 code0;                    /* Executable code */
+/// u32 code1;                    /* Executable code */
+/// u64 text_offset;              /* Image load offset, little endian */
+/// u64 image_size;               /* Effective Image size, little endian */
+/// u64 flags;                    /* kernel flags, little endian */
+///  bit 0    :                   Kernel endianness. 1 if BE, 0 if LE
+///  bit 1..2 :                   Kernel Page Size:
+///                                     0: unspecified
+///                                     1: 4K
+///                                     2: 16K
+///                                     3: 64K
+///  bit 3    :                   Kernel physical placement
+///                                     0: 2MB aligned base should be low memory
+///                                     1: 2MB aligned base whole image should be in 48bit
+///                                        address space
+///  bit 4..63;                   Reserved
+/// u64 res2      = 0;            /* reserved */
+/// u64 res3      = 0;            /* reserved */
+/// u64 res4      = 0;            /* reserved */
+/// u32 magic     = 0x644d5241;   /* Magic number, little endian, "ARM\x64" */
+/// u32 res5;                     /* reserved (used for PE COFF offset) */
+///
+/// Note,
+///  * Image (including this header) must be loaded `text_offset` bytes from a 2MiB aligned base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxImageHeader {
     pub text_offset: u64,
@@ -120,7 +146,7 @@ impl fmt::Display for LinuxBootLayoutError {
 pub struct LinuxBootLayout {
     ram_ipa: u64,
     ram_size: u64,
-    image: LinuxImageHeader,
+    image_header: LinuxImageHeader,
     image_ipa: u64,
     dtb_ipa: u64,
     initrd: Option<(u64, u64)>,
@@ -150,7 +176,8 @@ impl LinuxBootLayout {
         initrd_size: Option<u64>,
     ) -> Result<Self, LinuxBootLayoutError> {
         let image_header = LinuxImageHeader::parse(image)?;
-        if ram_ipa & (LINUX_IMAGE_BASE_ALIGNMENT - 1) != 0 || ram_size & (PAGE_SIZE as u64 - 1) != 0
+        if !is_aligned(ram_ipa as usize, LINUX_IMAGE_BASE_ALIGNMENT as usize)
+            || !is_page_aligned(ram_size as usize)
         {
             return Err(LinuxBootLayoutError::InvalidRam);
         }
@@ -193,7 +220,7 @@ impl LinuxBootLayout {
         Ok(Self {
             ram_ipa,
             ram_size,
-            image: image_header,
+            image_header,
             image_ipa,
             dtb_ipa,
             initrd,
@@ -205,11 +232,11 @@ impl LinuxBootLayout {
     }
 
     pub const fn image_header(&self) -> LinuxImageHeader {
-        self.image
+        self.image_header
     }
 
     pub const fn image(&self) -> (u64, u64) {
-        (self.image_ipa, self.image.image_size)
+        (self.image_ipa, self.image_header.image_size)
     }
 
     pub const fn dtb(&self) -> (u64, u64) {
