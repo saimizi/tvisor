@@ -16,6 +16,68 @@ pub const MAX_GUEST_MEM_PAGES: usize = (MAX_GUEST_MEM_BYTES) / PAGE_SIZE;
 pub type AddressType = PhysAddr;
 pub type RegionType = PhysRegion;
 
+/// Guest intermediate physical address (IPA).
+///
+/// This is deliberately distinct from [`PhysAddr`], which names a host
+/// physical address, so callers cannot accidentally mix address spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IpaAddr(u64);
+
+impl IpaAddr {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    const fn checked_add(self, offset: u64) -> Option<Self> {
+        match self.0.checked_add(offset) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+impl Display for IpaAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "0x{:016x}", self.0)
+    }
+}
+
+/// A contiguous guest IPA range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpaRegion {
+    start: IpaAddr,
+    size: u64,
+}
+
+impl IpaRegion {
+    fn new(start: IpaAddr, size: u64) -> Option<Self> {
+        if size == 0 || start.checked_add(size).is_none() {
+            return None;
+        }
+
+        Some(Self { start, size })
+    }
+
+    pub const fn start(self) -> IpaAddr {
+        self.start
+    }
+
+    #[allow(unused)]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    #[allow(unused)]
+    pub const fn end(self) -> IpaAddr {
+        // Construction proves this addition cannot overflow.
+        IpaAddr(self.start.0 + self.size)
+    }
+}
+
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub enum VmMemUsage {
     Image,
@@ -55,21 +117,20 @@ impl Display for VmMemUsage {
 }
 
 #[derive(PartialEq, PartialOrd)]
-struct IpaRegion {
+struct IpaOnlyRegion {
     usage: VmMemUsage,
-    base: AddressType,
+    base: IpaAddr,
     size: usize,
 }
 
 #[allow(unused)]
-impl IpaRegion {
-    fn end(&self) -> Option<AddressType> {
-        let start: u64 = self.base.into();
-        start.checked_add(self.size as u64).map(AddressType::new)
+impl IpaOnlyRegion {
+    fn end(&self) -> Option<IpaAddr> {
+        self.base.checked_add(self.size as u64)
     }
 }
 
-impl Display for IpaRegion {
+impl Display for IpaOnlyRegion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
@@ -82,7 +143,7 @@ impl Display for IpaRegion {
 #[derive(PartialEq, PartialOrd)]
 struct IpaPaRegion {
     usage: VmMemUsage,
-    ipa: AddressType,
+    ipa: IpaAddr,
     pa: AddressType,
     size: usize,
 }
@@ -93,9 +154,8 @@ impl IpaPaRegion {
         start.checked_add(self.size as u64).map(AddressType::new)
     }
 
-    pub fn ipa_end(&self) -> Option<AddressType> {
-        let start: u64 = self.ipa.into();
-        start.checked_add(self.size as u64).map(AddressType::new)
+    pub fn ipa_end(&self) -> Option<IpaAddr> {
+        self.ipa.checked_add(self.size as u64)
     }
 }
 
@@ -133,7 +193,7 @@ impl Display for PaRegion {
 
 #[derive(PartialEq, PartialOrd)]
 enum VmMem {
-    IpaOnly(IpaRegion),
+    IpaOnly(IpaOnlyRegion),
     IpaPa(IpaPaRegion),
     PaOnly(PaRegion),
 }
@@ -182,15 +242,15 @@ struct IpaRegionsIter<'a> {
 }
 
 impl Iterator for IpaRegionsIter<'_> {
-    type Item = RegionType;
+    type Item = IpaRegion;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut next = None;
 
         for entry in self.entries {
             let Some(region) = (match entry {
-                VmMem::IpaPa(region) => RegionType::new(region.ipa, region.size as u64).ok(),
-                VmMem::IpaOnly(region) => RegionType::new(region.base, region.size as u64).ok(),
+                VmMem::IpaPa(region) => IpaRegion::new(region.ipa, region.size as u64),
+                VmMem::IpaOnly(region) => IpaRegion::new(region.base, region.size as u64),
                 VmMem::PaOnly(_) => None,
             }) else {
                 continue;
@@ -198,7 +258,7 @@ impl Iterator for IpaRegionsIter<'_> {
 
             let start = region.start().value();
             if self.previous_start.is_none_or(|previous| start > previous)
-                && next.is_none_or(|candidate: RegionType| start < candidate.start().value())
+                && next.is_none_or(|candidate: IpaRegion| start < candidate.start().value())
             {
                 next = Some(region);
             }
@@ -251,7 +311,6 @@ impl Display for VmMem {
     }
 }
 
-#[derive(Default)]
 pub struct VmCtl {
     vm_id: u8,
     vm_mem: Vec<VmMem>,
@@ -396,7 +455,7 @@ impl VmCtl {
         self.vm_mem.iter().map(VmMem::physical_pages).sum()
     }
 
-    fn validate_ipa_range(&self, ipa: AddressType, size: usize) -> Result<(), AllocatorError> {
+    fn validate_ipa_range(&self, ipa: IpaAddr, size: usize) -> Result<(), AllocatorError> {
         let start = ipa.value();
         if size == 0 || !is_page_aligned(start as usize) {
             return Err(AllocatorError::InvalidIpa);
@@ -423,7 +482,7 @@ impl VmCtl {
     pub fn vm_mem_alloc(
         &mut self,
         usage: VmMemUsage,
-        ipa: Option<AddressType>,
+        ipa: Option<IpaAddr>,
         size: usize,
     ) -> Result<Option<PhysAddr>, AllocatorError> {
         let size_aligned =
@@ -489,7 +548,7 @@ impl VmCtl {
             }
             VmMemUsage::Guard => {
                 let ipa = ipa.expect("validated IpaOnly ipa");
-                VmMem::IpaOnly(IpaRegion {
+                VmMem::IpaOnly(IpaOnlyRegion {
                     usage,
                     base: ipa,
                     size: size_aligned,
@@ -537,17 +596,17 @@ impl VmCtl {
     }
 
     #[allow(unused)]
-    pub fn entry_ipa(&self, usage: VmMemUsage) -> Option<RegionType> {
+    pub fn entry_ipa(&self, usage: VmMemUsage) -> Option<IpaRegion> {
         let vm_mem = self.vm_mem.iter().find(|t| t.usage() == usage)?;
         match vm_mem {
-            VmMem::IpaPa(v) => Some(RegionType::new(v.ipa, v.size as u64).ok()?),
+            VmMem::IpaPa(v) => IpaRegion::new(v.ipa, v.size as u64),
             VmMem::PaOnly(_) => None,
-            VmMem::IpaOnly(v) => Some(RegionType::new(v.base, v.size as u64).ok()?),
+            VmMem::IpaOnly(v) => IpaRegion::new(v.base, v.size as u64),
         }
     }
 
     #[allow(unused)]
-    pub fn ipa_regions(&self) -> impl Iterator<Item = RegionType> + '_ {
+    pub fn ipa_regions(&self) -> impl Iterator<Item = IpaRegion> + '_ {
         IpaRegionsIter {
             entries: &self.vm_mem,
             previous_start: None,

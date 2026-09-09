@@ -360,7 +360,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     println!("Phase 9: Preparing guest execution environment...");
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
-                            ipa: AddressType,
+                            ipa: IpaAddr,
                             size: usize|
      -> Result<(u64, u64, usize), TranslationError> {
         let pa = vm_ctl
@@ -374,29 +374,26 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     // 2. Allocate individual 4 KiB physical backing pages for guest regions
     let (payload_pa, payload_ipa, payload_size) = alloc_ipa_pa(
         VmMemUsage::Image,
-        AddressType::new(GUEST_PAYLOAD_IPA),
+        IpaAddr::new(GUEST_PAYLOAD_IPA),
         PAGE_SIZE,
     )?;
 
     let (scratch_pa, scratch_ipa, scratch_size) = alloc_ipa_pa(
         VmMemUsage::Scratch,
-        AddressType::new(GUEST_SCRATCH_IPA),
+        IpaAddr::new(GUEST_SCRATCH_IPA),
         PAGE_SIZE,
     )?;
 
-    let (stack_pa, stack_ipa, stack_size) = alloc_ipa_pa(
-        VmMemUsage::Stack,
-        AddressType::new(GUEST_STACK_IPA),
-        PAGE_SIZE,
-    )?;
+    let (stack_pa, stack_ipa, stack_size) =
+        alloc_ipa_pa(VmMemUsage::Stack, IpaAddr::new(GUEST_STACK_IPA), PAGE_SIZE)?;
 
     let (dtb_pa, dtb_ipa, dtb_size) =
-        alloc_ipa_pa(VmMemUsage::Dtb, AddressType::new(GUEST_DTB_IPA), PAGE_SIZE)?;
+        alloc_ipa_pa(VmMemUsage::Dtb, IpaAddr::new(GUEST_DTB_IPA), PAGE_SIZE)?;
 
     vm_ctl
         .vm_mem_alloc(
             VmMemUsage::Guard,
-            Some(AddressType::new(GUEST_GUARD_IPA)),
+            Some(IpaAddr::new(GUEST_GUARD_IPA)),
             PAGE_SIZE,
         )
         .map_err(|_| TranslationError::Unexpected)?;
