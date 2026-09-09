@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format, vec::Vec};
+use alloc::format;
 use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
@@ -9,13 +9,12 @@ use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::stop;
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
-use tvisor_util::page_allocator::AllocatorStats;
 use tvisor_util::platform::discover_memory_map;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 use tvisor_util::*;
 
 use crate::{
-    heap::{self, InitializedHeap, stats},
+    heap::{self, stats},
     mm,
 };
 
@@ -171,37 +170,6 @@ fn check_switched_environment(
     println!("Phase 7 checkpoint 3: register, stack, and image validation passed");
 }
 
-#[allow(dead_code)]
-fn exception_vector_test() {
-    println!("Triggering deliberate synchronous exception under tvisor tables...");
-    unsafe { asm!("brk #0x600") };
-    println!("Returned from deliberate synchronous exception under tvisor tables");
-}
-
-#[allow(dead_code)]
-fn guard_page_test() {
-    unsafe extern "C" {
-        static __boot_stack_guard_start: u8;
-    }
-    let guard = core::ptr::addr_of!(__boot_stack_guard_start).cast_mut();
-    println!(
-        "Triggering deliberate guard-page write at {:#x}...",
-        guard.addr()
-    );
-    // SAFETY: This opt-in negative test deliberately faults and never
-    // returns; the private EL2 handler reports the translation fault.
-    unsafe { core::ptr::write_volatile(guard, 0) };
-}
-
-#[allow(dead_code)]
-fn unmap_test() {
-    const UNMAPPED_TEST_VA: usize = 0x2000_0000;
-    println!("Triggering deliberate unmapped read at {UNMAPPED_TEST_VA:#x}...");
-    // SAFETY: This opt-in negative test deliberately faults and never
-    // returns; the private EL2 handler reports the translation fault.
-    let _ = unsafe { core::ptr::read_volatile(UNMAPPED_TEST_VA as *const u8) };
-}
-
 #[unsafe(no_mangle)]
 extern "C" fn post_switch_page_tables(
     expected_mair: u64,
@@ -310,73 +278,4 @@ extern "C" fn post_switch_page_tables(
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
-}
-
-#[allow(dead_code)]
-fn phase_heap_allocator_test(heap: InitializedHeap) {
-    let boxed = Box::new(0x4845_4150_424f_5831_u64);
-    assert_eq!(*boxed, 0x4845_4150_424f_5831);
-    let boxed_address = (&*boxed as *const u64) as usize;
-    assert!(boxed_address >= heap.stats.arena_start);
-    assert!(boxed_address < heap.stats.arena_start + heap.stats.arena_bytes);
-
-    let mut values = Vec::<u64>::new();
-    values
-        .try_reserve_exact(128)
-        .expect("reserve heap test vector");
-    for value in 0..128_u64 {
-        values.push(value ^ 0x5456_4953_4f52_4845);
-    }
-    assert_eq!(values.len(), 128);
-    assert_eq!(values[0], 0x5456_4953_4f52_4845);
-    assert_eq!(values[127], 127 ^ 0x5456_4953_4f52_4845);
-    let vector_address = values.as_ptr() as usize;
-    assert!(vector_address >= heap.stats.arena_start);
-    assert!(vector_address < heap.stats.arena_start + heap.stats.arena_bytes);
-
-    let active = crate::heap::stats().expect("active heap statistics");
-    assert_eq!(active.live_allocations, 2);
-    assert!(active.used_bytes >= core::mem::size_of::<u64>() + 128 * core::mem::size_of::<u64>());
-    drop(values);
-    drop(boxed);
-
-    let final_stats = crate::heap::stats().expect("final heap statistics");
-    assert_eq!(final_stats.live_allocations, 0);
-    assert_eq!(final_stats.used_bytes, 0);
-    println!(
-        "Rust heap checkpoint complete: Box/Vec passed used={} free={} failures={}",
-        final_stats.used_bytes, final_stats.free_bytes, final_stats.failed_allocations
-    );
-}
-
-#[allow(dead_code)]
-fn phase8_allocator_test(baseline: AllocatorStats) {
-    let low = crate::mm::allocate_page().expect("allocate low test page");
-    let high = crate::mm::allocate_high_page().expect("allocate high test page");
-    assert_ne!(low, high);
-
-    for (page, pattern) in [
-        (low, 0x5038_4c4f_5750_4147_u64),
-        (high, 0x5038_4849_4748_5047_u64),
-    ] {
-        let pointer = page.value() as *mut u64;
-        // SAFETY: the allocator returned a mapped, exclusively owned Normal
-        // RAM page. Volatile accesses force the hardware validation traffic.
-        unsafe {
-            core::ptr::write_volatile(pointer, pattern);
-            assert_eq!(core::ptr::read_volatile(pointer), pattern);
-        }
-    }
-    println!("Phase 8 page test: low={} high={}", low, high);
-
-    crate::mm::free_page(low).expect("free low test page");
-    crate::mm::free_page(high).expect("free high test page");
-    let reused = crate::mm::allocate_page().expect("reallocate first-fit page");
-    assert_eq!(reused, low);
-    crate::mm::free_page(reused).expect("free reused page");
-
-    let final_stats = crate::mm::allocator_stats().expect("Phase 8 allocator statistics");
-    assert_eq!(final_stats.in_use_pages, baseline.in_use_pages);
-    assert_eq!(final_stats.unused_pages, baseline.unused_pages);
-    println!("Phase 8 checkpoint complete: allocator validation passed");
 }

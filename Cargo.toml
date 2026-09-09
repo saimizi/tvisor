@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["baremetal"]
+baremetal = []
+
 [lib]
 name = "tvisor_util"
 crate-type = ["rlib"]
@@ -12,6 +16,8 @@ path = "tvisor_util/lib.rs"
 [[bin]]
 name = "tvisor"
 path = "src/main.rs"
+test = false
+required-features = ["baremetal"]
 
 [dependencies]
 dtoolkit = { path = "third_party/dtoolkit", default-features = false, features = ["write"] }

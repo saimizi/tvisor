@@ -357,14 +357,6 @@ pub fn allocate_contiguous_pages(pages: usize) -> Result<PhysAddr, AllocatorErro
     with_allocator(|allocator| allocator.allocate_contiguous(pages))
 }
 
-/// Allocate the highest-addressed unused managed 4 KiB physical page.
-///
-/// The returned page is changed to `InUse`. This reverse-search API currently
-/// supports hardware validation of allocator coverage near the top of RAM.
-pub fn allocate_high_page() -> Result<PhysAddr, AllocatorError> {
-    with_allocator(|allocator| allocator.allocate_high())
-}
-
 pub fn free_page(page: PhysAddr) -> Result<(), AllocatorError> {
     with_allocator(|allocator| allocator.free(page))
 }

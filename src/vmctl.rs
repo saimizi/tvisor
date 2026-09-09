@@ -1,6 +1,7 @@
 use crate::alloc::string::ToString;
 use crate::mm;
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::el2_translation::*;
 use tvisor_util::page_allocator::AllocatorError;
@@ -336,14 +337,34 @@ impl VmCtl {
         access: Stage2Access,
         exec: Stage2Exec,
     ) -> Result<(), TranslationError> {
-        let Some(VmMem::IpaPa(mapping)) = self.vm_mem.iter().find(|f| f.usage() == usage) else {
-            return Err(TranslationError::InvalidateParameter);
-        };
-
+        #[cfg(target_arch = "aarch64")]
         let pa_bits = IdAa64Mmfr0El1::dump()
             .ok_or(TranslationError::Unexpected)?
             .pa_bits()
             .ok_or(TranslationError::Unexpected)?;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (usage, mem_type, access, exec);
+            return Err(TranslationError::Unexpected);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        self.map_with_pa_bits(usage, mem_type, access, exec, pa_bits)
+    }
+
+    fn map_with_pa_bits(
+        &mut self,
+        usage: VmMemUsage,
+        mem_type: Stage2MemoryType,
+        access: Stage2Access,
+        exec: Stage2Exec,
+        pa_bits: u8,
+    ) -> Result<(), TranslationError> {
+        let Some(VmMem::IpaPa(mapping)) = self.vm_mem.iter().find(|f| f.usage() == usage) else {
+            return Err(TranslationError::InvalidateParameter);
+        };
+
         let max_ipa = (1_u64 << IPA_BITS) - 1;
         let max_pa = (1_u64 << pa_bits) - 1;
         let ipa_end = mapping
@@ -623,14 +644,14 @@ impl VmCtl {
                     for page in 0..pages {
                         let pa = PhysAddr::new(start + (page * PAGE_SIZE) as u64);
                         if let Err(e) = mm::free_page(pa) {
-                            println!("Failed to free IpaPa page {}: {}", pa, e);
+                            tvisor_util::println!("Failed to free IpaPa page {}: {}", pa, e);
                         }
                     }
                 }
                 VmMem::PaOnly(region) => {
                     for pa in &region.pa {
                         if let Err(e) = mm::free_page(*pa) {
-                            println!("Failed to free PaOnly page {}: {}", pa, e);
+                            tvisor_util::println!("Failed to free PaOnly page {}: {}", pa, e);
                         }
                     }
                 }
@@ -654,5 +675,148 @@ impl Display for VmCtl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_PA_BITS: u8 = 48;
+    const IMAGE_IPA: u64 = 0x4000_0000;
+    const SCRATCH_IPA: u64 = IMAGE_IPA + PAGE_SIZE as u64;
+    const GUARD_IPA: u64 = IMAGE_IPA + 2 * PAGE_SIZE as u64;
+
+    fn leaf_descriptor(vm: &VmCtl, ipa: u64) -> u64 {
+        let root = vm.page_table_root().expect("page-table root");
+        let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
+        let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
+        let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
+
+        // SAFETY: test allocations are page-aligned and remain live for the
+        // duration of the VmCtl instance.
+        unsafe {
+            let root = &*(root.as_ptr() as *const TablePage);
+            let l2_pa = root.entries()[l1_idx] & ADDRESS_MASK;
+            let l2 = &*(l2_pa as *const TablePage);
+            let l3_pa = l2.entries()[l2_idx] & ADDRESS_MASK;
+            let l3 = &*(l3_pa as *const TablePage);
+            l3.entries()[l3_idx]
+        }
+    }
+
+    #[test]
+    fn vmctl_maps_stage2_pages_with_expected_permissions() {
+        let mut vm = VmCtl::new(1);
+        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+            .expect("allocate root page table");
+        vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
+            .expect("allocate image");
+        vm.vm_mem_alloc(
+            VmMemUsage::Scratch,
+            Some(IpaAddr::new(SCRATCH_IPA)),
+            PAGE_SIZE,
+        )
+        .expect("allocate scratch");
+
+        vm.map_with_pa_bits(
+            VmMemUsage::Image,
+            Stage2MemoryType::NormalWbWa,
+            Stage2Access::ReadOnly,
+            Stage2Exec::Executable,
+            TEST_PA_BITS,
+        )
+        .expect("map image");
+        vm.map_with_pa_bits(
+            VmMemUsage::Scratch,
+            Stage2MemoryType::NormalWbWa,
+            Stage2Access::ReadWrite,
+            Stage2Exec::ExecuteNever,
+            TEST_PA_BITS,
+        )
+        .expect("map scratch");
+
+        let image_pa = vm
+            .entry_pa(VmMemUsage::Image)
+            .next()
+            .expect("image page")
+            .start();
+        let scratch_pa = vm
+            .entry_pa(VmMemUsage::Scratch)
+            .next()
+            .expect("scratch page")
+            .start();
+        assert_eq!(
+            leaf_descriptor(&vm, IMAGE_IPA),
+            encode_l3_page_descriptor(
+                image_pa.value(),
+                Stage2MemoryType::NormalWbWa,
+                Stage2Access::ReadOnly,
+                Stage2Exec::Executable,
+            )
+        );
+        assert_eq!(
+            leaf_descriptor(&vm, SCRATCH_IPA),
+            encode_l3_page_descriptor(
+                scratch_pa.value(),
+                Stage2MemoryType::NormalWbWa,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
+        assert_eq!(vm.entry_pa(VmMemUsage::PageTable).count(), 3);
+    }
+
+    #[test]
+    fn vmctl_keeps_guard_ipa_unmapped() {
+        let mut vm = VmCtl::new(1);
+        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+            .expect("allocate root page table");
+        vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
+            .expect("allocate image");
+        vm.vm_mem_alloc(VmMemUsage::Guard, Some(IpaAddr::new(GUARD_IPA)), PAGE_SIZE)
+            .expect("allocate guard");
+
+        vm.map_with_pa_bits(
+            VmMemUsage::Image,
+            Stage2MemoryType::NormalWbWa,
+            Stage2Access::ReadOnly,
+            Stage2Exec::Executable,
+            TEST_PA_BITS,
+        )
+        .expect("map image");
+
+        let guard = vm.entry_ipa(VmMemUsage::Guard).expect("guard IPA");
+        assert_eq!(guard.start(), IpaAddr::new(GUARD_IPA));
+        assert_eq!(guard.size(), PAGE_SIZE as u64);
+        assert_eq!(leaf_descriptor(&vm, GUARD_IPA), 0);
+    }
+
+    #[test]
+    fn vmctl_stage2_table_allocation_respects_page_budget() {
+        let mut vm = VmCtl::new(1);
+        vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
+            .expect("allocate image");
+        vm.vm_mem_alloc(
+            VmMemUsage::PageTable,
+            None,
+            (MAX_GUEST_MEM_PAGES - 1) * PAGE_SIZE,
+        )
+        .expect("allocate page-table budget");
+
+        assert_eq!(
+            vm.map_with_pa_bits(
+                VmMemUsage::Image,
+                Stage2MemoryType::NormalWbWa,
+                Stage2Access::ReadOnly,
+                Stage2Exec::Executable,
+                TEST_PA_BITS,
+            ),
+            Err(TranslationError::TableExhausted)
+        );
+        assert_eq!(
+            vm.entry_pa(VmMemUsage::PageTable).count(),
+            MAX_GUEST_MEM_PAGES - 1
+        );
     }
 }
