@@ -1,4 +1,4 @@
-//! Single-vCPU execution context, world-switch assembly, and exit handling.
+//! vCPU state, pCPU-local world-switch state, and exit handling.
 
 use core::arch::global_asm;
 
@@ -123,25 +123,85 @@ impl VcpuExit {
     }
 }
 
+/// Persistent architectural state of one virtual CPU.
+///
+/// A vCPU is owned by its VM.  The `repr(C)` layout lets the world-switch
+/// assembly use the context at offset zero and the exit record after it.
+#[repr(C, align(16))]
+#[derive(Debug, Clone)]
+pub struct Vcpu {
+    context: VcpuContext,
+    exit: VcpuExit,
+}
+
+const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
+const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 352);
+
+impl Vcpu {
+    pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
+        Self {
+            context: VcpuContext::new(entry_pc, sp_el1),
+            exit: VcpuExit {
+                vector: 0,
+                esr_el2: 0,
+                far_el2: 0,
+                hpfar_el2: 0,
+            },
+        }
+    }
+
+    pub fn context(&self) -> &VcpuContext {
+        &self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut VcpuContext {
+        &mut self.context
+    }
+
+    pub fn exit(&self) -> &VcpuExit {
+        &self.exit
+    }
+}
+
+/// EL2 world-switch state owned by one physical CPU.
+///
+/// `active_vcpu` is non-null only while this pCPU is executing a guest.  The
+/// vCPU itself remains owned by its `VmCtl`; this is merely the pCPU's active
+/// association.  It is represented as a raw pointer because exception-entry
+/// assembly must access it without Rust references.
+#[repr(C, align(16))]
+pub struct PcpuState {
+    host_sp: u64,
+    active_vcpu: *mut Vcpu,
+}
+
+const _: () = assert!(core::mem::size_of::<PcpuState>() == 16);
+const _: () = assert!(core::mem::offset_of!(PcpuState, host_sp) == 0);
+const _: () = assert!(core::mem::offset_of!(PcpuState, active_vcpu) == 8);
+
+impl PcpuState {
+    pub const fn new() -> Self {
+        Self {
+            host_sp: 0,
+            active_vcpu: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// The sole pCPU state until SMP support is introduced.
+///
+/// Assembly accesses this symbol directly.  Only the world-switch path
+/// mutates it, while interrupts are disabled for guest execution.
+#[unsafe(no_mangle)]
+static mut __pcpu_state: PcpuState = PcpuState::new();
+
 global_asm!(
     r#"
-    .section .bss.vcpu, "aw", %nobits
-    .balign 16
-    .global __host_sp_storage
-    .global __active_vcpu_context
-    .global __active_vcpu_exit
-__host_sp_storage:
-    .quad 0
-__active_vcpu_context:
-    .quad 0
-__active_vcpu_exit:
-    .quad 0
-
     .section .text.vcpu, "ax"
     .global __vcpu_run
     .type __vcpu_run, %function
 __vcpu_run:
-    // x0 = *mut VcpuContext, x1 = *mut VcpuExit
+    // x0 = *mut Vcpu
     // Save host callee-saved registers on host EL2 stack
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
@@ -151,19 +211,15 @@ __vcpu_run:
     stp  x29, x30, [sp, #-16]!
 
     // Save host stack pointer
-    adrp x9, __host_sp_storage
-    add  x9, x9, :lo12:__host_sp_storage
+    adrp x9, __pcpu_state
+    add  x9, x9, :lo12:__pcpu_state
     mov  x10, sp
     str  x10, [x9]
 
-    // Save active context and exit pointers
-    adrp x9, __active_vcpu_context
-    add  x9, x9, :lo12:__active_vcpu_context
-    str  x0, [x9]
-
-    adrp x9, __active_vcpu_exit
-    add  x9, x9, :lo12:__active_vcpu_exit
-    str  x1, [x9]
+    // Associate this pCPU with the VM-owned vCPU.
+    adrp x9, __pcpu_state
+    add  x9, x9, :lo12:__pcpu_state
+    str  x0, [x9, #8]
 
     // Load guest EL1 system registers
     ldr  x9, [x0, #280]
@@ -239,10 +295,10 @@ __vcpu_exit_handler:
     msr  cptr_el2, x0
     isb
 
-    // Load active VcpuContext pointer
-    adrp x0, __active_vcpu_context
-    add  x0, x0, :lo12:__active_vcpu_context
-    ldr  x0, [x0]
+    // Load the active VM-owned vCPU. Its VcpuContext is at offset zero.
+    adrp x0, __pcpu_state
+    add  x0, x0, :lo12:__pcpu_state
+    ldr  x0, [x0, #8]
     cbz  x0, .Lfatal_no_context
 
     // Save guest x2..x30 into context
@@ -294,11 +350,8 @@ __vcpu_exit_handler:
     mrs  x1, contextidr_el1
     str  x1, [x0, #336]
 
-    // Populate VcpuExit
-    adrp x1, __active_vcpu_exit
-    add  x1, x1, :lo12:__active_vcpu_exit
-    ldr  x1, [x1]
-    cbz  x1, .Lskip_exit_info
+    // Populate the active VcpuExit, which follows VcpuContext.
+    add  x1, x0, #352
 
     mov  x2, #8                  // Vector 8: Lower EL AArch64 Sync
     str  x2, [x1, #0]
@@ -309,11 +362,11 @@ __vcpu_exit_handler:
     mrs  x2, hpfar_el2
     str  x2, [x1, #24]
 
-.Lskip_exit_info:
     // Restore host stack pointer
-    adrp x9, __host_sp_storage
-    add  x9, x9, :lo12:__host_sp_storage
+    adrp x9, __pcpu_state
+    add  x9, x9, :lo12:__pcpu_state
     ldr  x10, [x9]
+    str  xzr, [x9, #8]          // no vCPU is active after this exit
     mov  sp, x10
 
     // Restore host callee-saved registers
@@ -335,5 +388,5 @@ __vcpu_exit_handler:
 );
 
 unsafe extern "C" {
-    pub fn __vcpu_run(context: *mut VcpuContext, exit: *mut VcpuExit) -> u64;
+    pub fn __vcpu_run(vcpu: *mut Vcpu) -> u64;
 }
