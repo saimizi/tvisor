@@ -15,7 +15,7 @@ use crate::mm;
 /// The arena does not grow or return pages to the physical allocator.
 pub const INITIAL_HEAP_PAGES: usize = 256;
 pub const fn heap_page_to_bytes(page: usize) -> usize {
-    page * PAGE_SIZE as usize
+    page * PAGE_SIZE
 }
 
 #[global_allocator]

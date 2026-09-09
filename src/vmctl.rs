@@ -8,19 +8,20 @@ use tvisor_util::stage2_translation::*;
 use tvisor_util::*;
 
 use core::fmt::Display;
-use tvisor_util::system_info::PhysAddr;
+use tvisor_util::system_info::{PhysAddr, PhysRegion};
 
 pub const MAX_GUEST_MEM_BYTES: usize = 1024 * 1024;
 pub const MAX_GUEST_MEM_PAGES: usize = (MAX_GUEST_MEM_BYTES) / PAGE_SIZE;
 
 pub type AddressType = PhysAddr;
+pub type RegionType = PhysRegion;
 
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub enum VmMemUsage {
     Image,
     Scratch,
     Stack,
-    DTB,
+    Dtb,
     Guard,
     PageTable,
 }
@@ -29,7 +30,7 @@ impl VmMemUsage {
     pub fn need_physical_memory(&self) -> bool {
         match self {
             VmMemUsage::Image => true,
-            VmMemUsage::DTB => true,
+            VmMemUsage::Dtb => true,
             VmMemUsage::Stack => true,
             VmMemUsage::Guard => false,
             VmMemUsage::Scratch => true,
@@ -42,7 +43,7 @@ impl Display for VmMemUsage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
             VmMemUsage::Image => "Image",
-            VmMemUsage::DTB => "DTB",
+            VmMemUsage::Dtb => "DTB",
             VmMemUsage::Stack => "Stack",
             VmMemUsage::Guard => "Guard",
             VmMemUsage::Scratch => "Scratch",
@@ -54,19 +55,17 @@ impl Display for VmMemUsage {
 }
 
 #[derive(PartialEq, PartialOrd)]
-pub struct IpaRegion {
-    pub usage: VmMemUsage,
-    pub base: AddressType,
-    pub size: usize,
+struct IpaRegion {
+    usage: VmMemUsage,
+    base: AddressType,
+    size: usize,
 }
 
 #[allow(unused)]
 impl IpaRegion {
-    pub fn end(&self) -> Option<AddressType> {
+    fn end(&self) -> Option<AddressType> {
         let start: u64 = self.base.into();
-        start
-            .checked_add(self.size as u64)
-            .and_then(|v| Some(AddressType::new(v)))
+        start.checked_add(self.size as u64).map(AddressType::new)
     }
 }
 
@@ -81,26 +80,22 @@ impl Display for IpaRegion {
 }
 
 #[derive(PartialEq, PartialOrd)]
-pub struct IpaPaRegion {
-    pub usage: VmMemUsage,
-    pub ipa: AddressType,
-    pub pa: AddressType,
-    pub size: usize,
+struct IpaPaRegion {
+    usage: VmMemUsage,
+    ipa: AddressType,
+    pa: AddressType,
+    size: usize,
 }
 
 impl IpaPaRegion {
     pub fn pa_end(&self) -> Option<AddressType> {
         let start: u64 = self.pa.into();
-        start
-            .checked_add(self.size as u64)
-            .and_then(|v| Some(AddressType::new(v)))
+        start.checked_add(self.size as u64).map(AddressType::new)
     }
 
     pub fn ipa_end(&self) -> Option<AddressType> {
         let start: u64 = self.ipa.into();
-        start
-            .checked_add(self.size as u64)
-            .and_then(|v| Some(AddressType::new(v)))
+        start.checked_add(self.size as u64).map(AddressType::new)
     }
 }
 
@@ -115,21 +110,21 @@ impl Display for IpaPaRegion {
 }
 
 #[derive(PartialEq, PartialOrd)]
-pub struct PaRegion {
-    pub usage: VmMemUsage,
-    pub pa: Vec<AddressType>,
+struct PaRegion {
+    usage: VmMemUsage,
+    pa: Vec<AddressType>,
 }
 
 impl Display for PaRegion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
+        writeln!(
             f,
-            "usage: {} size:{}\n",
+            "usage: {} size:{}",
             self.usage,
             self.pa.len() * PAGE_SIZE
         )?;
         for p in &self.pa {
-            write!(f, "pa: {}\n", p)?;
+            writeln!(f, "pa: {}", p)?;
         }
 
         Ok(())
@@ -137,10 +132,85 @@ impl Display for PaRegion {
 }
 
 #[derive(PartialEq, PartialOrd)]
-pub enum VmMem {
+enum VmMem {
     IpaOnly(IpaRegion),
     IpaPa(IpaPaRegion),
     PaOnly(PaRegion),
+}
+
+/// Iterates over the physical regions backing one VM-memory entry.
+///
+/// IpaPa entries are contiguous and yield one region. Page-table entries can
+/// grow one page at a time, so they yield one region for each tracked page.
+struct EntryPaIter<'a> {
+    entry: Option<&'a VmMem>,
+    next_page: usize,
+}
+
+impl Iterator for EntryPaIter<'_> {
+    type Item = RegionType;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.entry? {
+                VmMem::IpaPa(region) => {
+                    if self.next_page != 0 {
+                        return None;
+                    }
+                    self.next_page = 1;
+                    return RegionType::new(region.pa, region.size as u64).ok();
+                }
+                VmMem::PaOnly(region) => {
+                    let pa = *region.pa.get(self.next_page)?;
+                    self.next_page += 1;
+                    if let Ok(region) = RegionType::new(pa, PAGE_SIZE as u64) {
+                        return Some(region);
+                    }
+                }
+                VmMem::IpaOnly(_) => return None,
+            }
+        }
+    }
+}
+
+/// Iterates through all IPA-backed entries in ascending IPA order without
+/// allocating a temporary collection. The number of entries is small, so a
+/// linear scan for each result is preferable to heap allocation.
+struct IpaRegionsIter<'a> {
+    entries: &'a [VmMem],
+    previous_start: Option<u64>,
+}
+
+impl Iterator for IpaRegionsIter<'_> {
+    type Item = RegionType;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut next = None;
+
+        for entry in self.entries {
+            let Some(region) = (match entry {
+                VmMem::IpaPa(region) => RegionType::new(region.ipa, region.size as u64).ok(),
+                VmMem::IpaOnly(region) => RegionType::new(region.base, region.size as u64).ok(),
+                VmMem::PaOnly(_) => None,
+            }) else {
+                continue;
+            };
+
+            let start = region.start().value();
+            if self.previous_start.is_none_or(|previous| start > previous)
+                && next.is_none_or(|candidate: RegionType| start < candidate.start().value())
+            {
+                next = Some(region);
+            }
+        }
+
+        if let Some(region) = next {
+            self.previous_start = Some(region.start().value());
+            Some(region)
+        } else {
+            None
+        }
+    }
 }
 
 impl VmMem {
@@ -183,21 +253,18 @@ impl Display for VmMem {
 
 #[derive(Default)]
 pub struct VmCtl {
+    vm_id: u8,
     vm_mem: Vec<VmMem>,
 }
 
 impl VmCtl {
     pub fn page_table_root(&self) -> Option<AddressType> {
-        if let Some(p) = self
+        if let Some(VmMem::PaOnly(pa)) = self
             .vm_mem
             .iter()
             .find(|&a| a.usage() == VmMemUsage::PageTable)
         {
-            if let VmMem::PaOnly(pa) = p {
-                Some(pa.pa[0])
-            } else {
-                None
-            }
+            Some(pa.pa[0])
         } else {
             None
         }
@@ -314,8 +381,15 @@ impl VmCtl {
         Ok(())
     }
 
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(vm_id: u8) -> Self {
+        Self {
+            vm_id,
+            vm_mem: Vec::new(),
+        }
+    }
+
+    pub fn vm_id(&self) -> u8 {
+        self.vm_id
     }
 
     fn allocated_physical_pages(&self) -> usize {
@@ -351,7 +425,7 @@ impl VmCtl {
         usage: VmMemUsage,
         ipa: Option<AddressType>,
         size: usize,
-    ) -> Result<&VmMem, AllocatorError> {
+    ) -> Result<Option<PhysAddr>, AllocatorError> {
         let size_aligned =
             align_up(size, PAGE_SIZE).ok_or(AllocatorError::AddressOverflow)? as usize;
 
@@ -363,7 +437,7 @@ impl VmCtl {
             usage,
             VmMemUsage::Image
                 | VmMemUsage::Scratch
-                | VmMemUsage::DTB
+                | VmMemUsage::Dtb
                 | VmMemUsage::Stack
                 | VmMemUsage::Guard
         );
@@ -404,7 +478,7 @@ impl VmCtl {
 
                 VmMem::PaOnly(PaRegion { usage, pa })
             }
-            VmMemUsage::Image | VmMemUsage::Scratch | VmMemUsage::DTB | VmMemUsage::Stack => {
+            VmMemUsage::Image | VmMemUsage::Scratch | VmMemUsage::Dtb | VmMemUsage::Stack => {
                 let ipa = ipa.expect("validated IpaPa ipa");
                 VmMem::IpaPa(IpaPaRegion {
                     usage,
@@ -423,11 +497,15 @@ impl VmCtl {
             }
         };
 
+        let ret = match &mem {
+            VmMem::IpaPa(v) => Ok(Some(v.pa)),
+            VmMem::IpaOnly(_) => Ok(None),
+            VmMem::PaOnly(v) => Ok(Some(v.pa[0])),
+        };
+
         self.vm_mem.push(mem);
-        self.vm_mem
-            .iter()
-            .find(|f| f.usage() == usage)
-            .ok_or(AllocatorError::Unexpected)
+
+        ret
     }
 
     fn vm_mem_alloc_sub_page_table(&mut self) -> Result<AddressType, AllocatorError> {
@@ -445,14 +523,35 @@ impl VmCtl {
 
         let phy = mm::allocate_page()?;
         unsafe {
-            core::ptr::write_bytes(phy.into(), 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phy.into(), 0, PAGE_SIZE);
         }
         pt.pa.push(phy);
         Ok(phy)
     }
 
-    pub fn vm_mem(&self, usage: VmMemUsage) -> Option<&VmMem> {
-        self.vm_mem.iter().find(|f| f.usage() == usage)
+    pub fn entry_pa(&self, usage: VmMemUsage) -> impl Iterator<Item = RegionType> + '_ {
+        EntryPaIter {
+            entry: self.vm_mem.iter().find(|entry| entry.usage() == usage),
+            next_page: 0,
+        }
+    }
+
+    #[allow(unused)]
+    pub fn entry_ipa(&self, usage: VmMemUsage) -> Option<RegionType> {
+        let vm_mem = self.vm_mem.iter().find(|t| t.usage() == usage)?;
+        match vm_mem {
+            VmMem::IpaPa(v) => Some(RegionType::new(v.ipa, v.size as u64).ok()?),
+            VmMem::PaOnly(_) => None,
+            VmMem::IpaOnly(v) => Some(RegionType::new(v.base, v.size as u64).ok()?),
+        }
+    }
+
+    #[allow(unused)]
+    pub fn ipa_regions(&self) -> impl Iterator<Item = RegionType> + '_ {
+        IpaRegionsIter {
+            entries: &self.vm_mem,
+            previous_start: None,
+        }
     }
 
     pub fn release_all(&mut self) {
@@ -492,7 +591,7 @@ impl Drop for VmCtl {
 impl Display for VmCtl {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for v in self.vm_mem.iter() {
-            write!(f, "{}\n", v)?;
+            writeln!(f, "{}", v)?;
         }
 
         Ok(())
