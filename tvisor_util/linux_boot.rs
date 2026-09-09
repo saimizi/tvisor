@@ -1,42 +1,114 @@
-//! Linux arm64 boot ABI and guest-IPA layout validation.
+//! Linux arm64 `Image` parsing and guest-IPA boot-layout validation.
 //!
-//! This module deliberately describes only the guest-visible contract. It
-//! does not allocate pages, copy an image, or expose host physical addresses;
-//! those remain the responsibility of `VmCtl` and the Phase 10 image loader.
+//! The Linux Image header, rather than a tvisor-specific fixed address, is
+//! authoritative for the kernel entry location and occupied image extent.
 
 use core::fmt;
 
 use crate::PAGE_SIZE;
 
-/// The first guest-RAM IPA. Lower IPAs remain reserved for virtual devices.
 pub const LINUX_GUEST_RAM_IPA: u64 = 0x4000_0000;
-/// Initial contiguous RAM capacity for the single-vCPU Linux guest (512 MiB).
 pub const LINUX_GUEST_RAM_SIZE: u64 = 512 * 1024 * 1024;
-/// A two-MiB DTB reservation at the beginning of guest RAM.
-pub const LINUX_DTB_IPA: u64 = LINUX_GUEST_RAM_IPA;
+pub const LINUX_IMAGE_BASE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 pub const LINUX_DTB_CAPACITY: u64 = 2 * 1024 * 1024;
-/// The Linux `Image` begins after the reserved DTB window, on a 2-MiB boundary.
-pub const LINUX_IMAGE_IPA: u64 = LINUX_GUEST_RAM_IPA + LINUX_DTB_CAPACITY;
+pub const LINUX_IMAGE_HEADER_SIZE: usize = 64;
+const LINUX_IMAGE_MAGIC: u32 = 0x644d_5241;
 
-const LINUX_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxImageError {
+    HeaderTooSmall,
+    BadMagic,
+    LegacyImageSize,
+    ImageTooLarge,
+    BigEndianImage,
+}
+
+impl fmt::Display for LinuxImageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderTooSmall => f.write_str("Linux Image is shorter than its 64-byte header"),
+            Self::BadMagic => f.write_str("Linux Image header has an invalid magic value"),
+            Self::LegacyImageSize => f.write_str("Linux Image has no authoritative image_size"),
+            Self::ImageTooLarge => {
+                f.write_str("Linux Image is shorter than its declared image_size")
+            }
+            Self::BigEndianImage => f.write_str("big-endian arm64 Linux Images are unsupported"),
+        }
+    }
+}
+
+/// The Linux arm64 Image header fields that affect loading and entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxImageHeader {
+    pub text_offset: u64,
+    pub image_size: u64,
+    pub flags: u64,
+}
+
+impl LinuxImageHeader {
+    pub fn parse(image: &[u8]) -> Result<Self, LinuxImageError> {
+        if image.len() < LINUX_IMAGE_HEADER_SIZE {
+            return Err(LinuxImageError::HeaderTooSmall);
+        }
+        let magic = u32::from_le_bytes(image[56..60].try_into().expect("header length checked"));
+        if magic != LINUX_IMAGE_MAGIC {
+            return Err(LinuxImageError::BadMagic);
+        }
+        let text_offset =
+            u64::from_le_bytes(image[8..16].try_into().expect("header length checked"));
+        let image_size =
+            u64::from_le_bytes(image[16..24].try_into().expect("header length checked"));
+        let flags = u64::from_le_bytes(image[24..32].try_into().expect("header length checked"));
+        if flags & 1 != 0 {
+            return Err(LinuxImageError::BigEndianImage);
+        }
+        // Phase 10 requires an explicit extent: a legacy zero-sized header
+        // cannot prove safe DTB and initrd placement.
+        if image_size == 0 {
+            return Err(LinuxImageError::LegacyImageSize);
+        }
+        if image_size > image.len() as u64 {
+            return Err(LinuxImageError::ImageTooLarge);
+        }
+        Ok(Self {
+            text_offset,
+            image_size,
+            flags,
+        })
+    }
+
+    pub const fn page_size_encoding(self) -> u8 {
+        ((self.flags >> 1) & 0x3) as u8
+    }
+
+    pub const fn requires_48bit_placement(self) -> bool {
+        self.flags & (1 << 3) != 0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxBootLayoutError {
+    Image(LinuxImageError),
     InvalidRam,
-    EmptyImage,
     ImageTooLarge,
+    DtbTooLarge,
     InitrdTooLarge,
     AddressOverflow,
+}
+
+impl From<LinuxImageError> for LinuxBootLayoutError {
+    fn from(error: LinuxImageError) -> Self {
+        Self::Image(error)
+    }
 }
 
 impl fmt::Display for LinuxBootLayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRam => {
-                f.write_str("guest RAM must be page-aligned and include the DTB window")
-            }
-            Self::EmptyImage => f.write_str("Linux Image must not be empty"),
+            Self::Image(error) => write!(f, "invalid Linux Image: {error}"),
+            Self::InvalidRam => f.write_str("guest RAM base must be 2-MiB aligned and page sized"),
             Self::ImageTooLarge => f.write_str("Linux Image does not fit in guest RAM"),
+            Self::DtbTooLarge => f.write_str("reserved DTB window does not fit in guest RAM"),
             Self::InitrdTooLarge => f.write_str("initrd does not fit in guest RAM"),
             Self::AddressOverflow => f.write_str("guest boot layout address overflow"),
         }
@@ -48,80 +120,82 @@ impl fmt::Display for LinuxBootLayoutError {
 pub struct LinuxBootLayout {
     ram_ipa: u64,
     ram_size: u64,
-    dtb_ipa: u64,
-    dtb_capacity: u64,
+    image: LinuxImageHeader,
     image_ipa: u64,
-    image_size: u64,
+    dtb_ipa: u64,
     initrd: Option<(u64, u64)>,
 }
 
 impl LinuxBootLayout {
-    /// Uses the initial single-vCPU contiguous guest-RAM arrangement.
     pub fn default_for_image(
-        image_size: u64,
+        image: &[u8],
         initrd_size: Option<u64>,
     ) -> Result<Self, LinuxBootLayoutError> {
         Self::new(
+            image,
             LINUX_GUEST_RAM_IPA,
             LINUX_GUEST_RAM_SIZE,
-            image_size,
             initrd_size,
         )
     }
 
-    /// Creates a layout with the DTB at the start of RAM, a 2-MiB-aligned
-    /// kernel entry, and an optional initrd immediately after the rounded
-    /// kernel image. Every range is guest IPA space.
+    /// Places the Image at `ram_ipa + header.text_offset`; `ram_ipa` is the
+    /// 2-MiB-aligned base mandated by the arm64 Linux boot ABI. The generated
+    /// DTB follows the declared Image extent, preventing an overlap with a
+    /// valid `text_offset` such as the common 0x80000.
     pub fn new(
+        image: &[u8],
         ram_ipa: u64,
         ram_size: u64,
-        image_size: u64,
         initrd_size: Option<u64>,
     ) -> Result<Self, LinuxBootLayoutError> {
-        if ram_ipa & (PAGE_SIZE as u64 - 1) != 0
-            || ram_size & (PAGE_SIZE as u64 - 1) != 0
-            || ram_size < LINUX_DTB_CAPACITY
+        let image_header = LinuxImageHeader::parse(image)?;
+        if ram_ipa & (LINUX_IMAGE_BASE_ALIGNMENT - 1) != 0 || ram_size & (PAGE_SIZE as u64 - 1) != 0
         {
             return Err(LinuxBootLayoutError::InvalidRam);
         }
-        if image_size == 0 {
-            return Err(LinuxBootLayoutError::EmptyImage);
-        }
-
         let ram_end = ram_ipa
             .checked_add(ram_size)
             .ok_or(LinuxBootLayoutError::AddressOverflow)?;
         let image_ipa = ram_ipa
-            .checked_add(LINUX_DTB_CAPACITY)
+            .checked_add(image_header.text_offset)
             .ok_or(LinuxBootLayoutError::AddressOverflow)?;
-        debug_assert_eq!(image_ipa & (LINUX_IMAGE_ALIGNMENT - 1), 0);
         let image_end = image_ipa
-            .checked_add(align_up(image_size, LINUX_IMAGE_ALIGNMENT)?)
+            .checked_add(image_header.image_size)
             .ok_or(LinuxBootLayoutError::AddressOverflow)?;
-        if image_end > ram_end {
+        if image_ipa < ram_ipa || image_end > ram_end {
+            return Err(LinuxBootLayoutError::ImageTooLarge);
+        }
+        if image_header.requires_48bit_placement() && image_end > (1_u64 << 48) {
             return Err(LinuxBootLayoutError::ImageTooLarge);
         }
 
+        let dtb_ipa = align_up(image_end, 8)?;
+        let dtb_end = dtb_ipa
+            .checked_add(LINUX_DTB_CAPACITY)
+            .ok_or(LinuxBootLayoutError::AddressOverflow)?;
+        if dtb_end > ram_end {
+            return Err(LinuxBootLayoutError::DtbTooLarge);
+        }
         let initrd = match initrd_size {
             None | Some(0) => None,
             Some(size) => {
-                let end = image_end
+                let initrd_ipa = align_up(dtb_end, PAGE_SIZE as u64)?;
+                let end = initrd_ipa
                     .checked_add(align_up(size, PAGE_SIZE as u64)?)
                     .ok_or(LinuxBootLayoutError::AddressOverflow)?;
                 if end > ram_end {
                     return Err(LinuxBootLayoutError::InitrdTooLarge);
                 }
-                Some((image_end, size))
+                Some((initrd_ipa, size))
             }
         };
-
         Ok(Self {
             ram_ipa,
             ram_size,
-            dtb_ipa: ram_ipa,
-            dtb_capacity: LINUX_DTB_CAPACITY,
+            image: image_header,
             image_ipa,
-            image_size,
+            dtb_ipa,
             initrd,
         })
     }
@@ -129,17 +203,23 @@ impl LinuxBootLayout {
     pub const fn ram(&self) -> (u64, u64) {
         (self.ram_ipa, self.ram_size)
     }
-    pub const fn dtb(&self) -> (u64, u64) {
-        (self.dtb_ipa, self.dtb_capacity)
+
+    pub const fn image_header(&self) -> LinuxImageHeader {
+        self.image
     }
+
     pub const fn image(&self) -> (u64, u64) {
-        (self.image_ipa, self.image_size)
+        (self.image_ipa, self.image.image_size)
     }
+
+    pub const fn dtb(&self) -> (u64, u64) {
+        (self.dtb_ipa, LINUX_DTB_CAPACITY)
+    }
+
     pub const fn initrd(&self) -> Option<(u64, u64)> {
         self.initrd
     }
 
-    /// Produces the only register state tvisor supplies to a Linux kernel.
     pub const fn initial_registers(&self) -> LinuxBootRegisters {
         LinuxBootRegisters {
             pc: self.image_ipa,
@@ -176,22 +256,45 @@ pub struct LinuxBootRegisters {
 mod tests {
     use super::*;
 
+    fn image(text_offset: u64, image_size: u64, flags: u64) -> alloc::vec::Vec<u8> {
+        let mut image =
+            alloc::vec![0; core::cmp::max(image_size as usize, LINUX_IMAGE_HEADER_SIZE)];
+        image[8..16].copy_from_slice(&text_offset.to_le_bytes());
+        image[16..24].copy_from_slice(&image_size.to_le_bytes());
+        image[24..32].copy_from_slice(&flags.to_le_bytes());
+        image[56..60].copy_from_slice(&LINUX_IMAGE_MAGIC.to_le_bytes());
+        image
+    }
+
     #[test]
-    fn default_layout_has_the_linux_register_abi() {
-        let layout =
-            LinuxBootLayout::default_for_image(12 * 1024 * 1024, Some(3 * 1024 * 1024)).unwrap();
+    fn layout_uses_image_header_for_entry_and_dtb_placement() {
+        let image = image(0x80000, 12 * 1024 * 1024, 0b10);
+        let layout = LinuxBootLayout::default_for_image(&image, Some(3 * 1024 * 1024)).unwrap();
         assert_eq!(layout.ram(), (LINUX_GUEST_RAM_IPA, LINUX_GUEST_RAM_SIZE));
-        assert_eq!(layout.dtb(), (LINUX_DTB_IPA, LINUX_DTB_CAPACITY));
-        assert_eq!(layout.image(), (LINUX_IMAGE_IPA, 12 * 1024 * 1024));
+        assert_eq!(
+            layout.image(),
+            (LINUX_GUEST_RAM_IPA + 0x80000, 12 * 1024 * 1024)
+        );
+        assert_eq!(
+            layout.dtb(),
+            (
+                LINUX_GUEST_RAM_IPA + 0x80000 + 12 * 1024 * 1024,
+                LINUX_DTB_CAPACITY
+            )
+        );
         assert_eq!(
             layout.initrd(),
-            Some((LINUX_IMAGE_IPA + 12 * 1024 * 1024, 3 * 1024 * 1024))
+            Some((
+                LINUX_GUEST_RAM_IPA + 0x80000 + 14 * 1024 * 1024,
+                3 * 1024 * 1024
+            ))
         );
+        assert_eq!(layout.image_header().page_size_encoding(), 1);
         assert_eq!(
             layout.initial_registers(),
             LinuxBootRegisters {
-                pc: LINUX_IMAGE_IPA,
-                x0: LINUX_DTB_IPA,
+                pc: LINUX_GUEST_RAM_IPA + 0x80000,
+                x0: LINUX_GUEST_RAM_IPA + 0x80000 + 12 * 1024 * 1024,
                 x1: 0,
                 x2: 0,
                 x3: 0,
@@ -200,34 +303,44 @@ mod tests {
     }
 
     #[test]
-    fn kernel_and_initrd_are_rejected_when_they_exceed_ram() {
+    fn rejects_invalid_headers_and_unaligned_ram_base() {
         assert_eq!(
-            LinuxBootLayout::default_for_image(LINUX_GUEST_RAM_SIZE, None),
-            Err(LinuxBootLayoutError::ImageTooLarge)
+            LinuxImageHeader::parse(&[]),
+            Err(LinuxImageError::HeaderTooSmall)
         );
+        let mut invalid = image(0x80000, 4096, 0);
+        invalid[56] = 0;
         assert_eq!(
-            LinuxBootLayout::default_for_image(
-                LINUX_GUEST_RAM_SIZE - LINUX_DTB_CAPACITY,
-                Some(PAGE_SIZE as u64)
+            LinuxImageHeader::parse(&invalid),
+            Err(LinuxImageError::BadMagic)
+        );
+        let image = image(0x80000, 4096, 0);
+        assert_eq!(
+            LinuxBootLayout::new(
+                &image,
+                LINUX_GUEST_RAM_IPA + PAGE_SIZE as u64,
+                LINUX_GUEST_RAM_SIZE,
+                None
             ),
-            Err(LinuxBootLayoutError::InitrdTooLarge)
+            Err(LinuxBootLayoutError::InvalidRam)
         );
     }
 
     #[test]
-    fn invalid_or_empty_layouts_are_rejected() {
+    fn rejects_legacy_big_endian_and_oversized_images() {
         assert_eq!(
-            LinuxBootLayout::default_for_image(0, None),
-            Err(LinuxBootLayoutError::EmptyImage)
+            LinuxImageHeader::parse(&image(0x80000, 0, 0)),
+            Err(LinuxImageError::LegacyImageSize)
         );
         assert_eq!(
-            LinuxBootLayout::new(
-                LINUX_GUEST_RAM_IPA + 1,
-                LINUX_GUEST_RAM_SIZE,
-                PAGE_SIZE as u64,
-                None
-            ),
-            Err(LinuxBootLayoutError::InvalidRam)
+            LinuxImageHeader::parse(&image(0x80000, 4096, 1)),
+            Err(LinuxImageError::BigEndianImage)
+        );
+        let mut short = image(0x80000, 4096, 0);
+        short.truncate(64);
+        assert_eq!(
+            LinuxImageHeader::parse(&short),
+            Err(LinuxImageError::ImageTooLarge)
         );
     }
 }
