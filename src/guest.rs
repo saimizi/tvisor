@@ -247,6 +247,14 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
             return vector;
         }
 
+        if vcpu.context().guest_stage1_mmu_enabled() {
+            let state = vcpu.context().guest_stage1_translation();
+            println!(
+                "  Guest EL1 stage-1 MMU active: TTBR0={:#018x} TTBR1={:#018x} TCR={:#018x} MAIR={:#018x} VBAR={:#018x}",
+                state.ttbr0_el1, state.ttbr1_el1, state.tcr_el1, state.mair_el1, state.vbar_el1,
+            );
+        }
+
         let reason = vcpu.exit().decode_reason(vcpu.context());
         let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
             return vector;

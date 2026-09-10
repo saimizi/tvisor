@@ -10,6 +10,18 @@ pub enum VcpuMmioError {
     ProgramCounterOverflow,
 }
 
+/// Guest-owned EL1 translation state. Stage 2 does not mirror these
+/// permissions: this state controls Linux VA-to-IPA translation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestEl1TranslationState {
+    pub sctlr_el1: u64,
+    pub ttbr0_el1: u64,
+    pub ttbr1_el1: u64,
+    pub tcr_el1: u64,
+    pub mair_el1: u64,
+    pub vbar_el1: u64,
+}
+
 impl core::fmt::Display for VcpuMmioError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -43,10 +55,15 @@ pub struct VcpuContext {
     pub mair_el1: u64,
     pub vbar_el1: u64,
     pub contextidr_el1: u64,
-    _pad: [u64; 1],
+    /// Linux current-task pointer, preserved across EL2 exits.
+    pub tpidr_el1: u64,
+    /// EL0 read-only thread pointer, preserved for later userspace support.
+    pub tpidrro_el0: u64,
+    /// Explicit tail padding keeps this assembly-facing context 16-byte aligned.
+    _padding: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<VcpuContext>() == 352);
+const _: () = assert!(core::mem::size_of::<VcpuContext>() == 368);
 const _: () = assert!(core::mem::align_of::<VcpuContext>() == 16);
 
 impl VcpuContext {
@@ -66,10 +83,27 @@ impl VcpuContext {
             mair_el1: 0,
             vbar_el1: 0,
             contextidr_el1: 0,
-            _pad: [0; 1],
+            tpidr_el1: 0,
+            tpidrro_el0: 0,
+            _padding: 0,
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
+    }
+
+    pub const fn guest_stage1_translation(&self) -> GuestEl1TranslationState {
+        GuestEl1TranslationState {
+            sctlr_el1: self.sctlr_el1,
+            ttbr0_el1: self.ttbr0_el1,
+            ttbr1_el1: self.ttbr1_el1,
+            tcr_el1: self.tcr_el1,
+            mair_el1: self.mair_el1,
+            vbar_el1: self.vbar_el1,
+        }
+    }
+
+    pub const fn guest_stage1_mmu_enabled(&self) -> bool {
+        self.sctlr_el1 & 1 != 0
     }
 
     /// Emulates a successfully decoded stage-2 MMIO abort. The guest PC is
@@ -85,6 +119,8 @@ impl VcpuContext {
         let transmit = dispatcher
             .emulate(access, &mut self.x)
             .map_err(VcpuMmioError::Emulation)?;
+        // In case of instruction trap, elr_el2 stores the address where the trap exactly happened.
+        // advance it to avoid re-entering;
         self.elr_el2 = self
             .elr_el2
             .checked_add(4)
@@ -175,7 +211,7 @@ pub struct Vcpu {
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
-const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 352);
+const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 368);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -291,6 +327,10 @@ __vcpu_run:
     msr  vbar_el1, x9
     ldr  x9, [x0, #336]
     msr  contextidr_el1, x9
+    ldr  x9, [x0, #344]
+    msr  tpidr_el1, x9
+    ldr  x9, [x0, #352]
+    msr  tpidrro_el0, x9
 
     // Load SP_EL0 and SP_EL1
     ldr  x9, [x0, #248]
@@ -402,9 +442,13 @@ __vcpu_exit_handler:
     str  x1, [x0, #328]
     mrs  x1, contextidr_el1
     str  x1, [x0, #336]
+    mrs  x1, tpidr_el1
+    str  x1, [x0, #344]
+    mrs  x1, tpidrro_el0
+    str  x1, [x0, #352]
 
     // Populate the active VcpuExit, which follows VcpuContext.
-    add  x1, x0, #352
+    add  x1, x0, #368
 
     mov  x2, #8                  // Vector 8: Lower EL AArch64 Sync
     str  x2, [x1, #0]
