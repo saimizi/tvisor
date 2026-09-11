@@ -14,6 +14,7 @@ use tvisor_util::{PAGE_SIZE, println};
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
 use tvisor_util::mmio::{MmioDispatcher, VIRTUAL_PL011_IPA, VIRTUAL_PL011_SIZE};
+use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
@@ -242,6 +243,20 @@ unsafe fn deactivate_stage2() {
 /// completed and resumed here, keeping the physical Mini UART host-owned.
 fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
     loop {
+        // The counter seen through CNTVCT_EL0 already applies this vCPU's
+        // CNTVOFF_EL2. Refreshing here guarantees that an expired timer is
+        // injected before a resumed guest entry; a future physical timer IRQ
+        // path provides wakeups while the guest is otherwise running.
+        let virtual_count: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, CNTVCT_EL0",
+                value = out(reg) virtual_count,
+                options(nostack, preserves_flags),
+            );
+        }
+        vcpu.timer_mut().refresh_pending(virtual_count);
+
         let vector = unsafe { __vcpu_run(vcpu) };
         if vector != 8 {
             return vector;
@@ -252,6 +267,13 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
             println!(
                 "  Guest EL1 stage-1 MMU active: TTBR0={:#018x} TTBR1={:#018x} TCR={:#018x} MAIR={:#018x} VBAR={:#018x}",
                 state.ttbr0_el1, state.ttbr1_el1, state.tcr_el1, state.mair_el1, state.vbar_el1,
+            );
+        }
+
+        if vcpu.timer_mut().virtual_irq_pending() {
+            println!(
+                "  Virtual timer PPI {} pending for guest injection",
+                VIRTUAL_TIMER_PPI
             );
         }
 

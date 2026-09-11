@@ -2,6 +2,7 @@
 
 use core::arch::global_asm;
 use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
+use tvisor_util::virtual_timer::VirtualTimerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcpuMmioError {
@@ -208,10 +209,13 @@ impl VcpuExit {
 pub struct Vcpu {
     context: VcpuContext,
     exit: VcpuExit,
+    timer: VirtualTimerState,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
 const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 368);
+const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 400);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 432);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -222,6 +226,12 @@ impl Vcpu {
                 esr_el2: 0,
                 far_el2: 0,
                 hpfar_el2: 0,
+            },
+            timer: VirtualTimerState {
+                cntvoff_el2: 0,
+                cntv_cval_el0: 0,
+                cntv_ctl_el0: 0,
+                pending_irq: 0,
             },
         }
     }
@@ -249,6 +259,10 @@ impl Vcpu {
 
     pub fn exit(&self) -> &VcpuExit {
         &self.exit
+    }
+
+    pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
+        &mut self.timer
     }
 }
 
@@ -332,6 +346,14 @@ __vcpu_run:
     ldr  x9, [x0, #352]
     msr  tpidrro_el0, x9
 
+    // Restore per-vCPU architectural virtual-timer state.
+    ldr  x9, [x0, #400]
+    msr  cntvoff_el2, x9
+    ldr  x9, [x0, #408]
+    msr  cntv_cval_el0, x9
+    ldr  x9, [x0, #416]
+    msr  cntv_ctl_el0, x9
+
     // Load SP_EL0 and SP_EL1
     ldr  x9, [x0, #248]
     msr  sp_el0, x9
@@ -350,6 +372,18 @@ __vcpu_run:
     mrs  x9, cptr_el2
     orr  x9, x9, #0x400
     msr  cptr_el2, x9
+
+    // HCR_EL2.VI is tvisor's single-vCPU virtual interrupt injection line.
+    // A later virtual GIC supplies acknowledgment and prioritization policy.
+    mrs  x9, hcr_el2
+    ldr  x10, [x0, #424]
+    cbz  x10, .Lno_virtual_irq
+    orr  x9, x9, #0x80
+    b    .Lvirtual_irq_configured
+.Lno_virtual_irq:
+    bic  x9, x9, #0x80
+.Lvirtual_irq_configured:
+    msr  hcr_el2, x9
     isb
 
     // Restore guest GPRs x1..x30
@@ -446,6 +480,14 @@ __vcpu_exit_handler:
     str  x1, [x0, #344]
     mrs  x1, tpidrro_el0
     str  x1, [x0, #352]
+
+    // Save architectural virtual-timer state before returning to EL2 Rust.
+    mrs  x1, cntvoff_el2
+    str  x1, [x0, #400]
+    mrs  x1, cntv_cval_el0
+    str  x1, [x0, #408]
+    mrs  x1, cntv_ctl_el0
+    str  x1, [x0, #416]
 
     // Populate the active VcpuExit, which follows VcpuContext.
     add  x1, x0, #368

@@ -23,6 +23,7 @@ pub mod page_allocator;
 pub mod platform;
 pub mod stage2_translation;
 pub mod system_info;
+pub mod virtual_timer;
 
 pub use page::*;
 
