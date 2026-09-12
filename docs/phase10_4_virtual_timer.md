@@ -17,8 +17,10 @@ The current policy is deliberately simple:
 - guest virtual timer compare/control state is preserved per vCPU;
 - EL2 maps the BCM2711 GIC distributor, physical CPU interface, GICH control
   interface, and GICV page as Device MMIO;
-- physical PPI 27 is Group 1 with `GICC_CTLR.EOImodeNS=1`: EL2's physical EOI
-  drops priority only, while the guest's virtual EOI completes deactivation;
+- the platform handoff must classify physical PPI 27 as Non-secure Group 1;
+  tvisor uses the GICv2 Non-secure control-register view and does not access
+  Secure-only `GICD_IGROUPR`; with `GICC_CTLR.EOImodeNS=1`, EL2's physical
+  EOI drops priority only while the guest's virtual EOI completes deactivation;
 - GICH VMCR and LR0 are saved and restored with the vCPU, and GICV is mapped
   at guest IPA `0x0801_0000`; and
 - physical counter/timer access remains controlled by the existing
