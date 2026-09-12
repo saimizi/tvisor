@@ -9,6 +9,7 @@ use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
+use tvisor_util::gicv2::{GIC_MMIO_SIZE, GICD_BASE};
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
@@ -232,6 +233,13 @@ pub fn setup_bootstrap_page_table(
 
     // UART page is mapped RW Device.
     map_identity_device(&mut tables, uart_region)?;
+
+    // The GIC distributor and CPU interface are host-owned EL2 MMIO.  They
+    // must be accessible before the timer PPI can be enabled and acknowledged.
+    let gic_region = PhysRegion::new(PhysAddr::new(GICD_BASE as u64), GIC_MMIO_SIZE as u64)
+        .map_err(|_| PrepareError::Validation)?;
+    map_identity_device(&mut tables, gic_region)?;
+
     validate_bootstrap_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
     let root_pa = tables.root_pa();

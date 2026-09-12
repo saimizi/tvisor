@@ -13,6 +13,7 @@ use tvisor_util::{PAGE_SIZE, println};
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
+use tvisor_util::gicv2;
 use tvisor_util::mmio::{MmioDispatcher, VIRTUAL_PL011_IPA, VIRTUAL_PL011_SIZE};
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
@@ -243,21 +244,24 @@ unsafe fn deactivate_stage2() {
 /// completed and resumed here, keeping the physical Mini UART host-owned.
 fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
     loop {
-        // The counter seen through CNTVCT_EL0 already applies this vCPU's
-        // CNTVOFF_EL2. Refreshing here guarantees that an expired timer is
-        // injected before a resumed guest entry; a future physical timer IRQ
-        // path provides wakeups while the guest is otherwise running.
-        let virtual_count: u64;
-        unsafe {
-            core::arch::asm!(
-                "mrs {value}, CNTVCT_EL0",
-                value = out(reg) virtual_count,
-                options(nostack, preserves_flags),
-            );
-        }
-        vcpu.timer_mut().refresh_pending(virtual_count);
-
         let vector = unsafe { __vcpu_run(vcpu) };
+        if vector == 9 {
+            let irq = unsafe { gicv2::acknowledge() };
+            if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
+                unsafe { gicv2::end_interrupt(irq) };
+                vcpu.timer_mut().mark_pending_from_irq();
+                println!(
+                    "  EL2 received virtual timer PPI {}; injecting guest IRQ",
+                    irq
+                );
+                continue;
+            }
+            if irq != gicv2::SPURIOUS_IRQ {
+                unsafe { gicv2::end_interrupt(irq) };
+            }
+            println!("Unexpected physical IRQ {} while guest ran", irq);
+            return vector;
+        }
         if vector != 8 {
             return vector;
         }
@@ -299,6 +303,8 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
 
 fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
+    // Device mapping is installed during private-EL2 setup before this point.
+    unsafe { gicv2::enable_timer_ppi(VIRTUAL_TIMER_PPI) };
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
                             ipa: IpaAddr,

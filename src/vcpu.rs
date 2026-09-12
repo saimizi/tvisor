@@ -414,6 +414,20 @@ __vcpu_exit_handler:
     // Scratch save x0, x1 on stack
     sub  sp, sp, #32
     stp  x0, x1, [sp, #0]
+    mov  x0, #8
+    str  x0, [sp, #16]
+    b    __vcpu_exit_common
+
+    .global __vcpu_irq_handler
+    .type __vcpu_irq_handler, %function
+__vcpu_irq_handler:
+    // Preserve the same guest state as a synchronous vCPU exit.
+    sub  sp, sp, #32
+    stp  x0, x1, [sp, #0]
+    mov  x0, #9
+    str  x0, [sp, #16]
+
+__vcpu_exit_common:
 
     // Re-enable FP/Advanced SIMD for the EL2 host before any Rust code can
     // execute. Guest x0/x1 are already safe on the stack, so x0 is scratch.
@@ -435,6 +449,7 @@ __vcpu_exit_handler:
     stp  x8,  x9,  [x0, #64]
     ldp  x1,  x2,  [sp, #0]     // Retrieve guest x0, x1 from temporary stack
     stp  x1,  x2,  [x0, #0]      // Save guest x0, x1 into context
+    ldr  x3, [sp, #16]           // Vector selected by the EL2 vector table.
     add  sp,  sp,  #32           // Restore temporary stack
 
     stp  x10, x11, [x0, #80]
@@ -492,8 +507,7 @@ __vcpu_exit_handler:
     // Populate the active VcpuExit, which follows VcpuContext.
     add  x1, x0, #368
 
-    mov  x2, #8                  // Vector 8: Lower EL AArch64 Sync
-    str  x2, [x1, #0]
+    str  x3, [x1, #0]
     mrs  x2, esr_el2
     str  x2, [x1, #8]
     mrs  x2, far_el2
@@ -516,7 +530,7 @@ __vcpu_exit_handler:
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
 
-    mov  x0, #8                  // Return exit vector 8
+    mov  x0, x3                  // Return Lower-EL Sync (8) or IRQ (9).
     ret
 
 .Lfatal_no_context:

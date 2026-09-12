@@ -13,6 +13,7 @@ pub mod debug_util;
 pub mod aarch64_reg;
 pub mod el2_translation;
 pub mod fdt;
+pub mod gicv2;
 pub mod guest_fdt;
 pub mod heap_allocator;
 pub mod linux_boot;
