@@ -15,8 +15,9 @@ The current policy is deliberately simple:
 - `CNTVOFF_EL2` is per-vCPU and initially zero, so the guest virtual counter
   starts aligned with the host counter;
 - guest virtual timer compare/control state is preserved per vCPU;
-- EL2 maps the BCM2711 GIC distributor, physical CPU interface, GICH control
-  interface, and GICV page as Device MMIO;
+- host GIC distributor, CPU, hypervisor, and virtual-CPU-interface regions are
+  discovered from the U-Boot DTB `arm,gic-400`/`arm,cortex-a15-gic` node and
+  each is mapped as Device MMIO; host physical addresses are not hard-coded;
 - the platform handoff must classify physical PPI 27 as Non-secure Group 1;
   tvisor uses the GICv2 Non-secure control-register view and does not access
   Secure-only `GICD_IGROUPR`; with `GICC_CTLR.EOImodeNS=1`, EL2's physical

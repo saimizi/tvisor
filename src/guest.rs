@@ -242,16 +242,16 @@ unsafe fn deactivate_stage2() {
 
 /// Runs a vCPU until a non-emulated exit. A virtual-PL011 stage-2 abort is
 /// completed and resumed here, keeping the physical Mini UART host-owned.
-fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
+fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gicv2::GicV2) -> u64 {
     loop {
         // The guest accesses GICV directly; save/restore GICH state around
         // every world switch so its List Register and CPU-interface policy
         // remain owned by this vCPU rather than the host.
-        unsafe { gicv2::restore_virtual_cpu(vcpu.gic()) };
+        unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
         let vector = unsafe { __vcpu_run(vcpu) };
-        unsafe { gicv2::save_virtual_cpu(vcpu.gic_mut()) };
+        unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
         if vector == 9 {
-            let irq = unsafe { gicv2::acknowledge() };
+            let irq = unsafe { gic.acknowledge() };
             if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
                 vcpu.timer_mut().mark_pending_from_irq();
                 gicv2::queue_timer_ppi(vcpu.gic_mut(), irq)
@@ -259,12 +259,12 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
                 vcpu.timer_mut().clear_pending_after_list_register();
                 // EOImodeNS is set: this only drops priority. The physical
                 // PPI remains active until the guest GICV_EOIR completes LR0.
-                unsafe { gicv2::end_interrupt(irq) };
+                unsafe { gic.end_interrupt(irq) };
                 println!("  EL2 queued virtual timer PPI {} in GICH LR0", irq);
                 continue;
             }
             if irq != gicv2::SPURIOUS_IRQ {
-                unsafe { gicv2::end_interrupt(irq) };
+                unsafe { gic.end_interrupt(irq) };
             }
             println!("Unexpected physical IRQ {} while guest ran", irq);
             return vector;
@@ -304,7 +304,8 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
 fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
     // Device mapping is installed during private-EL2 setup before this point.
-    unsafe { gicv2::enable_timer_ppi(VIRTUAL_TIMER_PPI) };
+    let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
+    unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
                             ipa: IpaAddr,
@@ -455,8 +456,8 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     // remains host-owned and is mapped only at this guest IPA.
     vm_ctl.map_external_device(
         IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
-        tvisor_util::system_info::PhysAddr::new(gicv2::GICV_BASE as u64),
-        gicv2::GICV_SIZE,
+        gic.info().virtual_cpu_interface.start(),
+        gic.info().virtual_cpu_interface.size() as usize,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
@@ -495,7 +496,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         vcpu.context().elr_el2
     );
 
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
 
     let reason = vcpu.exit().decode_reason(vcpu.context());
@@ -521,7 +522,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 2 (System register verification)
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
@@ -548,7 +549,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher);
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     let fault_ipa = vcpu.exit().fault_ipa();

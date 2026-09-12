@@ -8,7 +8,8 @@ use dtoolkit::fdt::Fdt;
 use tvisor_util::PAGE_SIZE;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::{debug_init, stop};
-use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
+use tvisor_util::fdt::{discover_console, discover_gic_v2, fdt_address_from_uboot_args, fdt_init};
+use tvisor_util::gicv2;
 use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysRegion};
 use tvisor_util::{halt, println};
 
@@ -137,9 +138,17 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         Ok(region) => region,
         Err(_) => halt(),
     };
+    let gic = match discover_gic_v2(*fdt) {
+        Ok(gic) => gic,
+        Err(error) => {
+            println!("GICv2 discovery failed: {}", error);
+            halt();
+        }
+    };
+    gicv2::initialize(gic);
 
     // Set up bootstrap page table
-    let bootstrap = match mm::setup_bootstrap_page_table(live_dtb_pages, uart_region) {
+    let bootstrap = match mm::setup_bootstrap_page_table(live_dtb_pages, uart_region, gic) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             println!("Failed to setup bootstrap page tables: {}", error);
