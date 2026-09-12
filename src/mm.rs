@@ -9,6 +9,7 @@ use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
+use tvisor_util::gicv2::GicV2Info;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
@@ -107,6 +108,7 @@ pub struct BootstrapPageTable {
 pub fn setup_bootstrap_page_table(
     live_dtb_pages: PhysRegion,
     uart_region: PhysRegion,
+    gic: GicV2Info,
 ) -> Result<BootstrapPageTable, PrepareError> {
     if BOOTSTRAP_TABLES_CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(PrepareError::Validation);
@@ -232,6 +234,19 @@ pub fn setup_bootstrap_page_table(
 
     // UART page is mapped RW Device.
     map_identity_device(&mut tables, uart_region)?;
+
+    // Host GIC topology comes from the U-Boot DTB. The four architecture
+    // interfaces are independently mapped because DTB regions need not be
+    // physically contiguous.
+    for region in [
+        gic.distributor,
+        gic.cpu_interface,
+        gic.hypervisor_interface,
+        gic.virtual_cpu_interface,
+    ] {
+        map_identity_device(&mut tables, region)?;
+    }
+
     validate_bootstrap_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
     let root_pa = tables.root_pa();

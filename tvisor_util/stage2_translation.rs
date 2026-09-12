@@ -61,9 +61,12 @@ pub const VTCR_EL2_RES1: u64 = 1 << 31;
 
 pub const HCR_EL2_VM: u64 = 1 << 0;
 pub const HCR_EL2_SWIO: u64 = 1 << 1;
+/// Route physical IRQ exceptions taken while running the guest to EL2.
+pub const HCR_EL2_IMO: u64 = 1 << 4;
 pub const HCR_EL2_TSC: u64 = 1 << 19;
 pub const HCR_EL2_RW: u64 = 1 << 31;
-pub const HCR_EL2_STAGE2_VALUE: u64 = HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | HCR_EL2_VM;
+pub const HCR_EL2_STAGE2_VALUE: u64 =
+    HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | HCR_EL2_IMO | HCR_EL2_VM;
 
 pub const CPTR_EL2_TFP: u64 = 1 << 10;
 pub const CPTR_EL2_RES1: u64 = (0b11 << 12) | 0x3ff;
@@ -186,6 +189,7 @@ mod tests {
 
         assert_eq!(regs.hcr_el2 & HCR_EL2_VM, HCR_EL2_VM);
         assert_eq!(regs.hcr_el2 & HCR_EL2_RW, HCR_EL2_RW);
+        assert_eq!(regs.hcr_el2 & HCR_EL2_IMO, HCR_EL2_IMO);
         assert_eq!(regs.cptr_el2 & CPTR_EL2_TFP, 0);
         assert_eq!(regs.vmpidr_el2, 0xC000_0000);
     }

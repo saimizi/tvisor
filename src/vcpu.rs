@@ -1,6 +1,40 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
 use core::arch::global_asm;
+use tvisor_util::gicv2::VirtualGicV2State;
+use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
+use tvisor_util::virtual_timer::VirtualTimerState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcpuMmioError {
+    Decode(MmioDecodeError),
+    Emulation(MmioEmulationError),
+    ProgramCounterOverflow,
+}
+
+/// Guest-owned EL1 translation state. Stage 2 does not mirror these
+/// permissions: this state controls Linux VA-to-IPA translation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestEl1TranslationState {
+    pub sctlr_el1: u64,
+    pub ttbr0_el1: u64,
+    pub ttbr1_el1: u64,
+    pub tcr_el1: u64,
+    pub mair_el1: u64,
+    pub vbar_el1: u64,
+}
+
+impl core::fmt::Display for VcpuMmioError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(f, "cannot decode trapped MMIO: {error}"),
+            Self::Emulation(error) => write!(f, "cannot emulate trapped MMIO: {error}"),
+            Self::ProgramCounterOverflow => {
+                f.write_str("cannot advance guest PC after MMIO emulation")
+            }
+        }
+    }
+}
 
 #[repr(C, align(16))]
 #[derive(Debug, Clone)]
@@ -23,10 +57,15 @@ pub struct VcpuContext {
     pub mair_el1: u64,
     pub vbar_el1: u64,
     pub contextidr_el1: u64,
-    _pad: [u64; 1],
+    /// Linux current-task pointer, preserved across EL2 exits.
+    pub tpidr_el1: u64,
+    /// EL0 read-only thread pointer, preserved for later userspace support.
+    pub tpidrro_el0: u64,
+    /// Explicit tail padding keeps this assembly-facing context 16-byte aligned.
+    _padding: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<VcpuContext>() == 352);
+const _: () = assert!(core::mem::size_of::<VcpuContext>() == 368);
 const _: () = assert!(core::mem::align_of::<VcpuContext>() == 16);
 
 impl VcpuContext {
@@ -46,10 +85,49 @@ impl VcpuContext {
             mair_el1: 0,
             vbar_el1: 0,
             contextidr_el1: 0,
-            _pad: [0; 1],
+            tpidr_el1: 0,
+            tpidrro_el0: 0,
+            _padding: 0,
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
+    }
+
+    pub const fn guest_stage1_translation(&self) -> GuestEl1TranslationState {
+        GuestEl1TranslationState {
+            sctlr_el1: self.sctlr_el1,
+            ttbr0_el1: self.ttbr0_el1,
+            ttbr1_el1: self.ttbr1_el1,
+            tcr_el1: self.tcr_el1,
+            mair_el1: self.mair_el1,
+            vbar_el1: self.vbar_el1,
+        }
+    }
+
+    pub const fn guest_stage1_mmu_enabled(&self) -> bool {
+        self.sctlr_el1 & 1 != 0
+    }
+
+    /// Emulates a successfully decoded stage-2 MMIO abort. The guest PC is
+    /// advanced only after the device has completed the access and any read
+    /// result is safely present in the target guest register.
+    pub fn emulate_stage2_mmio(
+        &mut self,
+        exit: &VcpuExit,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<Option<u8>, VcpuMmioError> {
+        let access = MmioAccess::decode_data_abort(exit.esr_el2, exit.fault_ipa())
+            .map_err(VcpuMmioError::Decode)?;
+        let transmit = dispatcher
+            .emulate(access, &mut self.x)
+            .map_err(VcpuMmioError::Emulation)?;
+        // In case of instruction trap, elr_el2 stores the address where the trap exactly happened.
+        // advance it to avoid re-entering;
+        self.elr_el2 = self
+            .elr_el2
+            .checked_add(4)
+            .ok_or(VcpuMmioError::ProgramCounterOverflow)?;
+        Ok(transmit)
     }
 }
 
@@ -132,10 +210,15 @@ impl VcpuExit {
 pub struct Vcpu {
     context: VcpuContext,
     exit: VcpuExit,
+    timer: VirtualTimerState,
+    gic: VirtualGicV2State,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
-const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 352);
+const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 368);
+const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 400);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 432);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 448);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -147,7 +230,30 @@ impl Vcpu {
                 far_el2: 0,
                 hpfar_el2: 0,
             },
+            timer: VirtualTimerState {
+                cntvoff_el2: 0,
+                cntv_cval_el0: 0,
+                cntv_ctl_el0: 0,
+                pending_irq: 0,
+            },
+            gic: VirtualGicV2State {
+                vmcr: 0,
+                timer_lr: 0,
+            },
         }
+    }
+
+    /// Constructs the initial EL1 state required by the standard arm64 Linux
+    /// boot ABI. Linux establishes its own stack and translation regime after
+    /// entry, so no Phase-9 test stack or HVC protocol is carried into it.
+    #[allow(dead_code)] // Used by the Phase 10 Linux image-loader path.
+    pub const fn new_linux(entry_pc: u64, dtb_ipa: u64) -> Self {
+        let mut vcpu = Self::new(entry_pc, 0);
+        vcpu.context.x[0] = dtb_ipa;
+        vcpu.context.x[1] = 0;
+        vcpu.context.x[2] = 0;
+        vcpu.context.x[3] = 0;
+        vcpu
     }
 
     pub fn context(&self) -> &VcpuContext {
@@ -160,6 +266,18 @@ impl Vcpu {
 
     pub fn exit(&self) -> &VcpuExit {
         &self.exit
+    }
+
+    pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
+        &mut self.timer
+    }
+
+    pub fn gic(&self) -> &VirtualGicV2State {
+        &self.gic
+    }
+
+    pub fn gic_mut(&mut self) -> &mut VirtualGicV2State {
+        &mut self.gic
     }
 }
 
@@ -238,6 +356,18 @@ __vcpu_run:
     msr  vbar_el1, x9
     ldr  x9, [x0, #336]
     msr  contextidr_el1, x9
+    ldr  x9, [x0, #344]
+    msr  tpidr_el1, x9
+    ldr  x9, [x0, #352]
+    msr  tpidrro_el0, x9
+
+    // Restore per-vCPU architectural virtual-timer state.
+    ldr  x9, [x0, #400]
+    msr  cntvoff_el2, x9
+    ldr  x9, [x0, #408]
+    msr  cntv_cval_el0, x9
+    ldr  x9, [x0, #416]
+    msr  cntv_ctl_el0, x9
 
     // Load SP_EL0 and SP_EL1
     ldr  x9, [x0, #248]
@@ -257,7 +387,6 @@ __vcpu_run:
     mrs  x9, cptr_el2
     orr  x9, x9, #0x400
     msr  cptr_el2, x9
-    isb
 
     // Restore guest GPRs x1..x30
     ldp  x2,  x3,  [x0, #16]
@@ -287,6 +416,20 @@ __vcpu_exit_handler:
     // Scratch save x0, x1 on stack
     sub  sp, sp, #32
     stp  x0, x1, [sp, #0]
+    mov  x0, #8
+    str  x0, [sp, #16]
+    b    __vcpu_exit_common
+
+    .global __vcpu_irq_handler
+    .type __vcpu_irq_handler, %function
+__vcpu_irq_handler:
+    // Preserve the same guest state as a synchronous vCPU exit.
+    sub  sp, sp, #32
+    stp  x0, x1, [sp, #0]
+    mov  x0, #9
+    str  x0, [sp, #16]
+
+__vcpu_exit_common:
 
     // Re-enable FP/Advanced SIMD for the EL2 host before any Rust code can
     // execute. Guest x0/x1 are already safe on the stack, so x0 is scratch.
@@ -308,6 +451,7 @@ __vcpu_exit_handler:
     stp  x8,  x9,  [x0, #64]
     ldp  x1,  x2,  [sp, #0]     // Retrieve guest x0, x1 from temporary stack
     stp  x1,  x2,  [x0, #0]      // Save guest x0, x1 into context
+    ldr  x3, [sp, #16]           // Vector selected by the EL2 vector table.
     add  sp,  sp,  #32           // Restore temporary stack
 
     stp  x10, x11, [x0, #80]
@@ -349,12 +493,23 @@ __vcpu_exit_handler:
     str  x1, [x0, #328]
     mrs  x1, contextidr_el1
     str  x1, [x0, #336]
+    mrs  x1, tpidr_el1
+    str  x1, [x0, #344]
+    mrs  x1, tpidrro_el0
+    str  x1, [x0, #352]
+
+    // Save architectural virtual-timer state before returning to EL2 Rust.
+    mrs  x1, cntvoff_el2
+    str  x1, [x0, #400]
+    mrs  x1, cntv_cval_el0
+    str  x1, [x0, #408]
+    mrs  x1, cntv_ctl_el0
+    str  x1, [x0, #416]
 
     // Populate the active VcpuExit, which follows VcpuContext.
-    add  x1, x0, #352
+    add  x1, x0, #368
 
-    mov  x2, #8                  // Vector 8: Lower EL AArch64 Sync
-    str  x2, [x1, #0]
+    str  x3, [x1, #0]
     mrs  x2, esr_el2
     str  x2, [x1, #8]
     mrs  x2, far_el2
@@ -377,7 +532,7 @@ __vcpu_exit_handler:
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
 
-    mov  x0, #8                  // Return exit vector 8
+    mov  x0, x3                  // Return Lower-EL Sync (8) or IRQ (9).
     ret
 
 .Lfatal_no_context:

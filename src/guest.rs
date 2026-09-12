@@ -13,6 +13,9 @@ use tvisor_util::{PAGE_SIZE, println};
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
+use tvisor_util::gicv2;
+use tvisor_util::mmio::{MmioDispatcher, VIRTUAL_PL011_IPA, VIRTUAL_PL011_SIZE};
+use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
 pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
@@ -237,8 +240,72 @@ unsafe fn deactivate_stage2() {
     }
 }
 
+/// Runs a vCPU until a non-emulated exit. A virtual-PL011 stage-2 abort is
+/// completed and resumed here, keeping the physical Mini UART host-owned.
+fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gicv2::GicV2) -> u64 {
+    loop {
+        // The guest accesses GICV directly; save/restore GICH state around
+        // every world switch so its List Register and CPU-interface policy
+        // remain owned by this vCPU rather than the host.
+        unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
+        let vector = unsafe { __vcpu_run(vcpu) };
+        unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
+        if vector == 9 {
+            let irq = unsafe { gic.acknowledge() };
+            if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
+                vcpu.timer_mut().mark_pending_from_irq();
+                gicv2::queue_timer_ppi(vcpu.gic_mut(), irq)
+                    .expect("physical timer PPI arrived while its virtual LR remained active");
+                vcpu.timer_mut().clear_pending_after_list_register();
+                // EOImodeNS is set: this only drops priority. The physical
+                // PPI remains active until the guest GICV_EOIR completes LR0.
+                unsafe { gic.end_interrupt(irq) };
+                println!("  EL2 queued virtual timer PPI {} in GICH LR0", irq);
+                continue;
+            }
+            if irq != gicv2::SPURIOUS_IRQ {
+                unsafe { gic.end_interrupt(irq) };
+            }
+            println!("Unexpected physical IRQ {} while guest ran", irq);
+            return vector;
+        }
+        if vector != 8 {
+            return vector;
+        }
+
+        if vcpu.context().guest_stage1_mmu_enabled() {
+            let state = vcpu.context().guest_stage1_translation();
+            println!(
+                "  Guest EL1 stage-1 MMU active: TTBR0={:#018x} TTBR1={:#018x} TCR={:#018x} MAIR={:#018x} VBAR={:#018x}",
+                state.ttbr0_el1, state.ttbr1_el1, state.tcr_el1, state.mair_el1, state.vbar_el1,
+            );
+        }
+
+        let reason = vcpu.exit().decode_reason(vcpu.context());
+        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
+            return vector;
+        };
+        if !(VIRTUAL_PL011_IPA..VIRTUAL_PL011_IPA + VIRTUAL_PL011_SIZE).contains(&ipa) {
+            return vector;
+        }
+
+        let exit = *vcpu.exit();
+        let transmit = vcpu
+            .context_mut()
+            .emulate_stage2_mmio(&exit, dispatcher)
+            .unwrap_or_else(|error| panic!("Virtual PL011 MMIO emulation failed: {error}"));
+        if let Some(byte) = transmit {
+            tvisor_util::debug_util::write_byte(byte)
+                .unwrap_or_else(|_| panic!("Virtual PL011 transmit could not reach host console"));
+        }
+    }
+}
+
 fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
     println!("Phase 9: Preparing guest execution environment...");
+    // Device mapping is installed during private-EL2 setup before this point.
+    let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
+    unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
                             ipa: IpaAddr,
@@ -384,6 +451,15 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         Stage2Exec::ExecuteNever,
     )?;
 
+    // The GIC virtual CPU interface exposes List Register-backed virtual
+    // acknowledge/EOI semantics directly to the guest. Its physical backing
+    // remains host-owned and is mapped only at this guest IPA.
+    vm_ctl.map_external_device(
+        IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
+        gic.info().virtual_cpu_interface.start(),
+        gic.info().virtual_cpu_interface.size() as usize,
+    )?;
+
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
     let stage2_root_pa = vm_ctl.page_table_root().unwrap().value();
     let stage2_regs = stage2_register_values(vm_ctl.vm_id(), stage2_root_pa, pa_range)?;
@@ -413,13 +489,14 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     let vcpu = vm_ctl.vcpu_mut(vcpu_id).expect("new vCPU must be present");
 
     println!("Phase 9: Entering guest EL1 execution loop...");
+    let mut mmio_dispatcher = MmioDispatcher::default();
     // Checkpoint 1 (Guest RAM read/write test)
     println!(
         "  Starting guest execution at IPA {:#018x}...",
         vcpu.context().elr_el2
     );
 
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
 
     let reason = vcpu.exit().decode_reason(vcpu.context());
@@ -445,7 +522,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 2 (System register verification)
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
@@ -472,7 +549,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     }
 
     // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-    let vector = unsafe { __vcpu_run(vcpu) };
+    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
     assert_eq!(vector, 8);
     let reason = vcpu.exit().decode_reason(vcpu.context());
     let fault_ipa = vcpu.exit().fault_ipa();

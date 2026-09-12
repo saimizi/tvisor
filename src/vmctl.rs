@@ -355,6 +355,72 @@ impl VmCtl {
         self.map_with_pa_bits(usage, mem_type, access, exec, pa_bits)
     }
 
+    /// Maps a host-owned device page into a guest IPA without making it a VM
+    /// allocation. This is only for explicitly selected virtualization
+    /// hardware, such as the GICv2 virtual CPU interface.
+    pub fn map_external_device(
+        &mut self,
+        ipa: IpaAddr,
+        pa: PhysAddr,
+        size: usize,
+    ) -> Result<(), TranslationError> {
+        #[cfg(target_arch = "aarch64")]
+        let pa_bits = IdAa64Mmfr0El1::dump()
+            .ok_or(TranslationError::Unexpected)?
+            .pa_bits()
+            .ok_or(TranslationError::Unexpected)?;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (ipa, pa, size);
+            return Err(TranslationError::Unexpected);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        self.map_external_device_with_pa_bits(ipa, pa, size, pa_bits)
+    }
+
+    fn map_external_device_with_pa_bits(
+        &mut self,
+        ipa: IpaAddr,
+        pa: PhysAddr,
+        size: usize,
+        pa_bits: u8,
+    ) -> Result<(), TranslationError> {
+        if size == 0
+            || !is_page_aligned(ipa.value() as usize)
+            || !is_page_aligned(pa.value() as usize)
+            || !is_page_aligned(size)
+        {
+            return Err(TranslationError::UnalignedMapping);
+        }
+        let ipa_end = ipa
+            .value()
+            .checked_add(size as u64)
+            .ok_or(TranslationError::AddressOverflow)?;
+        let pa_end = pa
+            .value()
+            .checked_add(size as u64)
+            .ok_or(TranslationError::AddressOverflow)?;
+        if ipa_end - 1 > (1_u64 << IPA_BITS) - 1 {
+            return Err(TranslationError::VirtualAddressOutOfRange);
+        }
+        if pa_end - 1 > (1_u64 << pa_bits) - 1 {
+            return Err(TranslationError::PhysicalAddressOutOfRange);
+        }
+
+        for offset in (0..size).step_by(PAGE_SIZE) {
+            self.map_l3_page(
+                ipa.value() + offset as u64,
+                pa.value() + offset as u64,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )?;
+        }
+        Ok(())
+    }
+
     fn map_with_pa_bits(
         &mut self,
         usage: VmMemUsage,
@@ -804,6 +870,40 @@ mod tests {
         assert_eq!(guard.start(), IpaAddr::new(GUARD_IPA));
         assert_eq!(guard.size(), PAGE_SIZE as u64);
         assert_eq!(leaf_descriptor(&vm, GUARD_IPA), 0);
+    }
+
+    #[test]
+    fn vmctl_maps_host_owned_virtual_cpu_interface_as_device() {
+        let mut vm = VmCtl::new(1);
+        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+            .expect("allocate root page table");
+
+        vm.map_external_device_with_pa_bits(
+            IpaAddr::new(0x0801_0000),
+            PhysAddr::new(0xff84_6000),
+            2 * PAGE_SIZE,
+            TEST_PA_BITS,
+        )
+        .expect("map GIC virtual CPU interface");
+
+        assert_eq!(
+            leaf_descriptor(&vm, 0x0801_0000),
+            encode_l3_page_descriptor(
+                0xff84_6000,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
+        assert_eq!(
+            leaf_descriptor(&vm, 0x0801_1000),
+            encode_l3_page_descriptor(
+                0xff84_7000,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
     }
 
     #[test]

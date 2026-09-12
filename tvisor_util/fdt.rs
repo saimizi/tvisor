@@ -1,13 +1,20 @@
 use core::fmt;
 
-use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
+use dtoolkit::{
+    Node, Property,
+    error::FdtParseError,
+    fdt::{Fdt, FdtNode},
+    standard::NodeStandard,
+};
 use spin::Once;
 
+use crate::gicv2::GicV2Info;
 use crate::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 
 const MAX_UBOOT_ARGS: usize = 16;
 const MAX_UBOOT_ARG_LEN: usize = 64;
 const FDT_ARG_PREFIX: &[u8] = b"fdt=";
+const MAX_FDT_PATH: usize = 256;
 
 static GLOBAL_FDT: Once<Fdt<'static>> = Once::new();
 
@@ -370,9 +377,238 @@ fn parent_path(path: &str) -> Option<&str> {
         &path[..separator]
     })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GicV2DiscoveryError {
+    MissingController,
+    DisabledController,
+    InvalidRegister,
+    MissingRegister,
+    InvalidRegion,
+    MissingParent,
+    MissingRanges,
+    AddressNotMapped,
+    AddressOverflow,
+    PathTooLong,
+}
+
+impl fmt::Display for GicV2DiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingController => "no supported GICv2 interrupt controller is present",
+            Self::DisabledController => "the GICv2 interrupt controller is disabled",
+            Self::InvalidRegister => "the GICv2 reg property is invalid",
+            Self::MissingRegister => "the GICv2 reg property lacks a required interface",
+            Self::InvalidRegion => "a GICv2 interface is too small or unaligned",
+            Self::MissingParent => "the GICv2 node has no parent bus",
+            Self::MissingRanges => "a GICv2 parent bus has no ranges property",
+            Self::AddressNotMapped => "a GICv2 register address is not covered by parent ranges",
+            Self::AddressOverflow => "a GICv2 register address overflows",
+            Self::PathTooLong => "the GICv2 DTB path exceeds the supported length",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Discovers the four GICv2 interfaces required for hardware-backed List
+/// Register delivery. The `reg` entries are translated through parent buses to
+/// CPU physical addresses; their order is GICD, GICC, GICH, then GICV.
+pub fn discover_gic_v2(fdt: Fdt<'_>) -> Result<GicV2Info, GicV2DiscoveryError> {
+    let mut path = [0_u8; MAX_FDT_PATH];
+    path[0] = b'/';
+    find_gic_v2(fdt, fdt.root(), &mut path, 1)?.ok_or(GicV2DiscoveryError::MissingController)
+}
+
+fn find_gic_v2(
+    fdt: Fdt<'_>,
+    node: FdtNode<'_>,
+    path: &mut [u8; MAX_FDT_PATH],
+    path_len: usize,
+) -> Result<Option<GicV2Info>, GicV2DiscoveryError> {
+    if node.is_compatible("arm,gic-400") || node.is_compatible("arm,cortex-a15-gic") {
+        if node
+            .status()
+            .map_err(|_| GicV2DiscoveryError::DisabledController)?
+            != dtoolkit::standard::Status::Okay
+        {
+            return Err(GicV2DiscoveryError::DisabledController);
+        }
+        let path = core::str::from_utf8(&path[..path_len])
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        return decode_gic_v2(fdt, node, path).map(Some);
+    }
+
+    for child in node.children() {
+        let separator = usize::from(path_len != 1);
+        let child_name = child.name().as_bytes();
+        let next_len = path_len
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(GicV2DiscoveryError::PathTooLong)?;
+        if next_len > path.len() {
+            return Err(GicV2DiscoveryError::PathTooLong);
+        }
+        if separator != 0 {
+            path[path_len] = b'/';
+        }
+        path[path_len + separator..next_len].copy_from_slice(child_name);
+        if let Some(info) = find_gic_v2(fdt, child, path, next_len)? {
+            return Ok(Some(info));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_gic_v2(
+    fdt: Fdt<'_>,
+    node: FdtNode<'_>,
+    path: &str,
+) -> Result<GicV2Info, GicV2DiscoveryError> {
+    let mut registers = node
+        .reg()
+        .map_err(|_| GicV2DiscoveryError::InvalidRegister)?
+        .ok_or(GicV2DiscoveryError::MissingRegister)?;
+    let mut regions = [None; 4];
+    for region in &mut regions {
+        let register = registers
+            .next()
+            .ok_or(GicV2DiscoveryError::MissingRegister)?;
+        let address = register
+            .address::<u64>()
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        let size = register
+            .size::<u64>()
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        let address = translate_gic_to_cpu_address(fdt, path, address)?;
+        *region = Some(
+            PhysRegion::new_aligned(PhysAddr::new(address), size, 0x1000)
+                .map_err(|_| GicV2DiscoveryError::InvalidRegion)?,
+        );
+    }
+    let [
+        Some(distributor),
+        Some(cpu_interface),
+        Some(hypervisor_interface),
+        Some(virtual_cpu_interface),
+    ] = regions
+    else {
+        return Err(GicV2DiscoveryError::MissingRegister);
+    };
+    if distributor.size() < 0x1000
+        || cpu_interface.size() < 0x1000
+        || hypervisor_interface.size() < 0x1000
+        || virtual_cpu_interface.size() < 0x2000
+    {
+        return Err(GicV2DiscoveryError::InvalidRegion);
+    }
+    Ok(GicV2Info {
+        distributor,
+        cpu_interface,
+        hypervisor_interface,
+        virtual_cpu_interface,
+    })
+}
+
+fn translate_gic_to_cpu_address(
+    fdt: Fdt<'_>,
+    device_path: &str,
+    mut address: u64,
+) -> Result<u64, GicV2DiscoveryError> {
+    let mut bus_path = parent_path(device_path).ok_or(GicV2DiscoveryError::MissingParent)?;
+    while bus_path != "/" {
+        let bus = fdt
+            .find_node(bus_path)
+            .ok_or(GicV2DiscoveryError::MissingParent)?;
+        let mut ranges = bus
+            .ranges()
+            .map_err(|_| GicV2DiscoveryError::MissingRanges)?
+            .ok_or(GicV2DiscoveryError::MissingRanges)?;
+        if let Some(first) = ranges.next() {
+            let mut translated = None;
+            for range in core::iter::once(first).chain(ranges) {
+                let child = range
+                    .child_bus_address::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let parent = range
+                    .parent_bus_address::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let length = range
+                    .length::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let Some(offset) = address.checked_sub(child) else {
+                    continue;
+                };
+                if offset < length {
+                    translated = Some(
+                        parent
+                            .checked_add(offset)
+                            .ok_or(GicV2DiscoveryError::AddressOverflow)?,
+                    );
+                    break;
+                }
+            }
+            address = translated.ok_or(GicV2DiscoveryError::AddressNotMapped)?;
+        }
+        bus_path = parent_path(bus_path).ok_or(GicV2DiscoveryError::MissingParent)?;
+    }
+    Ok(address)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dtoolkit::fdt::Fdt;
+    use dtoolkit::model::{DeviceTree, DeviceTreeNode, DeviceTreeProperty};
+    use std::vec::Vec;
+
+    fn property(name: &str, value: Vec<u8>) -> DeviceTreeProperty {
+        DeviceTreeProperty::new_unchecked(name, value)
+    }
+
+    fn gic_registers() -> Vec<u8> {
+        let mut registers = Vec::new();
+        for (address, size) in [
+            (0x1000_u32, 0x1000_u32),
+            (0x2000, 0x1000),
+            (0x4000, 0x1000),
+            (0x6000, 0x2000),
+        ] {
+            registers.extend_from_slice(&address.to_be_bytes());
+            registers.extend_from_slice(&size.to_be_bytes());
+        }
+        registers
+    }
+
+    #[test]
+    fn discovers_gicv2_regions_through_parent_ranges() {
+        let mut tree = DeviceTree::new();
+        tree.root
+            .add_property(property("#address-cells", 2_u32.to_be_bytes().to_vec()));
+        tree.root
+            .add_property(property("#size-cells", 1_u32.to_be_bytes().to_vec()));
+
+        let mut gic = DeviceTreeNode::new_unchecked("interrupt-controller@1000");
+        gic.add_property(property("compatible", b"arm,gic-400\0".to_vec()));
+        gic.add_property(property("reg", gic_registers()));
+
+        let mut soc = DeviceTreeNode::new_unchecked("soc");
+        soc.add_property(property("#address-cells", 1_u32.to_be_bytes().to_vec()));
+        soc.add_property(property("#size-cells", 1_u32.to_be_bytes().to_vec()));
+        let mut ranges = Vec::new();
+        ranges.extend_from_slice(&0_u32.to_be_bytes());
+        ranges.extend_from_slice(&0xff84_0000_u64.to_be_bytes());
+        ranges.extend_from_slice(&0x0010_0000_u32.to_be_bytes());
+        soc.add_property(property("ranges", ranges));
+        soc.add_child(gic);
+        tree.root.add_child(soc);
+
+        let blob = tree.to_dtb();
+        let info = discover_gic_v2(Fdt::new(&blob).unwrap()).unwrap();
+        assert_eq!(info.distributor.start().value(), 0xff84_1000);
+        assert_eq!(info.cpu_interface.start().value(), 0xff84_2000);
+        assert_eq!(info.hypervisor_interface.start().value(), 0xff84_4000);
+        assert_eq!(info.virtual_cpu_interface.start().value(), 0xff84_6000);
+        assert_eq!(info.virtual_cpu_interface.size(), 0x2000);
+    }
 
     #[test]
     fn decodes_bootelf_argument_layout() {

@@ -86,6 +86,14 @@ pub fn print(args: fmt::Arguments<'_>) -> fmt::Result {
     uart.write_fmt(args)
 }
 
+/// Sends one byte through tvisor's host-owned Mini UART.
+///
+/// This is used by virtual devices after their guest access has been fully
+/// emulated; it never makes the physical UART visible to a guest.
+pub fn write_byte(byte: u8) -> Result<(), ()> {
+    MiniUart::configured().ok_or(())?.write_byte(byte)
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
