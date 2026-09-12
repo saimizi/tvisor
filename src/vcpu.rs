@@ -1,6 +1,7 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
 use core::arch::global_asm;
+use tvisor_util::gicv2::VirtualGicV2State;
 use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
 use tvisor_util::virtual_timer::VirtualTimerState;
 
@@ -210,12 +211,14 @@ pub struct Vcpu {
     context: VcpuContext,
     exit: VcpuExit,
     timer: VirtualTimerState,
+    gic: VirtualGicV2State,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
 const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 368);
 const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 400);
-const _: () = assert!(core::mem::size_of::<Vcpu>() == 432);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 432);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 448);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -232,6 +235,10 @@ impl Vcpu {
                 cntv_cval_el0: 0,
                 cntv_ctl_el0: 0,
                 pending_irq: 0,
+            },
+            gic: VirtualGicV2State {
+                vmcr: 0,
+                timer_lr: 0,
             },
         }
     }
@@ -263,6 +270,14 @@ impl Vcpu {
 
     pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
         &mut self.timer
+    }
+
+    pub fn gic(&self) -> &VirtualGicV2State {
+        &self.gic
+    }
+
+    pub fn gic_mut(&mut self) -> &mut VirtualGicV2State {
+        &mut self.gic
     }
 }
 
@@ -372,19 +387,6 @@ __vcpu_run:
     mrs  x9, cptr_el2
     orr  x9, x9, #0x400
     msr  cptr_el2, x9
-
-    // HCR_EL2.VI is tvisor's single-vCPU virtual interrupt injection line.
-    // A later virtual GIC supplies acknowledgment and prioritization policy.
-    mrs  x9, hcr_el2
-    ldr  x10, [x0, #424]
-    cbz  x10, .Lno_virtual_irq
-    orr  x9, x9, #0x80
-    b    .Lvirtual_irq_configured
-.Lno_virtual_irq:
-    bic  x9, x9, #0x80
-.Lvirtual_irq_configured:
-    msr  hcr_el2, x9
-    isb
 
     // Restore guest GPRs x1..x30
     ldp  x2,  x3,  [x0, #16]

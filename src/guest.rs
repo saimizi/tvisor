@@ -244,16 +244,23 @@ unsafe fn deactivate_stage2() {
 /// completed and resumed here, keeping the physical Mini UART host-owned.
 fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
     loop {
+        // The guest accesses GICV directly; save/restore GICH state around
+        // every world switch so its List Register and CPU-interface policy
+        // remain owned by this vCPU rather than the host.
+        unsafe { gicv2::restore_virtual_cpu(vcpu.gic()) };
         let vector = unsafe { __vcpu_run(vcpu) };
+        unsafe { gicv2::save_virtual_cpu(vcpu.gic_mut()) };
         if vector == 9 {
             let irq = unsafe { gicv2::acknowledge() };
             if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
-                unsafe { gicv2::end_interrupt(irq) };
                 vcpu.timer_mut().mark_pending_from_irq();
-                println!(
-                    "  EL2 received virtual timer PPI {}; injecting guest IRQ",
-                    irq
-                );
+                gicv2::queue_timer_ppi(vcpu.gic_mut(), irq)
+                    .expect("physical timer PPI arrived while its virtual LR remained active");
+                vcpu.timer_mut().clear_pending_after_list_register();
+                // EOImodeNS is set: this only drops priority. The physical
+                // PPI remains active until the guest GICV_EOIR completes LR0.
+                unsafe { gicv2::end_interrupt(irq) };
+                println!("  EL2 queued virtual timer PPI {} in GICH LR0", irq);
                 continue;
             }
             if irq != gicv2::SPURIOUS_IRQ {
@@ -271,13 +278,6 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher) -> u64 {
             println!(
                 "  Guest EL1 stage-1 MMU active: TTBR0={:#018x} TTBR1={:#018x} TCR={:#018x} MAIR={:#018x} VBAR={:#018x}",
                 state.ttbr0_el1, state.ttbr1_el1, state.tcr_el1, state.mair_el1, state.vbar_el1,
-            );
-        }
-
-        if vcpu.timer_mut().virtual_irq_pending() {
-            println!(
-                "  Virtual timer PPI {} pending for guest injection",
-                VIRTUAL_TIMER_PPI
             );
         }
 
@@ -448,6 +448,15 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         Stage2MemoryType::NormalWbWa,
         Stage2Access::ReadOnly,
         Stage2Exec::ExecuteNever,
+    )?;
+
+    // The GIC virtual CPU interface exposes List Register-backed virtual
+    // acknowledge/EOI semantics directly to the guest. Its physical backing
+    // remains host-owned and is mapped only at this guest IPA.
+    vm_ctl.map_external_device(
+        IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
+        tvisor_util::system_info::PhysAddr::new(gicv2::GICV_BASE as u64),
+        PAGE_SIZE,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
