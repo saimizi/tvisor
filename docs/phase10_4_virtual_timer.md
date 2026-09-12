@@ -21,8 +21,8 @@ The current policy is deliberately simple:
   tvisor uses the GICv2 Non-secure control-register view and does not access
   Secure-only `GICD_IGROUPR`; with `GICC_CTLR.EOImodeNS=1`, EL2's physical
   EOI drops priority only while the guest's virtual EOI completes deactivation;
-- GICH VMCR and LR0 are saved and restored with the vCPU, and GICV is mapped
-  at guest IPA `0x0801_0000`; and
+- GICH VMCR and LR0 are saved and restored with the vCPU, and both GICV pages
+  (`GICV_CTLR` through `GICV_DIR`) are mapped at guest IPA `0x0801_0000`; and
 - physical counter/timer access remains controlled by the existing
   `CNTHCTL_EL2` policy; and
 - expiration detection is exclusively hardware-driven; tvisor does not poll

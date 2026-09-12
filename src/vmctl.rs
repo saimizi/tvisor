@@ -881,7 +881,7 @@ mod tests {
         vm.map_external_device_with_pa_bits(
             IpaAddr::new(0x0801_0000),
             PhysAddr::new(0xff84_6000),
-            PAGE_SIZE,
+            2 * PAGE_SIZE,
             TEST_PA_BITS,
         )
         .expect("map GIC virtual CPU interface");
@@ -890,6 +890,15 @@ mod tests {
             leaf_descriptor(&vm, 0x0801_0000),
             encode_l3_page_descriptor(
                 0xff84_6000,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
+        assert_eq!(
+            leaf_descriptor(&vm, 0x0801_1000),
+            encode_l3_page_descriptor(
+                0xff84_7000,
                 Stage2MemoryType::DeviceNgNre,
                 Stage2Access::ReadWrite,
                 Stage2Exec::ExecuteNever,

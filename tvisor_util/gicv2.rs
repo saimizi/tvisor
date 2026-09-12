@@ -9,10 +9,12 @@ pub const GICD_BASE: usize = 0xff84_1000;
 pub const GICC_BASE: usize = 0xff84_2000;
 pub const GICH_BASE: usize = 0xff84_4000;
 pub const GICV_BASE: usize = 0xff84_6000;
-/// Guest IPA of the GICv2 virtual CPU interface page.
+/// Guest IPA of the GICv2 virtual CPU interface register region.
 pub const VIRTUAL_GICV_IPA: u64 = 0x0801_0000;
-/// Covers GICD, GICC, GICH, and the GIC virtual CPU-interface page.
-pub const GIC_MMIO_SIZE: usize = 0x6000;
+/// GICV_CTLR is in the first page and GICV_DIR is in the second.
+pub const GICV_SIZE: usize = 0x2000;
+/// Covers GICD, GICC, GICH, and both GIC virtual CPU-interface pages.
+pub const GIC_MMIO_SIZE: usize = 0x7000;
 pub const SPURIOUS_IRQ: u32 = 1023;
 
 const GICD_CTLR: usize = 0x000;

@@ -456,7 +456,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     vm_ctl.map_external_device(
         IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
         tvisor_util::system_info::PhysAddr::new(gicv2::GICV_BASE as u64),
-        PAGE_SIZE,
+        gicv2::GICV_SIZE,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
