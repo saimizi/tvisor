@@ -197,14 +197,6 @@ extern "C" fn post_switch_page_tables(
         };
 
         let live_dtb: PhysRegion = (*fdt).into();
-        let live_dtb_pages =
-            match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64) {
-                Ok(region) => region,
-                Err(error) => {
-                    println!("Failed to page-align live DTB: {}", error);
-                    break 'wait;
-                }
-            };
 
         let mut memory_map_guard = MEMORY_MAP.lock();
         if let Err(error) = discover_memory_map(
@@ -218,7 +210,7 @@ extern "C" fn post_switch_page_tables(
         }
 
         let memory_map: &MemoryMap = &memory_map_guard;
-        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb_pages) {
+        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb) {
             println!("Failed to map usable RAM: {}", error);
             break 'wait;
         }

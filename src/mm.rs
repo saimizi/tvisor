@@ -12,7 +12,7 @@ use tvisor_util::el2_translation::{
 use tvisor_util::gicv2::GicV2Info;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
-    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
+    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap,
 };
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 use tvisor_util::*;
@@ -295,7 +295,9 @@ pub fn initialize_allocator_after_takeover(
     }
 
     validate_live_dtb(live_dtb)?;
-    let live_dtb_pages = page_covering(live_dtb)?;
+    let live_dtb_pages =
+        PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
+            .map_err(|_| AllocatorInitError::InvalidDtb)?;
 
     // SAFETY: initialization runs once after takeover on the boot CPU before
     // any allocator client or asynchronous exception can access this state.
@@ -328,13 +330,15 @@ pub fn initialize_allocator_after_takeover(
     Ok(AllocatorInitResult { stats, live_dtb })
 }
 
-pub fn map_usable_ram(
-    memory_map: &MemoryMap,
-    live_dtb_pages: PhysRegion,
-) -> Result<(), PrepareError> {
+pub fn map_usable_ram(memory_map: &MemoryMap, live_dtb: PhysRegion) -> Result<(), PrepareError> {
     let mut exclusions = FixedList::<PhysRegion, 1>::new();
+
+    let live_dtb_aligned =
+        PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
+            .map_err(|_| PrepareError::AddressOverflow)?;
+
     exclusions
-        .push(live_dtb_pages)
+        .push(live_dtb_aligned)
         .map_err(|_| PrepareError::Validation)?;
 
     with_tables(|tables| {

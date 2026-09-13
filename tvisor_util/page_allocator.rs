@@ -360,18 +360,6 @@ fn count_pages<const N: usize>(
     Ok(pages)
 }
 
-pub fn page_covering(region: PhysRegion) -> Result<PhysRegion, AllocatorError> {
-    let start = align_down(region.start().value() as usize, PAGE_SIZE)
-        .ok_or(AllocatorError::AddressOverflow)?;
-    let end = align_up(region.end().value() as usize, PAGE_SIZE)
-        .ok_or(AllocatorError::AddressOverflow)?;
-    if end as u64 > MAX_PHYSICAL_ADDRESS {
-        return Err(AllocatorError::PhysicalAddressOutOfRange);
-    }
-    PhysRegion::from_bounds(PhysAddr::new(start as u64), PhysAddr::new(end as u64))
-        .map_err(AllocatorError::InvalidRegion)
-}
-
 fn bit_is_set(bitmap: &[u8], index: usize) -> bool {
     bitmap[index / 8] & (1 << (index % 8)) != 0
 }
@@ -541,14 +529,6 @@ mod tests {
         assert_eq!(
             allocator.state(PhysAddr::new(0x8000)),
             Err(AllocatorError::PhysicalAddressOutOfRange)
-        );
-    }
-
-    #[test]
-    fn page_cover_rounds_outward() {
-        assert_eq!(
-            page_covering(region(0x3100, 0x100)).unwrap(),
-            region(0x3000, 0x1000)
         );
     }
 }
