@@ -481,32 +481,28 @@ fn decode_gic_v2(
             .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
         let address = translate_gic_to_cpu_address(fdt, path, address)?;
         *region = Some(
-            PhysRegion::new_aligned(PhysAddr::new(address), size, 0x1000)
+            PhysRegion::new(PhysAddr::new(address), size)
                 .map_err(|_| GicV2DiscoveryError::InvalidRegion)?,
         );
     }
-    let [
+
+    if let [
         Some(distributor),
         Some(cpu_interface),
         Some(hypervisor_interface),
         Some(virtual_cpu_interface),
     ] = regions
-    else {
-        return Err(GicV2DiscoveryError::MissingRegister);
-    };
-    if distributor.size() < 0x1000
-        || cpu_interface.size() < 0x1000
-        || hypervisor_interface.size() < 0x1000
-        || virtual_cpu_interface.size() < 0x2000
     {
-        return Err(GicV2DiscoveryError::InvalidRegion);
+        GicV2Info::new(
+            distributor,
+            cpu_interface,
+            hypervisor_interface,
+            virtual_cpu_interface,
+        )
+        .ok_or(GicV2DiscoveryError::InvalidRegion)
+    } else {
+        Err(GicV2DiscoveryError::MissingRegister)
     }
-    Ok(GicV2Info {
-        distributor,
-        cpu_interface,
-        hypervisor_interface,
-        virtual_cpu_interface,
-    })
 }
 
 fn translate_gic_to_cpu_address(
@@ -603,11 +599,11 @@ mod tests {
 
         let blob = tree.to_dtb();
         let info = discover_gic_v2(Fdt::new(&blob).unwrap()).unwrap();
-        assert_eq!(info.distributor.start().value(), 0xff84_1000);
-        assert_eq!(info.cpu_interface.start().value(), 0xff84_2000);
-        assert_eq!(info.hypervisor_interface.start().value(), 0xff84_4000);
-        assert_eq!(info.virtual_cpu_interface.start().value(), 0xff84_6000);
-        assert_eq!(info.virtual_cpu_interface.size(), 0x2000);
+        assert_eq!(info.distributor().start().value(), 0xff84_1000);
+        assert_eq!(info.cpu_interface().start().value(), 0xff84_2000);
+        assert_eq!(info.hypervisor_interface().start().value(), 0xff84_4000);
+        assert_eq!(info.virtual_cpu_interface().start().value(), 0xff84_6000);
+        assert_eq!(info.virtual_cpu_interface().size(), 0x2000);
     }
 
     #[test]

@@ -10,10 +10,50 @@ pub const SPURIOUS_IRQ: u32 = 1023;
 /// Physical GICv2 regions, in the DTB `reg` order: GICD, GICC, GICH, GICV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GicV2Info {
-    pub distributor: PhysRegion,
-    pub cpu_interface: PhysRegion,
-    pub hypervisor_interface: PhysRegion,
-    pub virtual_cpu_interface: PhysRegion,
+    distributor: PhysRegion,
+    cpu_interface: PhysRegion,
+    hypervisor_interface: PhysRegion,
+    virtual_cpu_interface: PhysRegion,
+}
+
+impl GicV2Info {
+    pub fn new(
+        distributor: PhysRegion,
+        cpu_interface: PhysRegion,
+        hypervisor_interface: PhysRegion,
+        virtual_cpu_interface: PhysRegion,
+    ) -> Option<Self> {
+        if distributor.size() < REQUIRED_GICD_SIZE
+            || cpu_interface.size() < REQUIRED_GICC_SIZE
+            || hypervisor_interface.size() < REQUIRED_GICH_SIZE
+            || virtual_cpu_interface.size() < REQUIRED_GICV_SIZE
+        {
+            None
+        } else {
+            Some(Self {
+                distributor,
+                cpu_interface,
+                hypervisor_interface,
+                virtual_cpu_interface,
+            })
+        }
+    }
+
+    pub const fn distributor(self) -> PhysRegion {
+        self.distributor
+    }
+
+    pub const fn cpu_interface(self) -> PhysRegion {
+        self.cpu_interface
+    }
+
+    pub const fn hypervisor_interface(self) -> PhysRegion {
+        self.hypervisor_interface
+    }
+
+    pub const fn virtual_cpu_interface(self) -> PhysRegion {
+        self.virtual_cpu_interface
+    }
 }
 
 /// Instance-oriented access to the host GICv2 virtualization interfaces.
@@ -132,6 +172,11 @@ pub fn initialize(info: GicV2Info) -> &'static GicV2 {
 pub fn global() -> Option<&'static GicV2> {
     GLOBAL_GIC.get()
 }
+
+pub const REQUIRED_GICD_SIZE: u64 = 0x104; // GICD_ISENABLER0 at 0x100
+pub const REQUIRED_GICC_SIZE: u64 = 0x14; // GICC_EOIR at 0x10
+pub const REQUIRED_GICH_SIZE: u64 = 0x104; // GICH_LR0 at 0x100
+pub const REQUIRED_GICV_SIZE: u64 = 0x1004; // GICV_DIR at 0x1000, if needed
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;

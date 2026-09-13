@@ -239,10 +239,10 @@ pub fn setup_bootstrap_page_table(
     // interfaces are independently mapped because DTB regions need not be
     // physically contiguous.
     for region in [
-        gic.distributor,
-        gic.cpu_interface,
-        gic.hypervisor_interface,
-        gic.virtual_cpu_interface,
+        gic.distributor(),
+        gic.cpu_interface(),
+        gic.hypervisor_interface(),
+        gic.virtual_cpu_interface(),
     ] {
         map_identity_device(&mut tables, region)?;
     }
@@ -460,15 +460,13 @@ pub fn map_identity_device<const N: usize>(
     tables: &mut TableSet<'_, N>,
     region: PhysRegion,
 ) -> Result<(), PrepareError> {
-    if !is_page_aligned(region.start().value() as usize)
-        || !is_page_aligned(region.end().value() as usize)
-    {
-        return Err(PrepareError::Validation);
-    }
+    let aligned_region = PhysRegion::new_aligned(region.start(), region.size(), PAGE_SIZE as u64)
+        .map_err(|_| PrepareError::AddressOverflow)?;
+
     tables.map(Mapping {
-        va: region.start().value(),
-        pa: region.start().value(),
-        size: region.size(),
+        va: aligned_region.start().value(),
+        pa: aligned_region.start().value(),
+        size: aligned_region.size(),
         memory_type: MemoryType::Device,
         writable: true,
         executable: false,

@@ -147,7 +147,10 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
     println!(
         "GICv2 DTB discovery:\n GICD={}\n GICC={}\n GICH={}\n GICV={}",
-        gic.distributor, gic.cpu_interface, gic.hypervisor_interface, gic.virtual_cpu_interface,
+        gic.distributor(),
+        gic.cpu_interface(),
+        gic.hypervisor_interface(),
+        gic.virtual_cpu_interface(),
     );
     gicv2::initialize(gic);
 

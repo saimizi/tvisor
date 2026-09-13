@@ -456,8 +456,8 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     // remains host-owned and is mapped only at this guest IPA.
     vm_ctl.map_external_device(
         IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
-        gic.info().virtual_cpu_interface.start(),
-        gic.info().virtual_cpu_interface.size() as usize,
+        gic.info().virtual_cpu_interface().start(),
+        gic.info().virtual_cpu_interface().size() as usize,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();

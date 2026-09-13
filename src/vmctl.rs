@@ -364,6 +364,12 @@ impl VmCtl {
         pa: PhysAddr,
         size: usize,
     ) -> Result<(), TranslationError> {
+        if !is_page_aligned(ipa.value() as usize)
+            || !is_page_aligned(pa.value() as usize)
+            || !is_aligned(size, PAGE_SIZE)
+        {
+            return Err(TranslationError::UnalignedMapping);
+        }
         #[cfg(target_arch = "aarch64")]
         let pa_bits = IdAa64Mmfr0El1::dump()
             .ok_or(TranslationError::Unexpected)?
