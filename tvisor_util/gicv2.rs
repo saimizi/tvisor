@@ -45,49 +45,83 @@ impl GicV2 {
         self.info.hypervisor_interface.start().value() as usize
     }
 
+    pub const fn gicd_ctlr(&self) -> usize {
+        self.distributor_base() + GICD_CTLR
+    }
+
+    pub const fn gicc_pmr(&self) -> usize {
+        self.cpu_interface_base() + GICC_PMR
+    }
+
+    pub const fn gicc_ctlr(&self) -> usize {
+        self.cpu_interface_base() + GICC_CTLR
+    }
+
+    pub const fn gicd_isenabler(&self) -> usize {
+        self.distributor_base() + GICD_ISENABLER
+    }
+
+    pub const fn gich_vmcr(&self) -> usize {
+        self.hypervisor_interface_base() + GICH_VMCR
+    }
+
+    pub const fn gich_lr0(&self) -> usize {
+        self.hypervisor_interface_base() + GICH_LR0
+    }
+
+    pub const fn gich_hcr(&self) -> usize {
+        self.hypervisor_interface_base() + GICH_HCR
+    }
+
+    pub const fn gicc_iar(&self) -> usize {
+        self.cpu_interface_base() + GICC_IAR
+    }
+
+    pub const fn gicc_eoir(&self) -> usize {
+        self.cpu_interface_base() + GICC_EOIR
+    }
+
     /// Enables a banked PPI from the GICv2 Non-secure register view.
     /// The platform handoff must classify the timer PPI as Non-secure Group 1.
     pub unsafe fn enable_timer_ppi(&self, ppi: u32) {
         debug_assert!(ppi < 32);
         unsafe {
             write32(
-                self.distributor_base() + GICD_CTLR,
-                read32(self.distributor_base() + GICD_CTLR) | GICD_CTLR_ENABLE_GRP1_NS,
+                self.gicd_ctlr(),
+                read32(self.gicd_ctlr()) | GICD_CTLR_ENABLE_GRP1_NS,
             );
-            write32(self.cpu_interface_base() + GICC_PMR, 0xff);
+            write32(self.gicc_pmr(), 0xff);
             write32(
-                self.cpu_interface_base() + GICC_CTLR,
-                read32(self.cpu_interface_base() + GICC_CTLR)
-                    | GICC_CTLR_ENABLE_GRP1_NS
-                    | GICC_CTLR_EOIMODE_NS,
+                self.gicc_ctlr(),
+                read32(self.gicc_ctlr()) | GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS,
             );
-            write32(self.distributor_base() + GICD_ISENABLER, 1 << ppi);
+            write32(self.gicd_isenabler(), 1 << ppi);
         }
     }
 
     pub unsafe fn restore_virtual_cpu(&self, state: &VirtualGicV2State) {
         unsafe {
-            write32(self.hypervisor_interface_base() + GICH_VMCR, state.vmcr);
-            write32(self.hypervisor_interface_base() + GICH_LR0, state.timer_lr);
-            write32(self.hypervisor_interface_base() + GICH_HCR, GICH_HCR_ENABLE);
+            write32(self.gich_vmcr(), state.vmcr);
+            write32(self.gich_lr0(), state.timer_lr);
+            write32(self.gich_hcr(), GICH_HCR_ENABLE);
         }
     }
 
     pub unsafe fn save_virtual_cpu(&self, state: &mut VirtualGicV2State) {
         unsafe {
-            state.vmcr = read32(self.hypervisor_interface_base() + GICH_VMCR);
-            state.timer_lr = read32(self.hypervisor_interface_base() + GICH_LR0);
-            write32(self.hypervisor_interface_base() + GICH_HCR, 0);
+            state.vmcr = read32(self.gich_vmcr());
+            state.timer_lr = read32(self.gich_lr0());
+            write32(self.gich_hcr(), 0);
         }
     }
 
     pub unsafe fn acknowledge(&self) -> u32 {
-        unsafe { read32(self.cpu_interface_base() + GICC_IAR) & GICH_LR_INTID_MASK }
+        unsafe { read32(self.gicc_iar()) & GICH_LR_INTID_MASK }
     }
 
     /// Drops priority only; guest GICV_EOIR deactivates the hardware LR.
     pub unsafe fn end_interrupt(&self, id: u32) {
-        unsafe { write32(self.cpu_interface_base() + GICC_EOIR, id) }
+        unsafe { write32(self.gicc_eoir(), id) }
     }
 }
 
