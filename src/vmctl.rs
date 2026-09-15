@@ -18,6 +18,7 @@ pub const MAX_GUEST_MEM_BYTES: usize = DEFAULT_GUEST_RAM_SIZE as usize + 2 * 102
 pub const MAX_GUEST_MEM_PAGES: usize = (MAX_GUEST_MEM_BYTES) / PAGE_SIZE;
 
 pub type AddressType = PhysAddr;
+#[cfg_attr(not(test), allow(dead_code))]
 pub type RegionType = PhysRegion;
 
 /// Guest intermediate physical address (IPA).
@@ -210,6 +211,7 @@ enum VmMem {
 ///
 /// IpaPa entries are contiguous and yield one region. Page-table entries can
 /// grow one page at a time, so they yield one region for each tracked page.
+#[cfg_attr(not(test), allow(dead_code))]
 struct EntryPaIter<'a> {
     entry: Option<&'a VmMem>,
     next_page: usize,
@@ -706,6 +708,7 @@ impl VmCtl {
         Ok(phy)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn entry_pa(&self, usage: VmMemUsage) -> impl Iterator<Item = RegionType> + '_ {
         EntryPaIter {
             entry: self.vm_mem.iter().find(|entry| entry.usage() == usage),

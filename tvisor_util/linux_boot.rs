@@ -27,7 +27,7 @@ impl fmt::Display for LinuxImageError {
             Self::BadMagic => f.write_str("Linux Image header has an invalid magic value"),
             Self::LegacyImageSize => f.write_str("Linux Image has no authoritative image_size"),
             Self::ImageTooLarge => {
-                f.write_str("Linux Image is shorter than its declared image_size")
+                f.write_str("Linux Image contents exceed its declared image_size")
             }
             Self::BigEndianImage => f.write_str("big-endian arm64 Linux Images are unsupported"),
         }
@@ -90,7 +90,11 @@ impl LinuxImageHeader {
         if image_size == 0 {
             return Err(LinuxImageError::LegacyImageSize);
         }
-        if image_size > image.len() as u64 {
+        // A stripped arm64 Image may omit its zero-initialized tail while
+        // `image_size` still covers the complete runtime extent. The loader
+        // copies the supplied bytes and zero-fills that tail. Bytes beyond
+        // the declared extent, conversely, have no valid placement.
+        if image.len() as u64 > image_size {
             return Err(LinuxImageError::ImageTooLarge);
         }
         Ok(Self {
@@ -355,11 +359,19 @@ mod tests {
             LinuxImageHeader::parse(&image(0x80000, 4096, 1)),
             Err(LinuxImageError::BigEndianImage)
         );
-        let mut short = image(0x80000, 4096, 0);
-        short.truncate(64);
+        let mut oversized = image(0x80000, 4096, 0);
+        oversized.extend_from_slice(&[0]);
         assert_eq!(
-            LinuxImageHeader::parse(&short),
+            LinuxImageHeader::parse(&oversized),
             Err(LinuxImageError::ImageTooLarge)
         );
+    }
+
+    #[test]
+    fn accepts_a_compact_image_and_reserves_its_declared_extent() {
+        let mut compact = image(0x80000, 0x370000, 0b10);
+        compact.truncate(0x305008);
+        let layout = LinuxBootLayout::default_for_image(&compact, None).unwrap();
+        assert_eq!(layout.image(), (GUEST_RAM.start() + 0x80000, 0x370000));
     }
 }

@@ -1,14 +1,13 @@
-//! Guest platform initialization, Stage-2 translation setup, and Phase 9 test runner.
+//! Guest platform initialization, Stage-2 translation setup, and Linux launch.
 
-use core::arch::global_asm;
+use spin::Once;
 
 use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
 use tvisor_util::el2_translation::TranslationError;
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
-use tvisor_util::guest_platform::{
-    self, GUEST_DTB_IPA, GUEST_GICV, GUEST_PAYLOAD_IPA, GUEST_PL011, GUEST_RAM, GUEST_STACK_IPA,
-};
+use tvisor_util::guest_platform::{self, GUEST_GICV, GUEST_PL011, GUEST_RAM};
+use tvisor_util::linux_boot::LinuxBootLayout;
 use tvisor_util::stage2_translation::{
     Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
 };
@@ -18,101 +17,24 @@ use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
 use tvisor_util::gicv2;
 use tvisor_util::mmio::MmioDispatcher;
+use tvisor_util::system_info::PhysRegion;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
-unsafe extern "C" {
-    static __payload_start: u8;
-    static __payload_end: u8;
+static LINUX_IMAGE_SOURCE: Once<PhysRegion> = Once::new();
+
+/// Records the U-Boot-loaded Linux Image source before tvisor replaces the
+/// inherited EL2 translation regime.
+pub fn set_linux_image_source(source: PhysRegion) -> Result<(), ()> {
+    if let Some(existing) = LINUX_IMAGE_SOURCE.get() {
+        return if *existing == source { Ok(()) } else { Err(()) };
+    }
+    LINUX_IMAGE_SOURCE.call_once(|| source);
+    Ok(())
 }
 
-global_asm!(
-    r#"
-    .section .payload, "ax"
-    .global __el1_test_payload
-    .type __el1_test_payload, %function
-__el1_test_payload:
-    // 1. Initialize EL1 stack pointer to 0x4000_4000 (top of stack page [0x4000_3000, 0x4000_4000))
-    // Note: [0x4000_2000, 0x4000_3000) is the unmapped stack guard page.
-    mov  x9, #0x40000000
-    add  x9, x9, #0x4000
-    mov  sp, x9
-
-    // 2. Checkpoint 1: Memory write and read test in scratch data page [0x4000_1000, 0x4000_2000)
-    // Write pattern 0x5039_5041_594c_4f41 ("P9PAYLOA") to 0x4000_1000
-    movz x10, #0x4f41
-    movk x10, #0x594c, lsl #16
-    movk x10, #0x5041, lsl #32
-    movk x10, #0x5039, lsl #48
-    mov  x11, #0x40000000
-    add  x11, x11, #0x1000
-    str  x10, [x11]
-    ldr  x12, [x11]
-    cmp  x10, x12
-    b.ne .Lfail_mem
-
-    // Signal Checkpoint 1 via HVC #0 with x0 = 1, x1 = read pattern
-    mov  x0, #1
-    mov  x1, x12
-    hvc  #0
-
-    // 3. Checkpoint 2: System register verification
-    // Verify CurrentEL is EL1 (bits [3:2] == 0b01 -> CurrentEL value == 0x04)
-    mrs  x13, CurrentEL
-    lsr  x14, x13, #2
-    and  x14, x14, #0x3
-    cmp  x14, #1
-    b.ne .Lfail_current_el
-
-    // Verify MPIDR_EL1 has bit 30 (UP) set and Aff0 == 0
-    mrs  x15, MPIDR_EL1
-    tbz  x15, #30, .Lfail_mpidr_u
-    and  x16, x15, #0xff
-    cbnz x16, .Lfail_mpidr_aff
-
-    // Read SCTLR_EL1 to verify accessibility
-    mrs  x16, SCTLR_EL1
-
-    // Signal Checkpoint 2 via HVC #0 with x0 = 2, x1 = MPIDR_EL1
-    mov  x0, #2
-    mov  x1, x15
-    hvc  #0
-
-    // 4. Checkpoint 3: Deliberate Stage-2 Translation Fault
-    // Attempt to read from unmapped guest IPA 0x3000_0000
-    movz x17, #0x3000, lsl #16
-    ldr  x18, [x17]
-
-    // If it did not fault, report failure via HVC #4
-    mov  x0, #0xdead
-    mov  x1, x18
-    hvc  #4
-    b    .Lhang
-
-.Lfail_mem:
-    mov  x0, #0xdead
-    mov  x1, x12
-    hvc  #1
-    b    .Lhang
-
-.Lfail_current_el:
-    mov  x0, #0xdead
-    mov  x1, x13
-    hvc  #2
-    b    .Lhang
-
-.Lfail_mpidr_u:
-.Lfail_mpidr_aff:
-    mov  x0, #0xdead
-    mov  x1, x15
-    hvc  #3
-    b    .Lhang
-
-.Lhang:
-    wfe
-    b    .Lhang
-    .size __el1_test_payload, . - __el1_test_payload
-"#
-);
+pub fn linux_image_source() -> Option<PhysRegion> {
+    LINUX_IMAGE_SOURCE.get().copied()
+}
 
 #[inline]
 unsafe fn dcache_line_size() -> usize {
@@ -300,119 +222,95 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
     }
 }
 
-fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), TranslationError> {
-    println!("Phase 9: Preparing guest execution environment...");
-    // Device mapping is installed during private-EL2 setup before this point.
+fn run_linux_guest_inner(
+    vm_ctl: &mut VmCtl,
+    stage2_active: &mut bool,
+) -> Result<(), TranslationError> {
+    let source = linux_image_source().ok_or(TranslationError::Unexpected)?;
+    let image = unsafe {
+        core::slice::from_raw_parts(source.start().value() as *const u8, source.size() as usize)
+    };
+    let layout = LinuxBootLayout::default_for_image(image, None)
+        .map_err(|_| TranslationError::Unexpected)?;
+    let (image_ipa, image_extent) = layout.image();
+    let (dtb_ipa, dtb_capacity) = layout.dtb();
+
+    println!(
+        "Phase 10: loading Linux Image: source={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
+        source,
+        image.len(),
+        image_ipa,
+        image_extent,
+        dtb_ipa,
+    );
     let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
     unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
     guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
-    // Keep both the exact GICV region and its guest-visible address together.
-    // When the guest GIC node is introduced, it must use
-    // `gicv_mapping.device_ipa` and `gicv_mapping.device.size()` rather than
-    // the page-aligned Stage-2 mapping values below.
     let gicv_mapping =
         guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())
             .map_err(|_| TranslationError::Unexpected)?;
 
-    let mut alloc_ipa_pa = |usage: VmMemUsage,
-                            ipa: IpaAddr,
-                            size: usize|
-     -> Result<(u64, u64, usize), TranslationError> {
-        let pa = vm_ctl
-            .vm_mem_alloc(usage, Some(ipa), size)
-            .map_err(|_| TranslationError::Unexpected)?
-            .ok_or(TranslationError::Unexpected)?;
-
-        Ok((pa.value(), ipa.value(), size))
-    };
-
-    // 2. Allocate one contiguous backing extent for every byte advertised as
-    // guest RAM. The Phase 9 payload, stack, and generated DTB live inside it.
-    let (guest_ram_pa, guest_ram_ipa, guest_ram_size) = alloc_ipa_pa(
-        VmMemUsage::GuestRam,
-        IpaAddr::new(GUEST_RAM.start()),
-        GUEST_RAM.size() as usize,
-    )?;
+    let guest_ram_pa = vm_ctl
+        .vm_mem_alloc(
+            VmMemUsage::GuestRam,
+            Some(IpaAddr::new(GUEST_RAM.start())),
+            GUEST_RAM.size() as usize,
+        )
+        .map_err(|_| TranslationError::Unexpected)?
+        .ok_or(TranslationError::Unexpected)?
+        .value();
     let guest_pa_for = |ipa: u64| -> Result<u64, TranslationError> {
         guest_ram_pa
             .checked_add(
-                ipa.checked_sub(guest_ram_ipa)
+                ipa.checked_sub(GUEST_RAM.start())
                     .ok_or(TranslationError::Unexpected)?,
             )
             .ok_or(TranslationError::AddressOverflow)
     };
-    let payload_pa = guest_pa_for(GUEST_PAYLOAD_IPA)?;
-    let dtb_pa = guest_pa_for(GUEST_DTB_IPA)?;
+    let image_pa = guest_pa_for(image_ipa)?;
+    let dtb_pa = guest_pa_for(dtb_ipa)?;
 
-    println!("{}", vm_ctl);
-
-    // 3. Copy test payload into payload backing page
-    let (payload_start, payload_end) = {
-        (
-            core::ptr::addr_of!(__payload_start) as usize,
-            core::ptr::addr_of!(__payload_end) as usize,
-        )
-    };
-    let payload_len = payload_end.saturating_sub(payload_start);
-    assert!(payload_len > 0, "payload must not be empty");
-    assert!(payload_len <= PAGE_SIZE, "payload must fit in one page");
-
+    // The U-Boot source contains only initialized bytes. The Image header's
+    // extent includes the zero-initialized tail expected by the kernel.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            payload_start as *const u8,
-            payload_pa as *mut u8,
-            payload_len,
+        core::ptr::copy_nonoverlapping(image.as_ptr(), image_pa as *mut u8, image.len());
+        core::ptr::write_bytes(
+            (image_pa + image.len() as u64) as *mut u8,
+            0,
+            image_extent as usize - image.len(),
         );
     }
 
-    // 4. Generate a Guest DTB that describes exactly the fully backed RAM.
     let guest_mem_regions = [GuestMemoryRegion {
-        base: guest_ram_ipa,
-        size: guest_ram_size as u64,
+        base: GUEST_RAM.start(),
+        size: GUEST_RAM.size(),
     }];
+    let dtb_slice =
+        unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_capacity as usize) };
+    let dtb_real_size = build_guest_dtb(
+        dtb_slice,
+        &GuestFdtConfig {
+            memory_regions: &guest_mem_regions,
+            bootargs: None,
+        },
+    )
+    .map_err(|_| TranslationError::Unexpected)?;
 
-    let dtb_slice = unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, PAGE_SIZE) };
-
-    let dtb_config = GuestFdtConfig {
-        memory_regions: &guest_mem_regions,
-        bootargs: None,
-    };
-    let dtb_real_size =
-        build_guest_dtb(dtb_slice, &dtb_config).map_err(|_| TranslationError::Unexpected)?;
-
-    println!(
-        "  Generated guest DTB at IPA {} ({} bytes)",
-        GUEST_DTB_IPA, dtb_real_size
-    );
-
-    // 5. Clean Data Cache to PoC for payload and DTB, and invalidate Instruction Cache
-    // Note: for EL2 stage1, PA=VA
     unsafe {
-        clean_dcache_poc(payload_pa as usize, payload_pa as usize + PAGE_SIZE);
-        clean_dcache_poc(dtb_pa as usize, dtb_pa as usize + dtb_real_size);
+        clean_dcache_poc(image_pa as usize, (image_pa + image_extent) as usize);
+        clean_dcache_poc(dtb_pa as usize, (dtb_pa + dtb_real_size as u64) as usize);
         invalidate_icache_all();
     }
 
-    // 6. Build Stage-2 translation tables with distinct per-region permissions (4 KiB L3 leaves only).
-    // Use the same implemented PA width for software descriptor validation
-    // that stage2_register_values() encodes in VTCR_EL2.PS below.
     vm_ctl
         .vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
         .map_err(|_| TranslationError::Unexpected)?;
-
-    // Guest stage 1 owns its internal page permissions. Stage 2 maps all
-    // advertised RAM read/write and executable so Linux can install its own
-    // page tables after entry.
     vm_ctl.map(
         VmMemUsage::GuestRam,
         Stage2MemoryType::NormalWbWa,
         Stage2Access::ReadWrite,
         Stage2Exec::Executable,
     )?;
-
-    // The GIC virtual CPU interface exposes List Register-backed virtual
-    // acknowledge/EOI semantics directly to the guest. Only its
-    // page-expanded backing is passed to the Stage-2 mapper.
     vm_ctl.map_external_device(
         IpaAddr::new(GUEST_GICV.start()),
         gicv_mapping.mapped_pa,
@@ -422,141 +320,33 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
     let stage2_root_pa = vm_ctl.page_table_root().unwrap().value();
     let stage2_regs = stage2_register_values(vm_ctl.vm_id(), stage2_root_pa, pa_range)?;
-
-    let used_pages = vm_ctl
-        .entry_pa(VmMemUsage::PageTable)
-        .map(|v| v.size() / PAGE_SIZE as u64)
-        .sum::<u64>();
-
-    println!(
-        "  Stage-2 translation tables initialized: root_pa={:#018x} used_pages={}",
-        stage2_root_pa, used_pages,
-    );
-
-    // 7. Publish descriptors and activate Stage-2 translation
-    unsafe {
-        activate_stage2(&stage2_regs);
-    }
+    unsafe { activate_stage2(&stage2_regs) };
     *stage2_active = true;
 
-    // 8. Create the VM-owned vCPU. The pCPU associates with it only while
-    // entering guest execution.
-    // Stack grows from high to low, so initial stack pointer is set to the stack_ipa + stack_size
-    let mut vcpu = Vcpu::new(GUEST_PAYLOAD_IPA, GUEST_STACK_IPA + PAGE_SIZE as u64);
-    vcpu.context_mut().x[0] = GUEST_DTB_IPA;
-    let vcpu_id = vm_ctl.add_vcpu(vcpu);
-    let vcpu = vm_ctl.vcpu_mut(vcpu_id).expect("new vCPU must be present");
+    let registers = layout.initial_registers();
+    let vcpu_id = vm_ctl.add_vcpu(Vcpu::new_linux(registers.pc, registers.x0));
+    let vcpu = vm_ctl
+        .vcpu_mut(vcpu_id)
+        .expect("new Linux vCPU must be present");
+    println!(
+        "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
+        vcpu.context().elr_el2,
+        vcpu.context().x[0]
+    );
 
-    println!("Phase 9: Entering guest EL1 execution loop...");
     let mut mmio_dispatcher = MmioDispatcher::default();
-    // Checkpoint 1 (Guest RAM read/write test)
-    println!(
-        "  Starting guest execution at IPA {:#018x}...",
-        vcpu.context().elr_el2
-    );
-
     let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
-    assert_eq!(vector, 8, "Expected Lower-EL AArch64 synchronous exit");
-
-    let reason = vcpu.exit().decode_reason(vcpu.context());
     println!(
-        "  Guest exit 1: ESR_EL2={:#018x} reason={:?}",
+        "Linux guest stopped: vector={} ESR_EL2={:#018x} reason={:?}",
+        vector,
         vcpu.exit().esr_el2,
-        reason
+        vcpu.exit().decode_reason(vcpu.context()),
     );
-
-    match reason {
-        VcpuExitReason::Hvc { imm: 0, arg0: 1 } => {
-            println!("  [OK] Guest Checkpoint 1: RAM read/write verification passed");
-        }
-        VcpuExitReason::Hvc { imm, arg0 } => {
-            panic!(
-                "Guest failure exit at Checkpoint 1: HVC #{} with x0={:#x} x1={:#x}",
-                imm,
-                arg0,
-                vcpu.context().x[1]
-            );
-        }
-        other => panic!("Unexpected exit at Checkpoint 1: {:?}", other),
-    }
-
-    // Checkpoint 2 (System register verification)
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
-    assert_eq!(vector, 8);
-    let reason = vcpu.exit().decode_reason(vcpu.context());
-    println!(
-        "  Guest exit 2: ESR_EL2={:#018x} reason={:?}",
-        vcpu.exit().esr_el2,
-        reason
-    );
-    match reason {
-        VcpuExitReason::Hvc { imm: 0, arg0: 2 } => {
-            println!(
-                "  [OK] Guest Checkpoint 2: System registers verified (CurrentEL=EL1, MPIDR_EL1={:#010x})",
-                vcpu.context().x[1]
-            );
-        }
-        VcpuExitReason::Hvc { imm, arg0 } => {
-            panic!(
-                "Guest failure exit at Checkpoint 2: HVC #{} with x0={:#x} x1={:#x}",
-                imm,
-                arg0,
-                vcpu.context().x[1]
-            );
-        }
-        other => panic!("Unexpected exit at Checkpoint 2: {:?}", other),
-    }
-
-    // Checkpoint 3 (Deliberate Stage-2 Translation Fault on unmapped IPA 0x3000_0000)
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
-    assert_eq!(vector, 8);
-    let reason = vcpu.exit().decode_reason(vcpu.context());
-    let fault_ipa = vcpu.exit().fault_ipa();
-    println!(
-        "  Guest exit 3: ESR_EL2={:#018x} FAR_EL2={:#018x} HPFAR_EL2={:#018x} fault_ipa={:#018x}",
-        vcpu.exit().esr_el2,
-        vcpu.exit().far_el2,
-        vcpu.exit().hpfar_el2,
-        fault_ipa
-    );
-
-    match reason {
-        VcpuExitReason::Stage2DataAbort {
-            ipa,
-            is_write,
-            dfsc,
-        } => {
-            assert_eq!(
-                ipa, 0x3000_0000,
-                "Fault IPA must match unmapped 0x3000_0000"
-            );
-            assert!(!is_write, "Test performed read from unmapped address");
-            assert!(
-                (0x04..=0x07).contains(&dfsc),
-                "Expected translation fault DFSC, got {:#x}",
-                dfsc
-            );
-            println!(
-                "  [OK] Guest Checkpoint 3: Deliberate Stage-2 Data Abort successfully trapped and decoded at IPA {:#018x}",
-                ipa
-            );
-        }
-        VcpuExitReason::Hvc { imm, arg0 } => {
-            panic!(
-                "Guest reported failure before Stage-2 abort: HVC #{} with x0={:#x} x1={:#x}",
-                imm,
-                arg0,
-                vcpu.context().x[1]
-            );
-        }
-        other => panic!("Unexpected exit at Checkpoint 3: {:?}", other),
-    }
-
-    Ok(())
+    Err(TranslationError::Unexpected)
 }
 
 pub fn run_guest() -> Result<(), TranslationError> {
-    println!("Phase 9: Preparing guest execution environment...");
+    println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
 
     let mut vm_ctl = VmCtl::new(1);
@@ -582,7 +372,7 @@ pub fn run_guest() -> Result<(), TranslationError> {
             active: &mut stage2_active,
         };
 
-        run_guest_inner(&mut vm_ctl, &mut *guard.active)?;
+        run_linux_guest_inner(&mut vm_ctl, &mut *guard.active)?;
     }
 
     vm_ctl.release_all();
@@ -594,7 +384,7 @@ pub fn run_guest() -> Result<(), TranslationError> {
     );
 
     println!("============================================================");
-    println!("Phase 9 Guest Preparation & Execution Verification: PASSED");
+    println!("Phase 10 Linux guest returned cleanly");
     println!("============================================================");
 
     Ok(())

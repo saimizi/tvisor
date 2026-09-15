@@ -1,8 +1,8 @@
 # Phase 10.1: Linux boot ABI and guest memory layout
 
-This checkpoint defines the Linux-facing contract without changing the Phase 9
-test payload. Until an explicit Linux `Image` source and loader are added,
-`run_guest()` remains the Phase 9 verification path.
+This checkpoint defines the Linux-facing contract and loads a separately
+staged Linux `Image` into the guest. U-Boot owns downloading the Image; tvisor
+copies it into allocator-owned guest RAM before entering EL1.
 
 The initial one-vCPU Linux VM has one contiguous 512 MiB guest-RAM region:
 
@@ -32,7 +32,25 @@ Linux owns stack setup and all EL1 stage-1 translation-register initialization.
 No host address, Phase 9 stack address, or HVC checkpoint value is part of this
 ABI.
 
-The future image-loader change must allocate the entire RAM range as normal
-guest RAM, copy and cache-publish the Image, write the generated DTB after the
-header-declared Image extent, and map only that RAM through stage 2. The DTB
-must advertise the contiguous IPA RAM region and no host physical address.
+The image loader allocates the entire RAM range as normal guest RAM, copies and
+cache-publishes the Image, writes the generated DTB after the header-declared
+Image extent, and maps only that RAM through stage 2. The DTB advertises the
+contiguous IPA RAM region and no host physical address.
+
+## U-Boot handoff
+
+Load tvisor and the guest kernel at distinct RAM addresses, then pass both the
+guest Image address and its exact TFTP byte count. The Image header describes
+the runtime extent but may omit a zero-initialized tail, so `image=` carries
+the file length required for a safe copy.
+
+```text
+tftpboot ${tvisor_addr_r} tvisor
+tftpboot ${kernel_addr_r} Image
+go ${tvisor_entry} fdt=${fdt_addr} image=${kernel_addr_r},${filesize}
+```
+
+`kernel_addr_r` must not overlap tvisor, the live DTB, or U-Boot runtime
+memory. Tvisor reserves the page-rounded source range through its private EL2
+transition, copies the exact file bytes, and zero-fills through the Image
+header's `image_size` extent.

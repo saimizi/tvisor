@@ -14,6 +14,7 @@ use crate::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 const MAX_UBOOT_ARGS: usize = 16;
 const MAX_UBOOT_ARG_LEN: usize = 64;
 const FDT_ARG_PREFIX: &[u8] = b"fdt=";
+const IMAGE_ARG_PREFIX: &[u8] = b"image=";
 const MAX_FDT_PATH: usize = 256;
 
 static GLOBAL_FDT: Once<Fdt<'static>> = Once::new();
@@ -29,6 +30,49 @@ pub enum FdtArgError {
     InvalidAddress,
     AddressOverflow,
     ZeroAddress,
+}
+
+/// A separately loaded Linux Image supplied by U-Boot. `size` is the exact
+/// TFTP file length, not the header-declared in-memory Image extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UbootImage {
+    pub address: *const u8,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageArgError {
+    InvalidArgCount,
+    NullArgv,
+    NullArgument,
+    ArgumentTooLong,
+    MissingImage,
+    DuplicateImage,
+    InvalidAddress,
+    InvalidSize,
+    AddressOverflow,
+    ZeroAddress,
+    ZeroSize,
+}
+
+impl fmt::Display for ImageArgError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidArgCount => formatter.write_str("invalid U-Boot argument count"),
+            Self::NullArgv => formatter.write_str("U-Boot argv is null"),
+            Self::NullArgument => formatter.write_str("a U-Boot argument is null"),
+            Self::ArgumentTooLong => formatter.write_str("a U-Boot argument is too long"),
+            Self::MissingImage => formatter.write_str("the image= argument is missing"),
+            Self::DuplicateImage => formatter.write_str("multiple image= arguments were supplied"),
+            Self::InvalidAddress => formatter.write_str("the image address is not hexadecimal"),
+            Self::InvalidSize => formatter.write_str("the image size is not hexadecimal"),
+            Self::AddressOverflow => {
+                formatter.write_str("the image address or size overflows usize")
+            }
+            Self::ZeroAddress => formatter.write_str("the image address is zero"),
+            Self::ZeroSize => formatter.write_str("the image size is zero"),
+        }
+    }
 }
 
 impl fmt::Display for FdtArgError {
@@ -153,6 +197,77 @@ pub unsafe fn fdt_address_from_uboot_args(
     }
 
     Ok(address as *const u8)
+}
+
+/// Finds `image=<hex-address>,<hex-byte-size>` in U-Boot's standalone
+/// arguments. The explicit source byte count lets tvisor zero-fill a compact
+/// Image's BSS tail instead of reading beyond the TFTP payload.
+///
+/// # Safety
+///
+/// Has the same `argc`/`argv` requirements as [`fdt_address_from_uboot_args`].
+pub unsafe fn image_from_uboot_args(
+    argc: isize,
+    argv: *const *const u8,
+) -> Result<UbootImage, ImageArgError> {
+    let argc = usize::try_from(argc).map_err(|_| ImageArgError::InvalidArgCount)?;
+    if argc == 0 || argc > MAX_UBOOT_ARGS {
+        return Err(ImageArgError::InvalidArgCount);
+    }
+    if argv.is_null() {
+        return Err(ImageArgError::NullArgv);
+    }
+
+    let mut image = None;
+    for index in 0..argc {
+        let argument = unsafe { *argv.add(index) };
+        if argument.is_null() {
+            return Err(ImageArgError::NullArgument);
+        }
+        let argument = unsafe { bounded_c_string(argument) }.map_err(|error| match error {
+            FdtArgError::ArgumentTooLong => ImageArgError::ArgumentTooLong,
+            _ => unreachable!("bounded_c_string only returns ArgumentTooLong"),
+        })?;
+        let Some(value) = argument.strip_prefix(IMAGE_ARG_PREFIX) else {
+            continue;
+        };
+        if image.is_some() {
+            return Err(ImageArgError::DuplicateImage);
+        }
+        let Some(separator) = value.iter().position(|byte| *byte == b',') else {
+            return Err(ImageArgError::InvalidSize);
+        };
+        let (address, size) = (&value[..separator], &value[separator + 1..]);
+        let address = parse_hex_address(address).map_err(map_image_address_error)?;
+        let size = parse_hex_address(size).map_err(map_image_size_error)?;
+        if address == 0 {
+            return Err(ImageArgError::ZeroAddress);
+        }
+        if size == 0 {
+            return Err(ImageArgError::ZeroSize);
+        }
+        image = Some(UbootImage {
+            address: address as *const u8,
+            size,
+        });
+    }
+    image.ok_or(ImageArgError::MissingImage)
+}
+
+const fn map_image_address_error(error: FdtArgError) -> ImageArgError {
+    match error {
+        FdtArgError::InvalidAddress => ImageArgError::InvalidAddress,
+        FdtArgError::AddressOverflow => ImageArgError::AddressOverflow,
+        _ => ImageArgError::InvalidAddress,
+    }
+}
+
+const fn map_image_size_error(error: FdtArgError) -> ImageArgError {
+    match error {
+        FdtArgError::InvalidAddress => ImageArgError::InvalidSize,
+        FdtArgError::AddressOverflow => ImageArgError::AddressOverflow,
+        _ => ImageArgError::InvalidSize,
+    }
 }
 
 unsafe fn bounded_c_string<'a>(pointer: *const u8) -> Result<&'a [u8], FdtArgError> {
@@ -625,6 +740,29 @@ mod tests {
         let address = unsafe { fdt_address_from_uboot_args(argv.len() as isize, argv.as_ptr()) };
 
         assert_eq!(address, Ok(0x37b3_aca0 as *const u8));
+    }
+
+    #[test]
+    fn decodes_image_address_and_exact_file_size() {
+        let entry = b"4001010\0";
+        let image = b"image=0x04000000,0x305008\0";
+        let argv = [entry.as_ptr(), image.as_ptr()];
+
+        let source = unsafe { image_from_uboot_args(argv.len() as isize, argv.as_ptr()) }
+            .expect("valid image argument");
+
+        assert_eq!(source.address, 0x0400_0000 as *const u8);
+        assert_eq!(source.size, 0x305008);
+    }
+
+    #[test]
+    fn rejects_image_without_a_file_size() {
+        let image = b"image=4000000\0";
+        let argv = [image.as_ptr()];
+        assert_eq!(
+            unsafe { image_from_uboot_args(argv.len() as isize, argv.as_ptr()) },
+            Err(ImageArgError::InvalidSize)
+        );
     }
 
     #[test]

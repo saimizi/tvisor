@@ -50,13 +50,6 @@ pub const GUEST_GICV: IpaRegion = IpaRegion::new(0x0801_0000, 2 * PAGE_SIZE as u
 /// Trapped, virtual PL011 UART interface.
 pub const GUEST_PL011: IpaRegion = IpaRegion::new(0x0900_0000, PAGE_SIZE as u64);
 
-/// Fixed locations within [`GUEST_RAM`] used by the current EL1 test payload.
-/// A future Linux loader may choose a different internal RAM layout, but these
-/// locations remain part of the test-payload ABI.
-pub const GUEST_PAYLOAD_IPA: u64 = GUEST_RAM.start();
-pub const GUEST_STACK_IPA: u64 = GUEST_RAM.start() + 3 * PAGE_SIZE as u64;
-pub const GUEST_DTB_IPA: u64 = GUEST_RAM.start() + MIB;
-
 pub const GUEST_DEVICE_REGIONS: [IpaRegion; 2] = [GUEST_GICV, GUEST_PL011];
 
 /// Exact device information together with the page-aligned Stage-2 mapping
@@ -119,7 +112,6 @@ pub enum GuestPlatformError {
     OverlappingRegions,
     InvalidDeviceSize,
     DeviceDoesNotFit,
-    GuestDataOutsideRam,
 }
 
 /// Validates the complete static guest IPA ABI before guest resources are
@@ -157,23 +149,7 @@ pub const fn validate() -> Result<(), GuestPlatformError> {
     if GUEST_GICV.size != 2 * PAGE_SIZE as u64 || GUEST_PL011.size != PAGE_SIZE as u64 {
         return Err(GuestPlatformError::InvalidDeviceSize);
     }
-    if !contains(GUEST_RAM, GUEST_PAYLOAD_IPA, PAGE_SIZE as u64)
-        || !contains(GUEST_RAM, GUEST_STACK_IPA, PAGE_SIZE as u64)
-        || !contains(GUEST_RAM, GUEST_DTB_IPA, PAGE_SIZE as u64)
-    {
-        return Err(GuestPlatformError::GuestDataOutsideRam);
-    }
     Ok(())
-}
-
-const fn contains(region: IpaRegion, start: u64, size: u64) -> bool {
-    let Some(end) = start.checked_add(size) else {
-        return false;
-    };
-    let Some(region_end) = region.end() else {
-        return false;
-    };
-    start >= region.start && end <= region_end
 }
 
 #[cfg(test)]

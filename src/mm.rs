@@ -51,8 +51,6 @@ static BOOTSTRAP_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;
-    static __payload_start: u8;
-    static __payload_end: u8;
     static __vectors_start: u8;
     static __vectors_end: u8;
     static __rodata_start: u8;
@@ -107,6 +105,7 @@ pub struct BootstrapPageTable {
 
 pub fn setup_bootstrap_page_table(
     live_dtb_pages: PhysRegion,
+    linux_image_pages: PhysRegion,
     uart_region: PhysRegion,
     gic: GicV2Info,
 ) -> Result<BootstrapPageTable, PrepareError> {
@@ -217,20 +216,20 @@ pub fn setup_bootstrap_page_table(
         false,
     )?;
 
-    // __payload_start
-    // TODO: This is for test.
-    map_identity(
-        &mut tables,
-        link_addr!(__payload_start),
-        link_addr!(__payload_end),
-        false,
-        false,
-    )?;
-
     // Complete live DTB pages are mapped read-only Normal.
     let dtb_start = live_dtb_pages.start().value();
     let dtb_end = live_dtb_pages.end().value();
     map_identity(&mut tables, dtb_start, dtb_end, false, false)?;
+
+    // U-Boot loaded the Linux Image separately. Keep this source readable
+    // across the private-EL2 switch until it is copied into guest RAM.
+    map_identity(
+        &mut tables,
+        linux_image_pages.start().value(),
+        linux_image_pages.end().value(),
+        false,
+        false,
+    )?;
 
     // UART page is mapped RW Device.
     map_identity_device(&mut tables, uart_region)?;
@@ -330,7 +329,11 @@ pub fn initialize_allocator_after_takeover(
     Ok(AllocatorInitResult { stats, live_dtb })
 }
 
-pub fn map_usable_ram(memory_map: &MemoryMap, live_dtb: PhysRegion) -> Result<(), PrepareError> {
+pub fn map_usable_ram(
+    memory_map: &MemoryMap,
+    live_dtb: PhysRegion,
+    linux_image_pages: PhysRegion,
+) -> Result<(), PrepareError> {
     let mut exclusions = FixedList::<PhysRegion, 1>::new();
 
     let live_dtb_aligned =
@@ -343,6 +346,13 @@ pub fn map_usable_ram(memory_map: &MemoryMap, live_dtb: PhysRegion) -> Result<()
 
     with_tables(|tables| {
         map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
+        map_identity(
+            tables,
+            linux_image_pages.start().value(),
+            linux_image_pages.end().value(),
+            false,
+            false,
+        )?;
         Ok(())
     })?;
 
@@ -525,18 +535,6 @@ pub fn validate_bootstrap_page_table<const N: usize>(
     let arena_end = link_addr!(__bootstrap_tables_end);
     let checks = [
         (link_addr!(__text_start), false, true, MemoryType::Normal),
-        (
-            link_addr!(__payload_start),
-            false,
-            false,
-            MemoryType::Normal,
-        ),
-        (
-            link_addr!(__payload_end) - 1,
-            false,
-            false,
-            MemoryType::Normal,
-        ),
         (link_addr!(__vectors_start), false, true, MemoryType::Normal),
         (link_addr!(__rodata_start), false, false, MemoryType::Normal),
         (

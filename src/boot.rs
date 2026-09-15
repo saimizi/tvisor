@@ -197,6 +197,21 @@ extern "C" fn post_switch_page_tables(
         };
 
         let live_dtb: PhysRegion = (*fdt).into();
+        let Some(linux_image_source) = crate::guest::linux_image_source() else {
+            println!("No Linux Image source was supplied by U-Boot");
+            break 'wait;
+        };
+        let linux_image_pages = match PhysRegion::new_aligned(
+            linux_image_source.start(),
+            linux_image_source.size(),
+            PAGE_SIZE as u64,
+        ) {
+            Ok(region) => region,
+            Err(error) => {
+                println!("Linux Image source cannot be page-aligned: {}", error);
+                break 'wait;
+            }
+        };
 
         let mut memory_map_guard = MEMORY_MAP.lock();
         if let Err(error) = discover_memory_map(
@@ -208,9 +223,17 @@ extern "C" fn post_switch_page_tables(
             println!("Platform discovery failed: {}", error);
             break 'wait;
         }
+        if let Err(error) = memory_map_guard.insert_reserved(linux_image_pages) {
+            println!("Cannot reserve Linux Image source: {}", error);
+            break 'wait;
+        }
+        if let Err(error) = memory_map_guard.finalize() {
+            println!("Cannot finalize Linux Image source reservation: {}", error);
+            break 'wait;
+        }
 
         let memory_map: &MemoryMap = &memory_map_guard;
-        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb) {
+        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb, linux_image_pages) {
             println!("Failed to map usable RAM: {}", error);
             break 'wait;
         }
@@ -262,8 +285,8 @@ extern "C" fn post_switch_page_tables(
         println!("{}", current_heap_state);
 
         match crate::guest::run_guest() {
-            Ok(()) => println!("Phase 9 checkpoint complete; halting"),
-            Err(error) => println!("Phase 9 guest execution failed: {}", error),
+            Ok(()) => println!("Linux guest exited cleanly; halting"),
+            Err(error) => println!("Linux guest execution failed: {}", error),
         }
     }
 
