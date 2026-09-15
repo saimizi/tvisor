@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::el2_translation::*;
+use tvisor_util::guest_platform::DEFAULT_GUEST_RAM_SIZE;
 use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::stage2_translation::*;
 use tvisor_util::*;
@@ -12,7 +13,8 @@ use tvisor_util::*;
 use core::fmt::Display;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 
-pub const MAX_GUEST_MEM_BYTES: usize = 1024 * 1024;
+/// The fixed 512 MiB guest RAM backing plus room for Stage-2 tables.
+pub const MAX_GUEST_MEM_BYTES: usize = DEFAULT_GUEST_RAM_SIZE as usize + 2 * 1024 * 1024;
 pub const MAX_GUEST_MEM_PAGES: usize = (MAX_GUEST_MEM_BYTES) / PAGE_SIZE;
 
 pub type AddressType = PhysAddr;
@@ -81,7 +83,9 @@ impl IpaRegion {
 }
 
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained for VmCtl tests and the forthcoming Linux image loader.
 pub enum VmMemUsage {
+    GuestRam,
     Image,
     Scratch,
     Stack,
@@ -93,6 +97,7 @@ pub enum VmMemUsage {
 impl VmMemUsage {
     pub fn need_physical_memory(&self) -> bool {
         match self {
+            VmMemUsage::GuestRam => true,
             VmMemUsage::Image => true,
             VmMemUsage::Dtb => true,
             VmMemUsage::Stack => true,
@@ -106,6 +111,7 @@ impl VmMemUsage {
 impl Display for VmMemUsage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
+            VmMemUsage::GuestRam => "GuestRam",
             VmMemUsage::Image => "Image",
             VmMemUsage::Dtb => "DTB",
             VmMemUsage::Stack => "Stack",
@@ -602,6 +608,7 @@ impl VmCtl {
         let needs_ipa = matches!(
             usage,
             VmMemUsage::Image
+                | VmMemUsage::GuestRam
                 | VmMemUsage::Scratch
                 | VmMemUsage::Dtb
                 | VmMemUsage::Stack
@@ -644,7 +651,11 @@ impl VmCtl {
 
                 VmMem::PaOnly(PaRegion { usage, pa })
             }
-            VmMemUsage::Image | VmMemUsage::Scratch | VmMemUsage::Dtb | VmMemUsage::Stack => {
+            VmMemUsage::GuestRam
+            | VmMemUsage::Image
+            | VmMemUsage::Scratch
+            | VmMemUsage::Dtb
+            | VmMemUsage::Stack => {
                 let ipa = ipa.expect("validated IpaPa ipa");
                 VmMem::IpaPa(IpaPaRegion {
                     usage,

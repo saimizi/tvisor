@@ -3,8 +3,6 @@
 use crate::system_info::PhysRegion;
 use spin::Once;
 
-/// Guest IPA of tvisor's GICv2 virtual CPU-interface region.
-pub const VIRTUAL_GICV_IPA: u64 = 0x0801_0000;
 pub const SPURIOUS_IRQ: u32 = 1023;
 
 /// Physical GICv2 regions, in the DTB `reg` order: GICD, GICC, GICH, GICV.

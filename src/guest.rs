@@ -6,6 +6,7 @@ use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
 use tvisor_util::el2_translation::TranslationError;
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
+use tvisor_util::guest_platform::{self, GUEST_GICV, GUEST_PL011, GUEST_RAM};
 use tvisor_util::stage2_translation::{
     Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
 };
@@ -14,12 +15,10 @@ use tvisor_util::{PAGE_SIZE, println};
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
 use tvisor_util::gicv2;
-use tvisor_util::mmio::{MmioDispatcher, VIRTUAL_PL011_IPA, VIRTUAL_PL011_SIZE};
+use tvisor_util::mmio::MmioDispatcher;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
-pub const GUEST_SCRATCH_IPA: u64 = 0x4000_1000;
-pub const GUEST_GUARD_IPA: u64 = 0x4000_2000;
 pub const GUEST_STACK_IPA: u64 = 0x4000_3000;
 pub const GUEST_DTB_IPA: u64 = 0x4010_0000;
 
@@ -285,7 +284,9 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
         let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
             return vector;
         };
-        if !(VIRTUAL_PL011_IPA..VIRTUAL_PL011_IPA + VIRTUAL_PL011_SIZE).contains(&ipa) {
+        if !(GUEST_PL011.start()..GUEST_PL011.end().expect("validated guest platform"))
+            .contains(&ipa)
+        {
             return vector;
         }
 
@@ -306,6 +307,7 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     // Device mapping is installed during private-EL2 setup before this point.
     let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
     unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
+    guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
                             ipa: IpaAddr,
@@ -319,32 +321,23 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         Ok((pa.value(), ipa.value(), size))
     };
 
-    // 2. Allocate individual 4 KiB physical backing pages for guest regions
-    let (payload_pa, payload_ipa, payload_size) = alloc_ipa_pa(
-        VmMemUsage::Image,
-        IpaAddr::new(GUEST_PAYLOAD_IPA),
-        PAGE_SIZE,
+    // 2. Allocate one contiguous backing extent for every byte advertised as
+    // guest RAM. The Phase 9 payload, stack, and generated DTB live inside it.
+    let (guest_ram_pa, guest_ram_ipa, guest_ram_size) = alloc_ipa_pa(
+        VmMemUsage::GuestRam,
+        IpaAddr::new(GUEST_RAM.start()),
+        GUEST_RAM.size() as usize,
     )?;
-
-    let (scratch_pa, scratch_ipa, scratch_size) = alloc_ipa_pa(
-        VmMemUsage::Scratch,
-        IpaAddr::new(GUEST_SCRATCH_IPA),
-        PAGE_SIZE,
-    )?;
-
-    let (stack_pa, stack_ipa, stack_size) =
-        alloc_ipa_pa(VmMemUsage::Stack, IpaAddr::new(GUEST_STACK_IPA), PAGE_SIZE)?;
-
-    let (dtb_pa, dtb_ipa, dtb_size) =
-        alloc_ipa_pa(VmMemUsage::Dtb, IpaAddr::new(GUEST_DTB_IPA), PAGE_SIZE)?;
-
-    vm_ctl
-        .vm_mem_alloc(
-            VmMemUsage::Guard,
-            Some(IpaAddr::new(GUEST_GUARD_IPA)),
-            PAGE_SIZE,
-        )
-        .map_err(|_| TranslationError::Unexpected)?;
+    let guest_pa_for = |ipa: u64| -> Result<u64, TranslationError> {
+        guest_ram_pa
+            .checked_add(
+                ipa.checked_sub(guest_ram_ipa)
+                    .ok_or(TranslationError::Unexpected)?,
+            )
+            .ok_or(TranslationError::AddressOverflow)
+    };
+    let payload_pa = guest_pa_for(GUEST_PAYLOAD_IPA)?;
+    let dtb_pa = guest_pa_for(GUEST_DTB_IPA)?;
 
     println!("{}", vm_ctl);
 
@@ -367,27 +360,13 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         );
     }
 
-    // 4. Generate minimal Guest DTB describing exact backed memory regions
-    let guest_mem_regions = [
-        GuestMemoryRegion {
-            base: payload_ipa,
-            size: payload_size as u64,
-        },
-        GuestMemoryRegion {
-            base: scratch_ipa,
-            size: scratch_size as u64,
-        },
-        GuestMemoryRegion {
-            base: stack_ipa,
-            size: stack_size as u64,
-        },
-        GuestMemoryRegion {
-            base: dtb_ipa,
-            size: dtb_size as u64,
-        },
-    ];
+    // 4. Generate a Guest DTB that describes exactly the fully backed RAM.
+    let guest_mem_regions = [GuestMemoryRegion {
+        base: guest_ram_ipa,
+        size: guest_ram_size as u64,
+    }];
 
-    let dtb_slice = unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_size) };
+    let dtb_slice = unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, PAGE_SIZE) };
 
     let dtb_config = GuestFdtConfig {
         memory_regions: &guest_mem_regions,
@@ -398,15 +377,13 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
 
     println!(
         "  Generated guest DTB at IPA {} ({} bytes)",
-        dtb_ipa, dtb_real_size
+        GUEST_DTB_IPA, dtb_real_size
     );
 
     // 5. Clean Data Cache to PoC for payload and DTB, and invalidate Instruction Cache
     // Note: for EL2 stage1, PA=VA
     unsafe {
-        clean_dcache_poc(payload_pa as usize, payload_pa as usize + payload_size);
-        clean_dcache_poc(scratch_pa as usize, scratch_pa as usize + scratch_size);
-        clean_dcache_poc(stack_pa as usize, stack_pa as usize + stack_size);
+        clean_dcache_poc(payload_pa as usize, payload_pa as usize + PAGE_SIZE);
         clean_dcache_poc(dtb_pa as usize, dtb_pa as usize + dtb_real_size);
         invalidate_icache_all();
     }
@@ -418,46 +395,23 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
         .vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
         .map_err(|_| TranslationError::Unexpected)?;
 
-    // Code page: ReadOnly, Executable
+    // Guest stage 1 owns its internal page permissions. Stage 2 maps all
+    // advertised RAM read/write and executable so Linux can install its own
+    // page tables after entry.
     vm_ctl.map(
-        VmMemUsage::Image,
+        VmMemUsage::GuestRam,
         Stage2MemoryType::NormalWbWa,
-        Stage2Access::ReadOnly,
+        Stage2Access::ReadWrite,
         Stage2Exec::Executable,
-    )?;
-
-    // Scratch data page: ReadWrite, ExecuteNever
-    vm_ctl.map(
-        VmMemUsage::Scratch,
-        Stage2MemoryType::NormalWbWa,
-        Stage2Access::ReadWrite,
-        Stage2Exec::ExecuteNever,
-    )?;
-
-    // Stack guard page at GUEST_GUARD_IPA (0x4000_2000) is intentionally left UNMAPPED!
-    // Stack page: ReadWrite, ExecuteNever
-    vm_ctl.map(
-        VmMemUsage::Stack,
-        Stage2MemoryType::NormalWbWa,
-        Stage2Access::ReadWrite,
-        Stage2Exec::ExecuteNever,
-    )?;
-
-    // DTB page: ReadOnly, ExecuteNever
-    vm_ctl.map(
-        VmMemUsage::Dtb,
-        Stage2MemoryType::NormalWbWa,
-        Stage2Access::ReadOnly,
-        Stage2Exec::ExecuteNever,
     )?;
 
     // The GIC virtual CPU interface exposes List Register-backed virtual
     // acknowledge/EOI semantics directly to the guest. Its physical backing
     // remains host-owned and is mapped only at this guest IPA.
     vm_ctl.map_external_device(
-        IpaAddr::new(gicv2::VIRTUAL_GICV_IPA),
+        IpaAddr::new(GUEST_GICV.start()),
         gic.info().virtual_cpu_interface().start(),
-        gic.info().virtual_cpu_interface().size() as usize,
+        GUEST_GICV.size() as usize,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
@@ -483,8 +437,8 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     // 8. Create the VM-owned vCPU. The pCPU associates with it only while
     // entering guest execution.
     // Stack grows from high to low, so initial stack pointer is set to the stack_ipa + stack_size
-    let mut vcpu = Vcpu::new(payload_ipa, stack_ipa + stack_size as u64);
-    vcpu.context_mut().x[0] = dtb_ipa;
+    let mut vcpu = Vcpu::new(GUEST_PAYLOAD_IPA, GUEST_STACK_IPA + PAGE_SIZE as u64);
+    vcpu.context_mut().x[0] = GUEST_DTB_IPA;
     let vcpu_id = vm_ctl.add_vcpu(vcpu);
     let vcpu = vm_ctl.vcpu_mut(vcpu_id).expect("new vCPU must be present");
 

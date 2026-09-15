@@ -2,9 +2,7 @@
 
 use core::fmt;
 
-/// Guest IPA of the first emulated device page.
-pub const VIRTUAL_PL011_IPA: u64 = 0x0900_0000;
-pub const VIRTUAL_PL011_SIZE: u64 = 0x1000;
+use crate::guest_platform::GUEST_PL011;
 
 const ESR_ISV: u32 = 1 << 24;
 const ESR_SAS_SHIFT: u32 = 22;
@@ -180,8 +178,8 @@ impl MmioDispatcher {
     ) -> Result<Option<u8>, MmioEmulationError> {
         let offset = access
             .ipa
-            .checked_sub(VIRTUAL_PL011_IPA)
-            .filter(|offset| *offset < VIRTUAL_PL011_SIZE)
+            .checked_sub(GUEST_PL011.start())
+            .filter(|offset| *offset < GUEST_PL011.size())
             .ok_or(MmioEmulationError::UnmappedIpa(access.ipa))?;
         let value = if access.register == 31 {
             0
@@ -221,11 +219,11 @@ mod tests {
     #[test]
     fn decodes_access_direction_width_and_register() {
         let access =
-            MmioAccess::decode_data_abort(data_abort_iss(true, 2, 7), VIRTUAL_PL011_IPA).unwrap();
+            MmioAccess::decode_data_abort(data_abort_iss(true, 2, 7), GUEST_PL011.start()).unwrap();
         assert_eq!(
             access,
             MmioAccess {
-                ipa: VIRTUAL_PL011_IPA,
+                ipa: GUEST_PL011.start(),
                 is_write: true,
                 width: 4,
                 register: 7,
@@ -241,7 +239,7 @@ mod tests {
         registers[3] = b'A' as u64;
         let tx = dispatcher
             .emulate(
-                MmioAccess::decode_data_abort(data_abort_iss(true, 0, 3), VIRTUAL_PL011_IPA)
+                MmioAccess::decode_data_abort(data_abort_iss(true, 0, 3), GUEST_PL011.start())
                     .unwrap(),
                 &mut registers,
             )
@@ -251,7 +249,7 @@ mod tests {
             .emulate(
                 MmioAccess::decode_data_abort(
                     data_abort_iss(false, 2, 5),
-                    VIRTUAL_PL011_IPA + 0x18,
+                    GUEST_PL011.start() + 0x18,
                 )
                 .unwrap(),
                 &mut registers,
@@ -272,7 +270,8 @@ mod tests {
             Err(MmioEmulationError::UnmappedIpa(0x0800_0000))
         );
         let access =
-            MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), VIRTUAL_PL011_IPA).unwrap();
+            MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), GUEST_PL011.start())
+                .unwrap();
         assert_eq!(
             dispatcher.emulate(access, &mut registers),
             Err(MmioEmulationError::Pl011(Pl011Error::UnsupportedRead(0)))

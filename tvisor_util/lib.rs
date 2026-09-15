@@ -15,6 +15,7 @@ pub mod el2_translation;
 pub mod fdt;
 pub mod gicv2;
 pub mod guest_fdt;
+pub mod guest_platform;
 pub mod heap_allocator;
 pub mod linux_boot;
 pub mod memory_map;

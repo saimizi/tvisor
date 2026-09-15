@@ -5,10 +5,7 @@
 
 use core::fmt;
 
-use crate::{PAGE_SIZE, is_aligned, is_page_aligned};
-
-pub const LINUX_GUEST_RAM_IPA: u64 = 0x4000_0000;
-pub const LINUX_GUEST_RAM_SIZE: u64 = 512 * 1024 * 1024;
+use crate::{PAGE_SIZE, guest_platform::GUEST_RAM, is_aligned, is_page_aligned};
 pub const LINUX_IMAGE_BASE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 pub const LINUX_DTB_CAPACITY: u64 = 2 * 1024 * 1024;
 pub const LINUX_IMAGE_HEADER_SIZE: usize = 64;
@@ -157,12 +154,7 @@ impl LinuxBootLayout {
         image: &[u8],
         initrd_size: Option<u64>,
     ) -> Result<Self, LinuxBootLayoutError> {
-        Self::new(
-            image,
-            LINUX_GUEST_RAM_IPA,
-            LINUX_GUEST_RAM_SIZE,
-            initrd_size,
-        )
+        Self::new(image, GUEST_RAM.start(), GUEST_RAM.size(), initrd_size)
     }
 
     /// Places the Image at `ram_ipa + header.text_offset`; `ram_ipa` is the
@@ -297,22 +289,22 @@ mod tests {
     fn layout_uses_image_header_for_entry_and_dtb_placement() {
         let image = image(0x80000, 12 * 1024 * 1024, 0b10);
         let layout = LinuxBootLayout::default_for_image(&image, Some(3 * 1024 * 1024)).unwrap();
-        assert_eq!(layout.ram(), (LINUX_GUEST_RAM_IPA, LINUX_GUEST_RAM_SIZE));
+        assert_eq!(layout.ram(), (GUEST_RAM.start(), GUEST_RAM.size()));
         assert_eq!(
             layout.image(),
-            (LINUX_GUEST_RAM_IPA + 0x80000, 12 * 1024 * 1024)
+            (GUEST_RAM.start() + 0x80000, 12 * 1024 * 1024)
         );
         assert_eq!(
             layout.dtb(),
             (
-                LINUX_GUEST_RAM_IPA + 0x80000 + 12 * 1024 * 1024,
+                GUEST_RAM.start() + 0x80000 + 12 * 1024 * 1024,
                 LINUX_DTB_CAPACITY
             )
         );
         assert_eq!(
             layout.initrd(),
             Some((
-                LINUX_GUEST_RAM_IPA + 0x80000 + 14 * 1024 * 1024,
+                GUEST_RAM.start() + 0x80000 + 14 * 1024 * 1024,
                 3 * 1024 * 1024
             ))
         );
@@ -320,8 +312,8 @@ mod tests {
         assert_eq!(
             layout.initial_registers(),
             LinuxBootRegisters {
-                pc: LINUX_GUEST_RAM_IPA + 0x80000,
-                x0: LINUX_GUEST_RAM_IPA + 0x80000 + 12 * 1024 * 1024,
+                pc: GUEST_RAM.start() + 0x80000,
+                x0: GUEST_RAM.start() + 0x80000 + 12 * 1024 * 1024,
                 x1: 0,
                 x2: 0,
                 x3: 0,
@@ -345,8 +337,8 @@ mod tests {
         assert_eq!(
             LinuxBootLayout::new(
                 &image,
-                LINUX_GUEST_RAM_IPA + PAGE_SIZE as u64,
-                LINUX_GUEST_RAM_SIZE,
+                GUEST_RAM.start() + PAGE_SIZE as u64,
+                GUEST_RAM.size(),
                 None
             ),
             Err(LinuxBootLayoutError::InvalidRam)
