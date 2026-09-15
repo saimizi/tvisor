@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use crate::guest_platform::GUEST_PL011;
+use crate::guest_platform::{GUEST_GICD, GUEST_PL011};
 
 const ESR_ISV: u32 = 1 << 24;
 const ESR_SAS_SHIFT: u32 = 22;
@@ -145,6 +145,7 @@ impl VirtualPl011 {
 pub enum MmioEmulationError {
     UnmappedIpa(u64),
     Pl011(Pl011Error),
+    GicDistributor,
 }
 
 impl From<Pl011Error> for MmioEmulationError {
@@ -158,6 +159,7 @@ impl fmt::Display for MmioEmulationError {
         match self {
             Self::UnmappedIpa(ipa) => write!(f, "no virtual MMIO device at IPA {ipa:#x}"),
             Self::Pl011(error) => write!(f, "PL011 emulation failed: {error}"),
+            Self::GicDistributor => f.write_str("unsupported virtual GIC distributor access"),
         }
     }
 }
@@ -166,6 +168,40 @@ impl fmt::Display for MmioEmulationError {
 #[derive(Debug, Default)]
 pub struct MmioDispatcher {
     pl011: VirtualPl011,
+    gicd: VirtualGicDistributor,
+}
+
+/// Minimal single-vCPU GICv2 distributor. It exposes only the discovery and
+/// configuration state Linux needs before using the hardware-backed GICV CPU
+/// interface; it never maps the host distributor into the guest.
+#[derive(Debug, Default)]
+struct VirtualGicDistributor {
+    ctlr: u32,
+}
+
+impl VirtualGicDistributor {
+    fn access(&mut self, offset: u64, is_write: bool, width: u8, value: u64) -> Result<u64, ()> {
+        if width != 4 {
+            return Err(());
+        }
+        match (is_write, offset) {
+            (false, 0x000) => Ok(self.ctlr as u64),
+            // One bank of 32 interrupt IDs is enough for private timer PPIs.
+            (false, 0x004) => Ok(0),
+            (false, 0x008) => Ok(0x0200_0043),
+            (true, 0x000) => {
+                self.ctlr = value as u32 & 1;
+                Ok(0)
+            }
+            // Linux initializes these banked registers; their state is not
+            // needed for the single timer PPI currently injected through LR0.
+            (
+                true,
+                0x080..=0x0ff | 0x100..=0x1ff | 0x280..=0x2ff | 0x400..=0x7ff | 0x800..=0x8ff,
+            ) => Ok(0),
+            _ => Err(()),
+        }
+    }
 }
 
 impl MmioDispatcher {
@@ -176,6 +212,29 @@ impl MmioDispatcher {
         access: MmioAccess,
         registers: &mut [u64; 31],
     ) -> Result<Option<u8>, MmioEmulationError> {
+        if let Some(offset) = access
+            .ipa
+            .checked_sub(GUEST_GICD.start())
+            .filter(|offset| *offset < GUEST_GICD.size())
+        {
+            let value = if access.register == 31 {
+                0
+            } else {
+                registers[access.register as usize]
+            };
+            let result = self
+                .gicd
+                .access(offset, access.is_write, access.width, value)
+                .map_err(|_| MmioEmulationError::GicDistributor)?;
+            if !access.is_write && access.register != 31 {
+                registers[access.register as usize] = if access.register_is_64bit {
+                    result
+                } else {
+                    result as u32 as u64
+                };
+            }
+            return Ok(None);
+        }
         let offset = access
             .ipa
             .checked_sub(GUEST_PL011.start())
@@ -264,10 +323,10 @@ mod tests {
         let mut dispatcher = MmioDispatcher::default();
         let mut registers = [0_u64; 31];
         let access =
-            MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), 0x0800_0000).unwrap();
+            MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), 0x0802_0000).unwrap();
         assert_eq!(
             dispatcher.emulate(access, &mut registers),
-            Err(MmioEmulationError::UnmappedIpa(0x0800_0000))
+            Err(MmioEmulationError::UnmappedIpa(0x0802_0000))
         );
         let access =
             MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), GUEST_PL011.start())

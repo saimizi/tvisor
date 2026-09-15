@@ -1,12 +1,17 @@
 //! Guest platform initialization, Stage-2 translation setup, and Linux launch.
 
+use core::fmt;
 use spin::Once;
 
 use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
 use tvisor_util::el2_translation::TranslationError;
-use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
-use tvisor_util::guest_platform::{self, GUEST_GICV, GUEST_PL011, GUEST_RAM};
+use tvisor_util::guest_fdt::{
+    GuestFdtConfig, GuestGicV2, GuestMemoryRegion, GuestPl011, build_guest_dtb,
+};
+use tvisor_util::guest_platform::{
+    self, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ, GUEST_RAM,
+};
 use tvisor_util::linux_boot::LinuxBootLayout;
 use tvisor_util::stage2_translation::{
     Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
@@ -21,6 +26,39 @@ use tvisor_util::system_info::PhysRegion;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 static LINUX_IMAGE_SOURCE: Once<PhysRegion> = Once::new();
+
+/// Why Linux execution returned to EL2 instead of continuing its normal run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestRunError {
+    Translation(TranslationError),
+    Exited {
+        vector: u64,
+        esr_el2: u64,
+        reason: VcpuExitReason,
+    },
+}
+
+impl From<TranslationError> for GuestRunError {
+    fn from(error: TranslationError) -> Self {
+        Self::Translation(error)
+    }
+}
+
+impl fmt::Display for GuestRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Translation(error) => write!(f, "guest translation setup failed: {error}"),
+            Self::Exited {
+                vector,
+                esr_el2,
+                reason,
+            } => write!(
+                f,
+                "Linux guest exited at EL2 vector {vector} (ESR_EL2={esr_el2:#018x}): {reason:?}"
+            ),
+        }
+    }
+}
 
 /// Records the U-Boot-loaded Linux Image source before tvisor replaces the
 /// inherited EL2 translation regime.
@@ -225,7 +263,7 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
 fn run_linux_guest_inner(
     vm_ctl: &mut VmCtl,
     stage2_active: &mut bool,
-) -> Result<(), TranslationError> {
+) -> Result<(), GuestRunError> {
     let source = linux_image_source().ok_or(TranslationError::Unexpected)?;
     let image = unsafe {
         core::slice::from_raw_parts(source.start().value() as *const u8, source.size() as usize)
@@ -291,7 +329,18 @@ fn run_linux_guest_inner(
         dtb_slice,
         &GuestFdtConfig {
             memory_regions: &guest_mem_regions,
-            bootargs: None,
+            bootargs: Some("earlycon=pl011,mmio32,0x09000000 loglevel=8"),
+            pl011: Some(GuestPl011 {
+                base: GUEST_PL011.start(),
+                size: GUEST_PL011.size(),
+                clock_hz: GUEST_PL011_CLOCK_HZ,
+            }),
+            gicv2: Some(GuestGicV2 {
+                distributor_base: GUEST_GICD.start(),
+                distributor_size: GUEST_GICD.size(),
+                cpu_interface_base: gicv_mapping.device_ipa,
+                cpu_interface_size: gicv_mapping.device.size(),
+            }),
         },
     )
     .map_err(|_| TranslationError::Unexpected)?;
@@ -336,16 +385,14 @@ fn run_linux_guest_inner(
 
     let mut mmio_dispatcher = MmioDispatcher::default();
     let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
-    println!(
-        "Linux guest stopped: vector={} ESR_EL2={:#018x} reason={:?}",
+    Err(GuestRunError::Exited {
         vector,
-        vcpu.exit().esr_el2,
-        vcpu.exit().decode_reason(vcpu.context()),
-    );
-    Err(TranslationError::Unexpected)
+        esr_el2: vcpu.exit().esr_el2,
+        reason: vcpu.exit().decode_reason(vcpu.context()),
+    })
 }
 
-pub fn run_guest() -> Result<(), TranslationError> {
+pub fn run_guest() -> Result<(), GuestRunError> {
     println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
 

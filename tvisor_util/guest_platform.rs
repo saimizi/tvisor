@@ -47,10 +47,14 @@ impl IpaRegion {
 pub const GUEST_RAM: IpaRegion = IpaRegion::new(0x4000_0000, DEFAULT_GUEST_RAM_SIZE);
 /// Guest-visible GICv2 virtual CPU interface, including GICV_DIR at +0x1000.
 pub const GUEST_GICV: IpaRegion = IpaRegion::new(0x0801_0000, 2 * PAGE_SIZE as u64);
+/// Trapped virtual GICv2 distributor used with the GICV CPU interface.
+pub const GUEST_GICD: IpaRegion = IpaRegion::new(0x0800_0000, 0x1_0000);
 /// Trapped, virtual PL011 UART interface.
 pub const GUEST_PL011: IpaRegion = IpaRegion::new(0x0900_0000, PAGE_SIZE as u64);
+/// Fixed virtual PL011 input clock advertised to the guest.
+pub const GUEST_PL011_CLOCK_HZ: u32 = 24_000_000;
 
-pub const GUEST_DEVICE_REGIONS: [IpaRegion; 2] = [GUEST_GICV, GUEST_PL011];
+pub const GUEST_DEVICE_REGIONS: [IpaRegion; 3] = [GUEST_GICD, GUEST_GICV, GUEST_PL011];
 
 /// Exact device information together with the page-aligned Stage-2 mapping
 /// that makes it visible in a guest IPA window.
@@ -117,7 +121,7 @@ pub enum GuestPlatformError {
 /// Validates the complete static guest IPA ABI before guest resources are
 /// allocated or described by the guest DTB.
 pub const fn validate() -> Result<(), GuestPlatformError> {
-    let regions = [GUEST_RAM, GUEST_GICV, GUEST_PL011];
+    let regions = [GUEST_RAM, GUEST_GICD, GUEST_GICV, GUEST_PL011];
     let max_ipa = (1_u64 << IPA_BITS) - 1;
 
     let mut index = 0;
@@ -146,7 +150,10 @@ pub const fn validate() -> Result<(), GuestPlatformError> {
         index += 1;
     }
 
-    if GUEST_GICV.size != 2 * PAGE_SIZE as u64 || GUEST_PL011.size != PAGE_SIZE as u64 {
+    if GUEST_GICD.size != 0x1_0000
+        || GUEST_GICV.size != 2 * PAGE_SIZE as u64
+        || GUEST_PL011.size != PAGE_SIZE as u64
+    {
         return Err(GuestPlatformError::InvalidDeviceSize);
     }
     Ok(())
@@ -160,6 +167,7 @@ mod tests {
     fn default_layout_is_page_aligned_non_overlapping_and_in_range() {
         assert_eq!(validate(), Ok(()));
         assert_eq!(GUEST_RAM.end(), Some(0x6000_0000));
+        assert!(!GUEST_GICD.overlaps(GUEST_GICV));
         assert!(!GUEST_GICV.overlaps(GUEST_PL011));
         assert!(!GUEST_RAM.overlaps(GUEST_GICV));
     }
