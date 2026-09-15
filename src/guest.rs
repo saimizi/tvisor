@@ -6,7 +6,9 @@ use crate::vmctl::*;
 use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
 use tvisor_util::el2_translation::TranslationError;
 use tvisor_util::guest_fdt::{GuestFdtConfig, GuestMemoryRegion, build_guest_dtb};
-use tvisor_util::guest_platform::{self, GUEST_GICV, GUEST_PL011, GUEST_RAM};
+use tvisor_util::guest_platform::{
+    self, GUEST_DTB_IPA, GUEST_GICV, GUEST_PAYLOAD_IPA, GUEST_PL011, GUEST_RAM, GUEST_STACK_IPA,
+};
 use tvisor_util::stage2_translation::{
     Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
 };
@@ -17,10 +19,6 @@ use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
 use tvisor_util::gicv2;
 use tvisor_util::mmio::MmioDispatcher;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
-
-pub const GUEST_PAYLOAD_IPA: u64 = 0x4000_0000;
-pub const GUEST_STACK_IPA: u64 = 0x4000_3000;
-pub const GUEST_DTB_IPA: u64 = 0x4010_0000;
 
 unsafe extern "C" {
     static __payload_start: u8;
@@ -308,6 +306,13 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
     unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
     guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
+    // Keep both the exact GICV region and its guest-visible address together.
+    // When the guest GIC node is introduced, it must use
+    // `gicv_mapping.device_ipa` and `gicv_mapping.device.size()` rather than
+    // the page-aligned Stage-2 mapping values below.
+    let gicv_mapping =
+        guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())
+            .map_err(|_| TranslationError::Unexpected)?;
 
     let mut alloc_ipa_pa = |usage: VmMemUsage,
                             ipa: IpaAddr,
@@ -406,12 +411,12 @@ fn run_guest_inner(vm_ctl: &mut VmCtl, stage2_active: &mut bool) -> Result<(), T
     )?;
 
     // The GIC virtual CPU interface exposes List Register-backed virtual
-    // acknowledge/EOI semantics directly to the guest. Its physical backing
-    // remains host-owned and is mapped only at this guest IPA.
+    // acknowledge/EOI semantics directly to the guest. Only its
+    // page-expanded backing is passed to the Stage-2 mapper.
     vm_ctl.map_external_device(
         IpaAddr::new(GUEST_GICV.start()),
-        gic.info().virtual_cpu_interface().start(),
-        GUEST_GICV.size() as usize,
+        gicv_mapping.mapped_pa,
+        gicv_mapping.mapping_size,
     )?;
 
     let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
