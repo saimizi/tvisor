@@ -49,11 +49,14 @@ pub struct VcpuContext {
     pub tpidr_el1: u64,
     /// EL0 read-only thread pointer, preserved for later userspace support.
     pub tpidrro_el0: u64,
-    /// Explicit tail padding keeps this assembly-facing context 16-byte aligned.
-    _padding: u64,
+    /// Guest FP/Advanced-SIMD registers q0 through q31.
+    pub q: [u128; 32],
+    /// Guest FP control and status registers.
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<VcpuContext>() == 368);
+const _: () = assert!(core::mem::size_of::<VcpuContext>() == 896);
 const _: () = assert!(core::mem::align_of::<VcpuContext>() == 16);
 
 impl VcpuContext {
@@ -75,7 +78,9 @@ impl VcpuContext {
             contextidr_el1: 0,
             tpidr_el1: 0,
             tpidrro_el0: 0,
-            _padding: 0,
+            q: [0; 32],
+            fpcr: 0,
+            fpsr: 0,
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
@@ -188,10 +193,10 @@ pub struct Vcpu {
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
-const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 368);
-const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 400);
-const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 432);
-const _: () = assert!(core::mem::size_of::<Vcpu>() == 448);
+const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 896);
+const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 928);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 960);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 976);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -301,6 +306,30 @@ __vcpu_run:
     stp  x27, x28, [sp, #-16]!
     stp  x29, x30, [sp, #-16]!
 
+    // Preserve the EL2 FP/Advanced-SIMD state before loading the vCPU's
+    // independent vector context. 528 bytes holds q0-q31 plus FPCR/FPSR.
+    sub  sp, sp, #528
+    stp  q0,  q1,  [sp, #0]
+    stp  q2,  q3,  [sp, #32]
+    stp  q4,  q5,  [sp, #64]
+    stp  q6,  q7,  [sp, #96]
+    stp  q8,  q9,  [sp, #128]
+    stp  q10, q11, [sp, #160]
+    stp  q12, q13, [sp, #192]
+    stp  q14, q15, [sp, #224]
+    stp  q16, q17, [sp, #256]
+    stp  q18, q19, [sp, #288]
+    stp  q20, q21, [sp, #320]
+    stp  q22, q23, [sp, #352]
+    stp  q24, q25, [sp, #384]
+    stp  q26, q27, [sp, #416]
+    stp  q28, q29, [sp, #448]
+    stp  q30, q31, [sp, #480]
+    mrs  x9, fpcr
+    str  x9, [sp, #512]
+    mrs  x9, fpsr
+    str  x9, [sp, #520]
+
     // Save host stack pointer
     adrp x9, __pcpu_state
     add  x9, x9, :lo12:__pcpu_state
@@ -334,12 +363,34 @@ __vcpu_run:
     ldr  x9, [x0, #352]
     msr  tpidrro_el0, x9
 
+    // Restore guest FP/Advanced-SIMD context.
+    ldp  q0,  q1,  [x0, #368]
+    ldp  q2,  q3,  [x0, #400]
+    ldp  q4,  q5,  [x0, #432]
+    ldp  q6,  q7,  [x0, #464]
+    ldp  q8,  q9,  [x0, #496]
+    ldp  q10, q11, [x0, #528]
+    ldp  q12, q13, [x0, #560]
+    ldp  q14, q15, [x0, #592]
+    ldp  q16, q17, [x0, #624]
+    ldp  q18, q19, [x0, #656]
+    ldp  q20, q21, [x0, #688]
+    ldp  q22, q23, [x0, #720]
+    ldp  q24, q25, [x0, #752]
+    ldp  q26, q27, [x0, #784]
+    ldp  q28, q29, [x0, #816]
+    ldp  q30, q31, [x0, #848]
+    ldr  x9, [x0, #880]
+    msr  fpcr, x9
+    ldr  x9, [x0, #888]
+    msr  fpsr, x9
+
     // Restore per-vCPU architectural virtual-timer state.
-    ldr  x9, [x0, #400]
+    ldr  x9, [x0, #928]
     msr  cntvoff_el2, x9
-    ldr  x9, [x0, #408]
+    ldr  x9, [x0, #936]
     msr  cntv_cval_el0, x9
-    ldr  x9, [x0, #416]
+    ldr  x9, [x0, #944]
     msr  cntv_ctl_el0, x9
 
     // Load SP_EL0 and SP_EL1
@@ -353,13 +404,6 @@ __vcpu_run:
     msr  elr_el2, x9
     ldr  x9, [x0, #272]
     msr  spsr_el2, x9
-
-    // Trap guest FP/Advanced-SIMD use only for the guest execution window.
-    // CPTR_EL2.TFP also affects EL2, so tvisor must not leave it set while
-    // running Rust code that may contain compiler-generated SIMD instructions.
-    mrs  x9, cptr_el2
-    orr  x9, x9, #0x400
-    msr  cptr_el2, x9
 
     // Restore guest GPRs x1..x30
     ldp  x2,  x3,  [x0, #16]
@@ -404,18 +448,33 @@ __vcpu_irq_handler:
 
 __vcpu_exit_common:
 
-    // Re-enable FP/Advanced SIMD for the EL2 host before any Rust code can
-    // execute. Guest x0/x1 are already safe on the stack, so x0 is scratch.
-    mrs  x0, cptr_el2
-    bic  x0, x0, #0x400
-    msr  cptr_el2, x0
-    isb
-
     // Load the active VM-owned vCPU. Its VcpuContext is at offset zero.
     adrp x0, __pcpu_state
     add  x0, x0, :lo12:__pcpu_state
     ldr  x0, [x0, #8]
     cbz  x0, .Lfatal_no_context
+
+    // Save guest FP/Advanced-SIMD state before EL2 code can use it.
+    stp  q0,  q1,  [x0, #368]
+    stp  q2,  q3,  [x0, #400]
+    stp  q4,  q5,  [x0, #432]
+    stp  q6,  q7,  [x0, #464]
+    stp  q8,  q9,  [x0, #496]
+    stp  q10, q11, [x0, #528]
+    stp  q12, q13, [x0, #560]
+    stp  q14, q15, [x0, #592]
+    stp  q16, q17, [x0, #624]
+    stp  q18, q19, [x0, #656]
+    stp  q20, q21, [x0, #688]
+    stp  q22, q23, [x0, #720]
+    stp  q24, q25, [x0, #752]
+    stp  q26, q27, [x0, #784]
+    stp  q28, q29, [x0, #816]
+    stp  q30, q31, [x0, #848]
+    mrs  x1, fpcr
+    str  x1, [x0, #880]
+    mrs  x1, fpsr
+    str  x1, [x0, #888]
 
     // Save guest x2..x30 into context
     stp  x2,  x3,  [x0, #16]
@@ -473,14 +532,14 @@ __vcpu_exit_common:
 
     // Save architectural virtual-timer state before returning to EL2 Rust.
     mrs  x1, cntvoff_el2
-    str  x1, [x0, #400]
+    str  x1, [x0, #928]
     mrs  x1, cntv_cval_el0
-    str  x1, [x0, #408]
+    str  x1, [x0, #936]
     mrs  x1, cntv_ctl_el0
-    str  x1, [x0, #416]
+    str  x1, [x0, #944]
 
     // Populate the active VcpuExit, which follows VcpuContext.
-    add  x1, x0, #368
+    add  x1, x0, #896
 
     str  x3, [x1, #0]
     mrs  x2, esr_el2
@@ -496,6 +555,29 @@ __vcpu_exit_common:
     ldr  x10, [x9]
     str  xzr, [x9, #8]          // no vCPU is active after this exit
     mov  sp, x10
+
+    // Restore the EL2 FP/Advanced-SIMD state saved at guest entry.
+    ldp  q0,  q1,  [sp, #0]
+    ldp  q2,  q3,  [sp, #32]
+    ldp  q4,  q5,  [sp, #64]
+    ldp  q6,  q7,  [sp, #96]
+    ldp  q8,  q9,  [sp, #128]
+    ldp  q10, q11, [sp, #160]
+    ldp  q12, q13, [sp, #192]
+    ldp  q14, q15, [sp, #224]
+    ldp  q16, q17, [sp, #256]
+    ldp  q18, q19, [sp, #288]
+    ldp  q20, q21, [sp, #320]
+    ldp  q22, q23, [sp, #352]
+    ldp  q24, q25, [sp, #384]
+    ldp  q26, q27, [sp, #416]
+    ldp  q28, q29, [sp, #448]
+    ldp  q30, q31, [sp, #480]
+    ldr  x9, [sp, #512]
+    msr  fpcr, x9
+    ldr  x9, [sp, #520]
+    msr  fpsr, x9
+    add  sp, sp, #528
 
     // Restore host callee-saved registers
     ldp  x29, x30, [sp], #16
