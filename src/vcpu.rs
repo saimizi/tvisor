@@ -12,18 +12,6 @@ pub enum VcpuMmioError {
     ProgramCounterOverflow,
 }
 
-/// Guest-owned EL1 translation state. Stage 2 does not mirror these
-/// permissions: this state controls Linux VA-to-IPA translation only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestEl1TranslationState {
-    pub sctlr_el1: u64,
-    pub ttbr0_el1: u64,
-    pub ttbr1_el1: u64,
-    pub tcr_el1: u64,
-    pub mair_el1: u64,
-    pub vbar_el1: u64,
-}
-
 impl core::fmt::Display for VcpuMmioError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -91,21 +79,6 @@ impl VcpuContext {
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
-    }
-
-    pub const fn guest_stage1_translation(&self) -> GuestEl1TranslationState {
-        GuestEl1TranslationState {
-            sctlr_el1: self.sctlr_el1,
-            ttbr0_el1: self.ttbr0_el1,
-            ttbr1_el1: self.ttbr1_el1,
-            tcr_el1: self.tcr_el1,
-            mair_el1: self.mair_el1,
-            vbar_el1: self.vbar_el1,
-        }
-    }
-
-    pub const fn guest_stage1_mmu_enabled(&self) -> bool {
-        self.sctlr_el1 & 1 != 0
     }
 
     /// Emulates a successfully decoded stage-2 MMIO abort. The guest PC is

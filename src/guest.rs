@@ -197,8 +197,8 @@ unsafe fn deactivate_stage2() {
     }
 }
 
-/// Runs a vCPU until a non-emulated exit. A virtual-PL011 stage-2 abort is
-/// completed and resumed here, keeping the physical Mini UART host-owned.
+/// Runs a vCPU until a non-emulated exit. Trapped virtual-device stage-2
+/// aborts are completed and resumed here, keeping host devices host-owned.
 fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gicv2::GicV2) -> u64 {
     loop {
         // The guest accesses GICV directly; save/restore GICH state around
@@ -230,21 +230,16 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
             return vector;
         }
 
-        if vcpu.context().guest_stage1_mmu_enabled() {
-            let state = vcpu.context().guest_stage1_translation();
-            println!(
-                "  Guest EL1 stage-1 MMU active: TTBR0={:#018x} TTBR1={:#018x} TCR={:#018x} MAIR={:#018x} VBAR={:#018x}",
-                state.ttbr0_el1, state.ttbr1_el1, state.tcr_el1, state.mair_el1, state.vbar_el1,
-            );
-        }
-
         let reason = vcpu.exit().decode_reason(vcpu.context());
         let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
             return vector;
         };
-        if !(GUEST_PL011.start()..GUEST_PL011.end().expect("validated guest platform"))
+        let is_trapped_mmio = (GUEST_GICD.start()
+            ..GUEST_GICD.end().expect("validated guest platform"))
             .contains(&ipa)
-        {
+            || (GUEST_PL011.start()..GUEST_PL011.end().expect("validated guest platform"))
+                .contains(&ipa);
+        if !is_trapped_mmio {
             return vector;
         }
 
@@ -252,7 +247,7 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
         let transmit = vcpu
             .context_mut()
             .emulate_stage2_mmio(&exit, dispatcher)
-            .unwrap_or_else(|error| panic!("Virtual PL011 MMIO emulation failed: {error}"));
+            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
         if let Some(byte) = transmit {
             tvisor_util::debug_util::write_byte(byte)
                 .unwrap_or_else(|_| panic!("Virtual PL011 transmit could not reach host console"));

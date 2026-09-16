@@ -189,6 +189,18 @@ impl VirtualGicDistributor {
             // One bank of 32 interrupt IDs is enough for private timer PPIs.
             (false, 0x004) => Ok(0),
             (false, 0x008) => Ok(0x0200_0043),
+            // Linux discovers the CPU target mask from this register bank
+            // before programming its distributor state. Every byte targets
+            // the only guest vCPU.
+            (false, 0x800..=0x8ff) => Ok(0x0101_0101),
+            // The remaining distributor state starts clear. Linux performs
+            // read-modify-write setup for these banks, so expose their reset
+            // value even though the single-vCPU timer path does not retain
+            // their programmed state yet.
+            (
+                false,
+                0x080..=0x0ff | 0x100..=0x1ff | 0x280..=0x2ff | 0x400..=0x7ff | 0xc00..=0xcff,
+            ) => Ok(0),
             (true, 0x000) => {
                 self.ctlr = value as u32 & 1;
                 Ok(0)
@@ -197,9 +209,19 @@ impl VirtualGicDistributor {
             // needed for the single timer PPI currently injected through LR0.
             (
                 true,
-                0x080..=0x0ff | 0x100..=0x1ff | 0x280..=0x2ff | 0x400..=0x7ff | 0x800..=0x8ff,
+                0x080..=0x0ff
+                | 0x100..=0x1ff
+                | 0x280..=0x2ff
+                | 0x400..=0x7ff
+                | 0x800..=0x8ff
+                | 0xc00..=0xcff,
             ) => Ok(0),
-            _ => Err(()),
+            // The virtual distributor has no shared interrupt sources. Its
+            // remaining registers are reserved for future emulation, so
+            // model them as RAZ/WI rather than terminating a Linux boot for
+            // an otherwise harmless discovery or initialization access.
+            (false, _) => Ok(0),
+            (true, _) => Ok(0),
         }
     }
 }
@@ -316,6 +338,76 @@ mod tests {
             .unwrap();
         assert_eq!(status, None);
         assert_eq!(registers[5], (1 << 7) | (1 << 4));
+    }
+
+    #[test]
+    fn gic_distributor_discovery_and_configuration_are_emulated() {
+        let mut dispatcher = MmioDispatcher::default();
+        let mut registers = [0_u64; 31];
+
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(
+                    data_abort_iss(false, 2, 3),
+                    GUEST_GICD.start() + 0x004,
+                )
+                .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
+        assert_eq!(registers[3], 0);
+
+        registers[4] = 1;
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(data_abort_iss(true, 2, 4), GUEST_GICD.start())
+                    .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(data_abort_iss(false, 2, 5), GUEST_GICD.start())
+                    .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
+        assert_eq!(registers[5], 1);
+
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(
+                    data_abort_iss(false, 2, 6),
+                    GUEST_GICD.start() + 0x800,
+                )
+                .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
+        assert_eq!(registers[6], 0x0101_0101);
+
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(
+                    data_abort_iss(false, 2, 7),
+                    GUEST_GICD.start() + 0xc00,
+                )
+                .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
+        assert_eq!(registers[7], 0);
+
+        dispatcher
+            .emulate(
+                MmioAccess::decode_data_abort(
+                    data_abort_iss(true, 2, 7),
+                    GUEST_GICD.start() + 0xc00,
+                )
+                .unwrap(),
+                &mut registers,
+            )
+            .unwrap();
     }
 
     #[test]
