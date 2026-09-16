@@ -10,7 +10,7 @@ use tvisor_util::guest_fdt::{
     GuestFdtConfig, GuestGicV2, GuestMemoryRegion, GuestPl011, build_guest_dtb,
 };
 use tvisor_util::guest_platform::{
-    self, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ, GUEST_RAM,
+    self, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ, GUEST_RAM, VIRTUAL_PL011_IRQ,
 };
 use tvisor_util::linux_boot::LinuxBootLayout;
 use tvisor_util::stage2_translation::{
@@ -329,6 +329,7 @@ fn run_linux_guest_inner(
                 base: GUEST_PL011.start(),
                 size: GUEST_PL011.size(),
                 clock_hz: GUEST_PL011_CLOCK_HZ,
+                interrupt: VIRTUAL_PL011_IRQ,
             }),
             gicv2: Some(GuestGicV2 {
                 distributor_base: GUEST_GICD.start(),

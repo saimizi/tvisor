@@ -96,9 +96,13 @@ enum Pl011Result {
     Write(Option<u8>),
 }
 
-/// TX-only, polled subset of an emulated PrimeCell PL011.
+/// TX-only subset of an emulated PrimeCell PL011. Control and status state is
+/// RAZ/WI where it is not needed for transmit; this lets Linux bind a normal
+/// ttyAMA0 console without exposing a physical UART.
 #[derive(Debug, Default)]
-pub struct VirtualPl011;
+pub struct VirtualPl011 {
+    imsc: u32,
+}
 
 impl VirtualPl011 {
     const DR: u64 = 0x00;
@@ -108,7 +112,17 @@ impl VirtualPl011 {
     const LCR_H: u64 = 0x2c;
     const CR: u64 = 0x30;
     const IMSC: u64 = 0x38;
+    const RIS: u64 = 0x3c;
+    const MIS: u64 = 0x40;
     const ICR: u64 = 0x44;
+    const PID0: u64 = 0xfe0;
+    const PID1: u64 = 0xfe4;
+    const PID2: u64 = 0xfe8;
+    const PID3: u64 = 0xfec;
+    const CID0: u64 = 0xff0;
+    const CID1: u64 = 0xff4;
+    const CID2: u64 = 0xff8;
+    const CID3: u64 = 0xffc;
     // TX FIFO empty and RX FIFO empty. In particular TXFF is clear.
     const FR_TX_READY: u64 = (1 << 7) | (1 << 4);
 
@@ -127,15 +141,32 @@ impl VirtualPl011 {
                 Self::DR => Ok(Pl011Result::Write(Some(value as u8))),
                 // Linux earlycon may program these before transmitting. Phase
                 // 10.2 accepts them without exposing the physical Mini UART.
-                Self::IBRD | Self::FBRD | Self::LCR_H | Self::CR | Self::IMSC | Self::ICR => {
+                Self::IBRD | Self::FBRD | Self::LCR_H | Self::CR | Self::ICR => {
                     Ok(Pl011Result::Write(None))
                 }
-                _ => Err(Pl011Error::UnsupportedWrite(offset)),
+                Self::IMSC => {
+                    self.imsc = value as u32;
+                    Ok(Pl011Result::Write(None))
+                }
+                _ => Ok(Pl011Result::Write(None)),
             }
         } else {
             match offset {
                 Self::FR => Ok(Pl011Result::Read(Self::FR_TX_READY)),
-                _ => Err(Pl011Error::UnsupportedRead(offset)),
+                Self::IMSC => Ok(Pl011Result::Read(self.imsc as u64)),
+                Self::RIS | Self::MIS => Ok(Pl011Result::Read(0)),
+                // The AMBA bus verifies these IDs before it binds the PL011
+                // driver. They encode ARM PrimeCell PL011 (0x0004_1011)
+                // and the AMBA component signature (0xb105_f00d).
+                Self::PID0 => Ok(Pl011Result::Read(0x11)),
+                Self::PID1 => Ok(Pl011Result::Read(0x10)),
+                Self::PID2 => Ok(Pl011Result::Read(0x04)),
+                Self::PID3 => Ok(Pl011Result::Read(0x00)),
+                Self::CID0 => Ok(Pl011Result::Read(0x0d)),
+                Self::CID1 => Ok(Pl011Result::Read(0xf0)),
+                Self::CID2 => Ok(Pl011Result::Read(0x05)),
+                Self::CID3 => Ok(Pl011Result::Read(0xb1)),
+                _ => Ok(Pl011Result::Read(0)),
             }
         }
     }
@@ -181,13 +212,14 @@ struct VirtualGicDistributor {
 
 impl VirtualGicDistributor {
     fn access(&mut self, offset: u64, is_write: bool, width: u8, value: u64) -> Result<u64, ()> {
-        if width != 4 {
+        if !matches!(width, 1 | 2 | 4) {
             return Err(());
         }
         match (is_write, offset) {
             (false, 0x000) => Ok(self.ctlr as u64),
-            // One bank of 32 interrupt IDs is enough for private timer PPIs.
-            (false, 0x004) => Ok(0),
+            // Two banks describe private interrupts plus the virtual PL011
+            // SPI, which Linux needs before binding ttyAMA0.
+            (false, 0x004) => Ok(1),
             (false, 0x008) => Ok(0x0200_0043),
             // Linux discovers the CPU target mask from this register bank
             // before programming its distributor state. Every byte targets
@@ -338,6 +370,20 @@ mod tests {
             .unwrap();
         assert_eq!(status, None);
         assert_eq!(registers[5], (1 << 7) | (1 << 4));
+
+        for (register, offset, expected) in [(0, 0xfe0, 0x11), (1, 0xfe4, 0x10), (2, 0xfe8, 0x04)] {
+            dispatcher
+                .emulate(
+                    MmioAccess::decode_data_abort(
+                        data_abort_iss(false, 2, register),
+                        GUEST_PL011.start() + offset,
+                    )
+                    .unwrap(),
+                    &mut registers,
+                )
+                .unwrap();
+            assert_eq!(registers[register as usize], expected);
+        }
     }
 
     #[test]
@@ -355,7 +401,7 @@ mod tests {
                 &mut registers,
             )
             .unwrap();
-        assert_eq!(registers[3], 0);
+        assert_eq!(registers[3], 1);
 
         registers[4] = 1;
         dispatcher
@@ -411,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_devices_and_unsupported_pl011_accesses() {
+    fn rejects_unknown_devices_and_tolerates_pl011_control_accesses() {
         let mut dispatcher = MmioDispatcher::default();
         let mut registers = [0_u64; 31];
         let access =
@@ -423,9 +469,7 @@ mod tests {
         let access =
             MmioAccess::decode_data_abort(data_abort_iss(false, 2, 0), GUEST_PL011.start())
                 .unwrap();
-        assert_eq!(
-            dispatcher.emulate(access, &mut registers),
-            Err(MmioEmulationError::Pl011(Pl011Error::UnsupportedRead(0)))
-        );
+        assert_eq!(dispatcher.emulate(access, &mut registers), Ok(None));
+        assert_eq!(registers[0], 0);
     }
 }

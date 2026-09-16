@@ -1,22 +1,31 @@
 # Build a minimal, single-core arm64 Linux guest image.
 #
-# Prerequisites: curl, tar, make, and LLVM/Clang with LLD.  A GNU cross-toolchain
-# can be selected instead with `make LLVM= CROSS_COMPILE=aarch64-linux-gnu-`.
+# Prerequisites: curl, tar, make, and LLVM/Clang with LLD for the kernel. The
+# BusyBox initramfs additionally needs an arm64 GNU cross-toolchain and libc
+# sysroot (for example, `aarch64-linux-gnu-gcc`).
 
 KERNEL_VERSION := 6.18.2
 KERNEL_ARCHIVE := linux-$(KERNEL_VERSION).tar.xz
 KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/$(KERNEL_ARCHIVE)
 KERNEL_DIR := linux-$(KERNEL_VERSION)
 BUILD_DIR := build/arm64
+BUSYBOX_VERSION := 1.38.0
+BUSYBOX_ARCHIVE := busybox-$(BUSYBOX_VERSION).tar.bz2
+BUSYBOX_URL := https://busybox.net/downloads/$(BUSYBOX_ARCHIVE)
+BUSYBOX_DIR := busybox-$(BUSYBOX_VERSION)
+BUSYBOX_BUILD_DIR := build/busybox-arm64
+INITRAMFS_ROOT := build/initramfs-root
+INITRAMFS_CPIO := build/initramfs.cpio
+INITRAMFS := $(INITRAMFS_CPIO).gz
 
 ARCH ?= arm64
 CROSS_COMPILE ?= aarch64-linux-gnu-
 LLVM ?= 1
 JOBS ?= $(shell nproc)
 
-.PHONY: all download extract config image clean distclean
+.PHONY: all download extract config image busybox initramfs clean distclean
 
-all: image
+all: image initramfs
 
 download: $(KERNEL_ARCHIVE)
 
@@ -34,9 +43,8 @@ $(KERNEL_DIR)/Makefile: $(KERNEL_ARCHIVE)
 config: $(BUILD_DIR)/.config
 
 # `tinyconfig` gives the smallest upstream configuration. CPU topology comes
-# from the guest DTB. INITRAMFS_SOURCE is kept empty as a second safeguard
-# against embedding a cpio archive.
-$(BUILD_DIR)/.config: Makefile $(KERNEL_DIR)/Makefile
+# from the guest DTB, and INITRAMFS_SOURCE embeds the generated cpio archive.
+$(BUILD_DIR)/.config: Makefile $(KERNEL_DIR)/Makefile $(INITRAMFS_CPIO)
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) tinyconfig
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable 64BIT
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable ARM64
@@ -45,6 +53,10 @@ $(BUILD_DIR)/.config: Makefile $(KERNEL_DIR)/Makefile
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable OF
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable OF_EARLY_FLATTREE
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable TTY
+	# devtmpfs provides /dev/console before /init runs, so the initramfs shell
+	# retains its standard streams after the normal PL011 console is registered.
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable DEVTMPFS
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable DEVTMPFS_MOUNT
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable SERIAL_AMBA_PL011
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable SERIAL_AMBA_PL011_CONSOLE
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable SERIAL_EARLYCON
@@ -53,8 +65,14 @@ $(BUILD_DIR)/.config: Makefile $(KERNEL_DIR)/Makefile
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable ARM_ARCH_TIMER
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable PRINTK
 	# Linux 6.18.2 has removed CONFIG_EARLY_PRINTK; SERIAL_EARLYCON above is its replacement.
-	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --disable BLK_DEV_INITRD
-	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --set-str INITRAMFS_SOURCE ""
+	# BLK_DEV_INITRD gates CONFIG_INITRAMFS_SOURCE in Linux Kconfig.
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable BLK_DEV_INITRD
+	# The initramfs starts with a #!/bin/sh script whose interpreter is the
+	# statically linked BusyBox binary, so tinyconfig also needs both binary
+	# format handlers to execute the initial userspace.
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable BINFMT_ELF
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --enable BINFMT_SCRIPT
+	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --set-str INITRAMFS_SOURCE "$(abspath $(INITRAMFS_CPIO))"
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) olddefconfig
 
 image: $(BUILD_DIR)/arch/arm64/boot/Image
@@ -62,8 +80,51 @@ image: $(BUILD_DIR)/arch/arm64/boot/Image
 $(BUILD_DIR)/arch/arm64/boot/Image: $(BUILD_DIR)/.config
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) -j$(JOBS) Image
 
+busybox: $(BUSYBOX_BUILD_DIR)/busybox
+
+$(BUSYBOX_ARCHIVE):
+	curl --fail --location --remote-name $(BUSYBOX_URL)
+
+$(BUSYBOX_DIR)/Makefile: $(BUSYBOX_ARCHIVE)
+	tar -xf $<
+	touch $@
+
+# BusyBox is deliberately statically linked so the initramfs needs no shared
+# libraries. A GNU arm64 cross-toolchain, including its libc sysroot, is
+# required for this userspace build.
+$(BUSYBOX_BUILD_DIR)/.config: Makefile $(BUSYBOX_DIR)/Makefile
+	mkdir -p $(BUSYBOX_BUILD_DIR)
+	$(MAKE) -C $(BUSYBOX_DIR) O=$(abspath $(BUSYBOX_BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) allnoconfig
+	sed -i \
+		-e 's/^# CONFIG_BUSYBOX is not set/CONFIG_BUSYBOX=y/' \
+		-e 's/^# CONFIG_FEATURE_INSTALLER is not set/CONFIG_FEATURE_INSTALLER=y/' \
+		-e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+		-e 's/^# CONFIG_MOUNT is not set/CONFIG_MOUNT=y/' \
+		-e 's/^# CONFIG_SH_IS_ASH is not set/CONFIG_SH_IS_ASH=y/' \
+		-e 's/^CONFIG_SH_IS_NONE=y/# CONFIG_SH_IS_NONE is not set/' \
+		-e 's/^# CONFIG_SHELL_ASH is not set/CONFIG_SHELL_ASH=y/' $(abspath $@)
+
+$(BUSYBOX_BUILD_DIR)/busybox: $(BUSYBOX_BUILD_DIR)/.config
+	$(MAKE) -C $(BUSYBOX_DIR) O=$(abspath $(BUSYBOX_BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS)
+
+initramfs: $(INITRAMFS)
+
+$(INITRAMFS_CPIO): $(BUSYBOX_BUILD_DIR)/busybox initramfs/init
+	rm -rf $(INITRAMFS_ROOT)
+	install -D -m 0755 $(BUSYBOX_BUILD_DIR)/busybox $(INITRAMFS_ROOT)/bin/busybox
+	ln -s busybox $(INITRAMFS_ROOT)/bin/sh
+	install -D -m 0755 initramfs/init $(INITRAMFS_ROOT)/init
+	mkdir -p $(INITRAMFS_ROOT)/dev $(INITRAMFS_ROOT)/proc $(INITRAMFS_ROOT)/sys
+	# fakeroot records the console's c 5:1 metadata in the CPIO archive without
+	# requiring host privileges to create a device node in the build tree.
+	fakeroot -- sh -c 'mknod -m 0600 "$(abspath $(INITRAMFS_ROOT))/dev/console" c 5 1 && cd "$(abspath $(INITRAMFS_ROOT))" && find . -print0 | sort -z | cpio --null -o -H newc > "$(abspath $@)"'
+
+$(INITRAMFS): $(INITRAMFS_CPIO)
+	gzip -9 -c $< > $@
+
 clean:
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) clean
+	$(MAKE) -C $(BUSYBOX_DIR) O=$(abspath $(BUSYBOX_BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean
 
 distclean:
-	rm -rf $(BUILD_DIR) $(KERNEL_DIR) 
+	rm -rf $(BUILD_DIR) $(BUSYBOX_BUILD_DIR) $(INITRAMFS_ROOT) $(INITRAMFS_CPIO) $(INITRAMFS) $(KERNEL_DIR) $(BUSYBOX_DIR) $(KERNEL_ARCHIVE) $(BUSYBOX_ARCHIVE)

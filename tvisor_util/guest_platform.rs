@@ -51,6 +51,9 @@ pub const GUEST_GICV: IpaRegion = IpaRegion::new(0x0801_0000, 2 * PAGE_SIZE as u
 pub const GUEST_GICD: IpaRegion = IpaRegion::new(0x0800_0000, 0x1_0000);
 /// Trapped, virtual PL011 UART interface.
 pub const GUEST_PL011: IpaRegion = IpaRegion::new(0x0900_0000, PAGE_SIZE as u64);
+/// Virtual SPI assigned to the trapped PL011. The current transmit-only model
+/// never asserts it, but Linux requires an IRQ resource to bind ttyAMA0.
+pub const VIRTUAL_PL011_IRQ: u32 = 33;
 /// Fixed virtual PL011 input clock advertised to the guest.
 pub const GUEST_PL011_CLOCK_HZ: u32 = 24_000_000;
 

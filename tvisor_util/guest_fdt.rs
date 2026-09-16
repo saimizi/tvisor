@@ -47,7 +47,11 @@ pub struct GuestPl011 {
     pub base: u64,
     pub size: u64,
     pub clock_hz: u32,
+    pub interrupt: u32,
 }
+
+const GIC_PHANDLE: u32 = 2;
+const GIC_SPI_BASE: u32 = 32;
 
 /// Guest-visible GICv2 distributor and CPU interface regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +116,7 @@ fn validate_config(config: &GuestFdtConfig<'_>) -> Result<(), GuestFdtError> {
             || pl011.size & 0xfff != 0
             || pl011.base.checked_add(pl011.size).is_none()
             || pl011.clock_hz == 0
+            || (config.gicv2.is_some() && pl011.interrupt < GIC_SPI_BASE)
         {
             return Err(GuestFdtError::InvalidConfiguration);
         }
@@ -194,7 +199,6 @@ fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
     tree.root.add_child(memory);
 
     if let Some(gic) = config.gicv2 {
-        const GIC_PHANDLE: u32 = 2;
         let mut node = DeviceTreeNode::new_unchecked(format!("intc@{:x}", gic.distributor_base));
         node.add_property(property("compatible", string_value("arm,cortex-a15-gic")));
         node.add_property(property("#interrupt-cells", 3_u32.to_be_bytes().to_vec()));
@@ -244,7 +248,10 @@ fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
         tree.root.add_child(clock);
 
         let mut uart = DeviceTreeNode::new_unchecked(format!("serial@{:x}", pl011.base));
-        uart.add_property(property("compatible", string_value("arm,pl011")));
+        uart.add_property(property(
+            "compatible",
+            string_list_value(&["arm,pl011", "arm,primecell"]),
+        ));
         let mut uart_reg = Vec::with_capacity(16);
         uart_reg.extend_from_slice(&pl011.base.to_be_bytes());
         uart_reg.extend_from_slice(&pl011.size.to_be_bytes());
@@ -257,6 +264,18 @@ fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
             "clock-names",
             string_list_value(&["uartclk", "apb_pclk"]),
         ));
+        if config.gicv2.is_some() {
+            uart.add_property(property(
+                "interrupt-parent",
+                GIC_PHANDLE.to_be_bytes().to_vec(),
+            ));
+            let mut interrupts = Vec::with_capacity(12);
+            // GICv2 SPI with level-high polarity.
+            interrupts.extend_from_slice(&0_u32.to_be_bytes());
+            interrupts.extend_from_slice(&(pl011.interrupt - GIC_SPI_BASE).to_be_bytes());
+            interrupts.extend_from_slice(&4_u32.to_be_bytes());
+            uart.add_property(property("interrupts", interrupts));
+        }
         uart.add_property(property("status", string_value("okay")));
         tree.root.add_child(uart);
     }
@@ -418,8 +437,14 @@ mod tests {
                 base: 0x0900_0000,
                 size: 0x1000,
                 clock_hz: 24_000_000,
+                interrupt: 33,
             }),
-            gicv2: None,
+            gicv2: Some(GuestGicV2 {
+                distributor_base: 0x0800_0000,
+                distributor_size: 0x1_0000,
+                cpu_interface_base: 0x0801_0000,
+                cpu_interface_size: 0x2_000,
+            }),
         };
 
         let size = build_guest_dtb(&mut buf, &config).unwrap();
@@ -445,8 +470,8 @@ mod tests {
         );
         let uart = root.child("serial@9000000").unwrap();
         assert_eq!(
-            uart.property("compatible").unwrap().as_str().unwrap(),
-            "arm,pl011"
+            uart.property("compatible").unwrap().value(),
+            b"arm,pl011\0arm,primecell\0"
         );
         assert_eq!(
             u64::from_be_bytes(
@@ -475,6 +500,20 @@ mod tests {
                     .unwrap()
             ),
             24_000_000
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                uart.property("interrupt-parent")
+                    .unwrap()
+                    .value()
+                    .try_into()
+                    .unwrap()
+            ),
+            GIC_PHANDLE
+        );
+        assert_eq!(
+            uart.property("interrupts").unwrap().value(),
+            &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4]
         );
     }
 
