@@ -324,7 +324,7 @@ fn run_linux_guest_inner(
         dtb_slice,
         &GuestFdtConfig {
             memory_regions: &guest_mem_regions,
-            bootargs: Some("earlycon=pl011,mmio32,0x09000000 loglevel=8"),
+            bootargs: Some("console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"),
             pl011: Some(GuestPl011 {
                 base: GUEST_PL011.start(),
                 size: GUEST_PL011.size(),

@@ -413,7 +413,7 @@ mod tests {
         }];
         let config = GuestFdtConfig {
             memory_regions: &mem_regions,
-            bootargs: Some("earlycon=pl011,mmio32,0x09000000 loglevel=8"),
+            bootargs: Some("console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"),
             pl011: Some(GuestPl011 {
                 base: 0x0900_0000,
                 size: 0x1000,
@@ -433,6 +433,15 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "serial@9000000"
+        );
+        assert_eq!(
+            root.child("chosen")
+                .unwrap()
+                .property("bootargs")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"
         );
         let uart = root.child("serial@9000000").unwrap();
         assert_eq!(
