@@ -320,6 +320,8 @@ pub enum ConsoleDiscoveryError {
     UnsupportedConsole,
     MissingRegister,
     InvalidRegister,
+    MissingInterrupt,
+    InvalidInterrupt,
     MissingParent,
     MissingRanges,
     AddressNotMapped,
@@ -339,6 +341,8 @@ impl fmt::Display for ConsoleDiscoveryError {
             Self::UnsupportedConsole => "the stdout-path console type is unsupported",
             Self::MissingRegister => "the console has no reg entry",
             Self::InvalidRegister => "the console reg entry is invalid",
+            Self::MissingInterrupt => "the console has no interrupt specifier",
+            Self::InvalidInterrupt => "the console interrupt specifier is unsupported or invalid",
             Self::MissingParent => "the console path has no parent bus",
             Self::MissingRanges => "a console parent bus has no ranges property",
             Self::AddressNotMapped => "the console address is not covered by parent ranges",
@@ -400,7 +404,51 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
     let registers = PhysRegion::new(PhysAddr::new(physical_address), register_size)
         .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
 
-    Ok(ConsoleInfo { kind, registers })
+    // Raspberry Pi's Mini UART is wired to the GIC with the standard
+    // three-cell SPI specifier: <0, spi-number, level-high>.  Keep this
+    // physical source in the console description so EL2 can wake an idle
+    // guest when host-console input arrives.
+    let interrupt_property = node
+        .property("interrupts")
+        .ok_or(ConsoleDiscoveryError::MissingInterrupt)?;
+    let interrupts = interrupt_property.value();
+    let irq = decode_console_gic_spi(interrupts)?;
+
+    Ok(ConsoleInfo {
+        kind,
+        registers,
+        irq,
+    })
+}
+
+fn decode_console_gic_spi(interrupts: &[u8]) -> Result<u32, ConsoleDiscoveryError> {
+    let interrupt_cells: [u8; 12] = interrupts
+        .get(..12)
+        .ok_or(ConsoleDiscoveryError::MissingInterrupt)?
+        .try_into()
+        .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?;
+    let interrupt_type = u32::from_be_bytes(
+        interrupt_cells[0..4]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    let interrupt_number = u32::from_be_bytes(
+        interrupt_cells[4..8]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    let interrupt_flags = u32::from_be_bytes(
+        interrupt_cells[8..12]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    if interrupt_type != 0 || interrupt_flags != 4 {
+        return Err(ConsoleDiscoveryError::InvalidInterrupt);
+    }
+    interrupt_number
+        .checked_add(32)
+        .filter(|irq| *irq < 1020)
+        .ok_or(ConsoleDiscoveryError::InvalidInterrupt)
 }
 
 fn resolve_stdout_path<'a>(fdt: Fdt<'a>) -> Result<&'a str, ConsoleDiscoveryError> {
@@ -812,5 +860,17 @@ mod tests {
         assert_eq!(parent_path("/soc"), Some("/"));
         assert_eq!(parent_path("/"), None);
         assert_eq!(parent_path("relative"), None);
+    }
+
+    #[test]
+    fn decodes_level_high_gic_spi_for_console() {
+        assert_eq!(
+            decode_console_gic_spi(&[0, 0, 0, 0, 0, 0, 0, 93, 0, 0, 0, 4]),
+            Ok(125)
+        );
+        assert_eq!(
+            decode_console_gic_spi(&[0, 0, 0, 1, 0, 0, 0, 93, 0, 0, 0, 4]),
+            Err(ConsoleDiscoveryError::InvalidInterrupt)
+        );
     }
 }

@@ -217,6 +217,7 @@ impl Vcpu {
             gic: VirtualGicV2State {
                 vmcr: 0,
                 timer_lr: 0,
+                uart_lr: 0,
             },
         }
     }

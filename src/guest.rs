@@ -26,6 +26,7 @@ use tvisor_util::system_info::PhysRegion;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 static LINUX_IMAGE_SOURCE: Once<PhysRegion> = Once::new();
+static HOST_CONSOLE_IRQ: Once<u32> = Once::new();
 
 /// Why Linux execution returned to EL2 instead of continuing its normal run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,18 @@ pub fn set_linux_image_source(source: PhysRegion) -> Result<(), ()> {
 
 pub fn linux_image_source() -> Option<PhysRegion> {
     LINUX_IMAGE_SOURCE.get().copied()
+}
+
+/// Records the physical Mini UART SPI discovered from the host DTB.
+pub fn set_host_console_irq(irq: u32) -> Result<(), ()> {
+    if !(32..gicv2::SPURIOUS_IRQ).contains(&irq) {
+        return Err(());
+    }
+    if let Some(existing) = HOST_CONSOLE_IRQ.get() {
+        return if *existing == irq { Ok(()) } else { Err(()) };
+    }
+    HOST_CONSOLE_IRQ.call_once(|| irq);
+    Ok(())
 }
 
 #[inline]
@@ -200,7 +213,16 @@ unsafe fn deactivate_stage2() {
 /// Runs a vCPU until a non-emulated exit. Trapped virtual-device stage-2
 /// aborts are completed and resumed here, keeping host devices host-owned.
 fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gicv2::GicV2) -> u64 {
+    let host_console_irq = *HOST_CONSOLE_IRQ
+        .get()
+        .expect("host console IRQ must be configured before running a guest");
     loop {
+        // An RX IRQ drains the host-owned Mini UART into this FIFO. Recheck
+        // the virtual interrupt after every EL2 exit, because Linux can
+        // enable PL011 RXIM in the same exit that emulates its IMSC write.
+        if dispatcher.pl011_rx_irq_pending() && !vcpu.gic().uart_in_flight() {
+            let _ = gicv2::queue_uart_spi(vcpu.gic_mut(), VIRTUAL_PL011_IRQ);
+        }
         // The guest accesses GICV directly; save/restore GICH state around
         // every world switch so its List Register and CPU-interface policy
         // remain owned by this vCPU rather than the host.
@@ -218,6 +240,16 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
                 // PPI remains active until the guest GICV_EOIR completes LR0.
                 unsafe { gic.end_interrupt(irq) };
                 println!("  EL2 queued virtual timer PPI {} in GICH LR0", irq);
+                continue;
+            }
+            if irq == host_console_irq {
+                // Drain before EOI: the Mini UART RX source is level-triggered
+                // and would otherwise immediately reassert at the GIC.
+                while let Some(byte) = tvisor_util::debug_util::read_byte() {
+                    let _ = dispatcher.enqueue_pl011_rx(byte);
+                }
+                unsafe { gic.end_interrupt(irq) };
+                unsafe { gic.deactivate_interrupt(irq) };
                 continue;
             }
             if irq != gicv2::SPURIOUS_IRQ {
@@ -277,7 +309,16 @@ fn run_linux_guest_inner(
         dtb_ipa,
     );
     let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
-    unsafe { gic.enable_timer_ppi(VIRTUAL_TIMER_PPI) };
+    unsafe {
+        gic.enable_timer_ppi(VIRTUAL_TIMER_PPI);
+        gic.enable_spi(
+            *HOST_CONSOLE_IRQ
+                .get()
+                .expect("host console IRQ must be configured before guest setup"),
+        );
+    }
+    tvisor_util::debug_util::enable_rx_interrupt()
+        .expect("host Mini UART must be initialized before guest setup");
     guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
     let gicv_mapping =
         guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())

@@ -334,6 +334,8 @@ impl ConsoleKind {
 pub struct ConsoleInfo {
     pub kind: ConsoleKind,
     pub registers: PhysRegion,
+    /// Physical GIC interrupt asserted when input arrives at the host console.
+    pub irq: u32,
 }
 
 impl From<Fdt<'_>> for PhysRegion {

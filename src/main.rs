@@ -196,6 +196,10 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         gic.virtual_cpu_interface(),
     );
     gicv2::initialize(gic);
+    if guest::set_host_console_irq(console.irq).is_err() {
+        println!("Host console IRQ discovery failed: {}", console.irq);
+        halt();
+    }
 
     // Set up bootstrap page table
     let bootstrap = match mm::setup_bootstrap_page_table(

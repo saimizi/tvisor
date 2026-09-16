@@ -96,12 +96,25 @@ enum Pl011Result {
     Write(Option<u8>),
 }
 
-/// TX-only subset of an emulated PrimeCell PL011. Control and status state is
-/// RAZ/WI where it is not needed for transmit; this lets Linux bind a normal
-/// ttyAMA0 console without exposing a physical UART.
-#[derive(Debug, Default)]
+/// Emulated PrimeCell PL011 with a bounded RX FIFO. The host Mini UART remains
+/// owned by tvisor; received bytes are routed into this virtual device.
+#[derive(Debug)]
 pub struct VirtualPl011 {
     imsc: u32,
+    rx: [u8; 64],
+    rx_head: usize,
+    rx_len: usize,
+}
+
+impl Default for VirtualPl011 {
+    fn default() -> Self {
+        Self {
+            imsc: 0,
+            rx: [0; 64],
+            rx_head: 0,
+            rx_len: 0,
+        }
+    }
 }
 
 impl VirtualPl011 {
@@ -123,8 +136,33 @@ impl VirtualPl011 {
     const CID1: u64 = 0xff4;
     const CID2: u64 = 0xff8;
     const CID3: u64 = 0xffc;
-    // TX FIFO empty and RX FIFO empty. In particular TXFF is clear.
-    const FR_TX_READY: u64 = (1 << 7) | (1 << 4);
+    const RXIM: u32 = 1 << 4;
+    const FR_TX_READY: u64 = 1 << 7;
+    const FR_RXFE: u64 = 1 << 4;
+
+    pub fn enqueue_rx(&mut self, byte: u8) -> bool {
+        if self.rx_len == self.rx.len() {
+            return false;
+        }
+        let tail = (self.rx_head + self.rx_len) % self.rx.len();
+        self.rx[tail] = byte;
+        self.rx_len += 1;
+        true
+    }
+
+    fn dequeue_rx(&mut self) -> u8 {
+        if self.rx_len == 0 {
+            return 0;
+        }
+        let byte = self.rx[self.rx_head];
+        self.rx_head = (self.rx_head + 1) % self.rx.len();
+        self.rx_len -= 1;
+        byte
+    }
+
+    fn rx_irq_pending(&self) -> bool {
+        self.rx_len != 0 && self.imsc & Self::RXIM != 0
+    }
 
     fn access(
         &mut self,
@@ -152,9 +190,21 @@ impl VirtualPl011 {
             }
         } else {
             match offset {
-                Self::FR => Ok(Pl011Result::Read(Self::FR_TX_READY)),
+                Self::DR => Ok(Pl011Result::Read(self.dequeue_rx() as u64)),
+                Self::FR => Ok(Pl011Result::Read(
+                    Self::FR_TX_READY | if self.rx_len == 0 { Self::FR_RXFE } else { 0 },
+                )),
                 Self::IMSC => Ok(Pl011Result::Read(self.imsc as u64)),
-                Self::RIS | Self::MIS => Ok(Pl011Result::Read(0)),
+                Self::RIS => Ok(Pl011Result::Read(if self.rx_len != 0 {
+                    Self::RXIM as u64
+                } else {
+                    0
+                })),
+                Self::MIS => Ok(Pl011Result::Read(if self.rx_irq_pending() {
+                    Self::RXIM as u64
+                } else {
+                    0
+                })),
                 // The AMBA bus verifies these IDs before it binds the PL011
                 // driver. They encode ARM PrimeCell PL011 (0x0004_1011)
                 // and the AMBA component signature (0xb105_f00d).
@@ -259,6 +309,13 @@ impl VirtualGicDistributor {
 }
 
 impl MmioDispatcher {
+    pub fn enqueue_pl011_rx(&mut self, byte: u8) -> bool {
+        self.pl011.enqueue_rx(byte)
+    }
+
+    pub fn pl011_rx_irq_pending(&self) -> bool {
+        self.pl011.rx_irq_pending()
+    }
     /// Emulates one access. A returned byte is forwarded by the EL2 caller to
     /// the host console only after this method succeeds.
     pub fn emulate(
@@ -384,6 +441,33 @@ mod tests {
                 .unwrap();
             assert_eq!(registers[register as usize], expected);
         }
+    }
+
+    #[test]
+    fn pl011_rx_fifo_drives_status_and_masked_interrupt() {
+        let mut uart = VirtualPl011::default();
+        assert!(uart.enqueue_rx(b'x'));
+        assert_eq!(
+            uart.access(VirtualPl011::FR, false, 4, 0).unwrap(),
+            Pl011Result::Read(VirtualPl011::FR_TX_READY)
+        );
+        assert_eq!(
+            uart.access(VirtualPl011::RIS, false, 4, 0).unwrap(),
+            Pl011Result::Read(VirtualPl011::RXIM as u64)
+        );
+        assert!(!uart.rx_irq_pending());
+        uart.access(VirtualPl011::IMSC, true, 4, VirtualPl011::RXIM as u64)
+            .unwrap();
+        assert!(uart.rx_irq_pending());
+        assert_eq!(
+            uart.access(VirtualPl011::DR, false, 4, 0).unwrap(),
+            Pl011Result::Read(b'x' as u64)
+        );
+        assert!(!uart.rx_irq_pending());
+        assert_eq!(
+            uart.access(VirtualPl011::FR, false, 4, 0).unwrap(),
+            Pl011Result::Read(VirtualPl011::FR_TX_READY | VirtualPl011::FR_RXFE)
+        );
     }
 
     #[test]
