@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn timer_lr_is_reusable_after_invalid_state() {
         let mut state = VirtualGicV2State {
-            timer_lr: GICH_LR_HW | GICH_LR_GROUP1 | 27,
+            timer_lr: GICH_LR_HW | 27,
             ..VirtualGicV2State::default()
         };
         assert!(!state.timer_in_flight());

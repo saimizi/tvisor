@@ -727,7 +727,7 @@ mod tests {
         let mut registers = Vec::new();
         for (address, size) in [
             (0x1000_u32, 0x1000_u32),
-            (0x2000, 0x1000),
+            (0x2000, 0x2000),
             (0x4000, 0x1000),
             (0x6000, 0x2000),
         ] {
