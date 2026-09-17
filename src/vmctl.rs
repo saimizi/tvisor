@@ -1,17 +1,25 @@
 use crate::alloc::string::ToString;
+use crate::guest::{self, GuestRunError};
 use crate::mm;
 use crate::vcpu::Vcpu;
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::el2_translation::*;
-use tvisor_util::guest_platform::DEFAULT_GUEST_RAM_SIZE;
+use tvisor_util::guest_fdt;
+use tvisor_util::guest_platform::{
+    self, DEFAULT_GUEST_RAM_SIZE, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ,
+    GUEST_RAM, VIRTUAL_PL011_IRQ,
+};
+use tvisor_util::linux_boot;
+use tvisor_util::mmio;
 use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::stage2_translation::*;
 use tvisor_util::*;
 
 use core::fmt::Display;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
+use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 /// The fixed 512 MiB guest RAM backing plus room for Stage-2 tables.
 pub const MAX_GUEST_MEM_BYTES: usize = DEFAULT_GUEST_RAM_SIZE as usize + 2 * 1024 * 1024;
@@ -759,6 +767,146 @@ impl VmCtl {
         }
 
         self.vm_mem.clear();
+    }
+
+    pub fn run(&mut self) -> Result<(), GuestRunError> {
+        let source = guest::linux_image_source().ok_or(TranslationError::Unexpected)?;
+        let image = unsafe {
+            core::slice::from_raw_parts(source.start().value() as *const u8, source.size() as usize)
+        };
+
+        let layout = linux_boot::LinuxBootLayout::default_for_image(image, None)
+            .map_err(|_| TranslationError::Unexpected)?;
+        let (image_ipa, image_extent) = layout.image();
+        let (dtb_ipa, dtb_capacity) = layout.dtb();
+
+        println!(
+            "Phase 10: loading Linux Image: source={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
+            source,
+            image.len(),
+            image_ipa,
+            image_extent,
+            dtb_ipa,
+        );
+
+        let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
+        unsafe {
+            gic.enable_timer_ppi(VIRTUAL_TIMER_PPI);
+            gic.enable_spi(guest::get_host_console_irq());
+        }
+
+        tvisor_util::debug_util::enable_rx_interrupt()
+            .expect("host Mini UART must be initialized before guest setup");
+        guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
+
+        let gicv_mapping =
+            guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())
+                .map_err(|_| TranslationError::Unexpected)?;
+
+        let guest_ram_pa = self
+            .vm_mem_alloc(
+                VmMemUsage::GuestRam,
+                Some(IpaAddr::new(GUEST_RAM.start())),
+                GUEST_RAM.size() as usize,
+            )
+            .map_err(|_| TranslationError::Unexpected)?
+            .ok_or(TranslationError::Unexpected)?
+            .value();
+        let guest_pa_for = |ipa: u64| -> Result<u64, TranslationError> {
+            guest_ram_pa
+                .checked_add(
+                    ipa.checked_sub(GUEST_RAM.start())
+                        .ok_or(TranslationError::Unexpected)?,
+                )
+                .ok_or(TranslationError::AddressOverflow)
+        };
+        let image_pa = guest_pa_for(image_ipa)?;
+        let dtb_pa = guest_pa_for(dtb_ipa)?;
+
+        // The U-Boot source contains only initialized bytes. The Image header's
+        // extent includes the zero-initialized tail expected by the kernel.
+        unsafe {
+            core::ptr::copy_nonoverlapping(image.as_ptr(), image_pa as *mut u8, image.len());
+            core::ptr::write_bytes(
+                (image_pa + image.len() as u64) as *mut u8,
+                0,
+                image_extent as usize - image.len(),
+            );
+        }
+
+        let guest_mem_regions = [guest_fdt::GuestMemoryRegion {
+            base: GUEST_RAM.start(),
+            size: GUEST_RAM.size(),
+        }];
+        let dtb_slice =
+            unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_capacity as usize) };
+        let dtb_real_size = guest_fdt::build_guest_dtb(
+            dtb_slice,
+            &guest_fdt::GuestFdtConfig {
+                memory_regions: &guest_mem_regions,
+                bootargs: Some(
+                    "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8",
+                ),
+                pl011: Some(guest_fdt::GuestPl011 {
+                    base: GUEST_PL011.start(),
+                    size: GUEST_PL011.size(),
+                    clock_hz: GUEST_PL011_CLOCK_HZ,
+                    interrupt: VIRTUAL_PL011_IRQ,
+                }),
+                gicv2: Some(guest_fdt::GuestGicV2 {
+                    distributor_base: GUEST_GICD.start(),
+                    distributor_size: GUEST_GICD.size(),
+                    cpu_interface_base: gicv_mapping.device_ipa,
+                    cpu_interface_size: gicv_mapping.device.size(),
+                }),
+            },
+        )
+        .map_err(|_| TranslationError::Unexpected)?;
+
+        unsafe {
+            guest::clean_dcache_poc(image_pa as usize, (image_pa + image_extent) as usize);
+            guest::clean_dcache_poc(dtb_pa as usize, (dtb_pa + dtb_real_size as u64) as usize);
+            guest::invalidate_icache_all();
+        }
+
+        self.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+            .map_err(|_| TranslationError::Unexpected)?;
+        self.map(
+            VmMemUsage::GuestRam,
+            Stage2MemoryType::NormalWbWa,
+            Stage2Access::ReadWrite,
+            Stage2Exec::Executable,
+        )?;
+        self.map_external_device(
+            IpaAddr::new(guest_platform::GUEST_GICV.start()),
+            gicv_mapping.mapped_pa,
+            gicv_mapping.mapping_size,
+        )?;
+
+        let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
+        let stage2_root_pa = self.page_table_root().unwrap().value();
+        let stage2_regs = stage2_register_values(self.vm_id(), stage2_root_pa, pa_range)?;
+        unsafe { guest::activate_stage2(&stage2_regs) };
+
+        let registers = layout.initial_registers();
+        let vcpu_id = self.add_vcpu(Vcpu::new_linux(registers.pc, registers.x0));
+        let vcpu = self
+            .vcpu_mut(vcpu_id)
+            .expect("new Linux vCPU must be present");
+        println!(
+            "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
+            vcpu.context().elr_el2,
+            vcpu.context().x[0]
+        );
+
+        let mut mmio_dispatcher = mmio::MmioDispatcher::default();
+        let vector = guest::run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
+
+        Err(GuestRunError::Exited {
+            vector,
+            esr_el2: vcpu.exit().esr_el2,
+            reason: vcpu.exit().decode_reason(vcpu.context()),
+        })
     }
 }
 
