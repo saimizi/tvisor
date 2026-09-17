@@ -239,7 +239,6 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
                 // EOImodeNS is set: this only drops priority. The physical
                 // PPI remains active until the guest GICV_EOIR completes LR0.
                 unsafe { gic.end_interrupt(irq) };
-                println!("  EL2 queued virtual timer PPI {} in GICH LR0", irq);
                 continue;
             }
             if irq == host_console_irq {

@@ -267,7 +267,6 @@ const GICC_CTLR_ENABLE_GRP1_NS: u32 = 1 << 0;
 const GICC_CTLR_EOIMODE_NS: u32 = 1 << 9;
 const GICH_HCR_ENABLE: u32 = 1;
 const GICH_LR_HW: u32 = 1 << 31;
-const GICH_LR_GROUP1: u32 = 1 << 30;
 const GICH_LR_PENDING: u32 = 0b01 << 28;
 const GICH_LR_STATE_MASK: u32 = 0b11 << 28;
 const GICH_LR_PRIORITY_SHIFT: u32 = 23;
@@ -314,7 +313,6 @@ pub fn queue_timer_ppi(state: &mut VirtualGicV2State, ppi: u32) -> Result<(), ()
         return Err(());
     }
     state.timer_lr = GICH_LR_HW
-        | GICH_LR_GROUP1
         | GICH_LR_PENDING
         | lr_priority(0x80)
         | (ppi << GICH_LR_PHYSICAL_ID_SHIFT)
@@ -322,13 +320,15 @@ pub fn queue_timer_ppi(state: &mut VirtualGicV2State, ppi: u32) -> Result<(), ()
     Ok(())
 }
 
-/// Queues a software-originated Group 1 SPI in LR1. Unlike the timer LR, it
-/// has no physical interrupt to deactivate when the guest EOIs it.
+/// Queues a software-originated SPI in LR1. The guest's non-secure GICv2
+/// CPU-interface initialization enables virtual Group 0 (VMCR.VENG0), so the
+/// LR group bit must remain clear. Unlike the timer LR, it has no physical
+/// interrupt to deactivate when the guest EOIs it.
 pub fn queue_uart_spi(state: &mut VirtualGicV2State, spi: u32) -> Result<(), ()> {
     if state.uart_in_flight() || spi > GICH_LR_INTID_MASK {
         return Err(());
     }
-    state.uart_lr = GICH_LR_GROUP1 | GICH_LR_PENDING | lr_priority(0x80) | spi;
+    state.uart_lr = GICH_LR_PENDING | lr_priority(0x80) | spi;
     Ok(())
 }
 
