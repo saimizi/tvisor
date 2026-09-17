@@ -769,10 +769,12 @@ impl VmCtl {
         self.vm_mem.clear();
     }
 
-    pub fn run(&mut self) -> Result<(), GuestRunError> {
-        let source = guest::linux_image_source().ok_or(TranslationError::Unexpected)?;
+    pub fn run_linux_vm(&mut self, linux_image: PhysRegion) -> Result<(), GuestRunError> {
         let image = unsafe {
-            core::slice::from_raw_parts(source.start().value() as *const u8, source.size() as usize)
+            core::slice::from_raw_parts(
+                linux_image.start().value() as *const u8,
+                linux_image.size() as usize,
+            )
         };
 
         let layout = linux_boot::LinuxBootLayout::default_for_image(image, None)
@@ -781,8 +783,8 @@ impl VmCtl {
         let (dtb_ipa, dtb_capacity) = layout.dtb();
 
         println!(
-            "Phase 10: loading Linux Image: source={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
-            source,
+            "Phase 10: loading Linux Image: linux_image={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
+            linux_image,
             image.len(),
             image_ipa,
             image_extent,

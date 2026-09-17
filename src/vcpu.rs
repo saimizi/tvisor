@@ -1,6 +1,9 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
+use alloc::format;
+use alloc::string::String;
 use core::arch::global_asm;
+use core::fmt::Display;
 use tvisor_util::gicv2::VirtualGicV2State;
 use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
 use tvisor_util::virtual_timer::VirtualTimerState;
@@ -130,6 +133,31 @@ pub enum VcpuExitReason {
     SysRegTrap,
     FpSimdTrap,
     Unknown { ec: u8, iss: u32 },
+}
+
+impl Display for VcpuExitReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let msg = match self {
+            VcpuExitReason::Hvc { imm, arg0 } => format!("Hvc{{imm:{}, arg0:{}}}", imm, arg0),
+            VcpuExitReason::Stage2DataAbort {
+                ipa,
+                is_write,
+                dfsc,
+            } => format!(
+                "Stage2DataAbort{{ipa:{:x}, is_write:{:?}, dfsc:{}}}",
+                ipa, is_write, dfsc
+            ),
+            VcpuExitReason::Stage2InstructionAbort { ipa, ifsc } => {
+                format!("Stage2InstructionAbort{{ipa:{:x}, ifsc:{}}}", ipa, ifsc)
+            }
+            VcpuExitReason::SmcTrap => String::from("SmcTrap"),
+            VcpuExitReason::SysRegTrap => String::from("SysRegTrap"),
+            VcpuExitReason::FpSimdTrap => String::from("FpSimdTrap"),
+            VcpuExitReason::Unknown { ec, iss } => format!("Unknown{{ec:{}, iss:{}}}", ec, iss),
+        };
+
+        write!(f, "{}", msg)
+    }
 }
 
 impl VcpuExit {

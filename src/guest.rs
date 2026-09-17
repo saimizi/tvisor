@@ -1,5 +1,7 @@
 //! Guest platform initialization, Stage-2 translation setup, and Linux launch.
 
+use alloc::format;
+use alloc::string::String;
 use core::fmt;
 use spin::Once;
 
@@ -206,6 +208,99 @@ unsafe fn deactivate_stage2() {
     }
 }
 
+fn handle_irq(
+    vcpu: &mut Vcpu,
+    gic: &gicv2::GicV2,
+    dispatcher: &mut MmioDispatcher,
+) -> Result<(), String> {
+    let irq = unsafe { gic.acknowledge() };
+    let mut result = Ok(());
+    'end: {
+        if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
+            vcpu.timer_mut().mark_pending_from_irq();
+            if gicv2::queue_timer_ppi(vcpu.gic_mut(), irq).is_err() {
+                result = Err(String::from("failed to queue timer ppi"));
+            }
+            vcpu.timer_mut().clear_pending_after_list_register();
+            unsafe { gic.end_interrupt(irq) };
+            break 'end;
+        }
+
+        if Some(&irq) == HOST_CONSOLE_IRQ.get() {
+            // Drain before EOI: the Mini UART RX source is level-triggered
+            // and would otherwise immediately reassert at the GIC.
+            while let Some(byte) = tvisor_util::debug_util::read_byte() {
+                let _ = dispatcher.enqueue_pl011_rx(byte);
+            }
+            unsafe { gic.end_interrupt(irq) };
+            unsafe { gic.deactivate_interrupt(irq) };
+            break 'end;
+        }
+
+        result = Err(format!("Unexpected IRQ {}", irq));
+        if irq != gicv2::SPURIOUS_IRQ {
+            unsafe { gic.end_interrupt(irq) };
+        }
+    }
+
+    result
+}
+
+fn handle_synchronous_exception(
+    vcpu: &mut Vcpu,
+    dispatcher: &mut MmioDispatcher,
+) -> Result<(), String> {
+    let mut result = Ok(());
+    'end: {
+        let reason = vcpu.exit().decode_reason(vcpu.context());
+        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
+            result = Err(format!("Unexpected exception:{}", reason));
+            break 'end;
+        };
+
+        let mut is_trapped_mmio = false;
+        let gicd_start = GUEST_GICD.start();
+        let Some(gicd_end) = GUEST_GICD.end() else {
+            result = Err(String::from("Invalid GICD range"));
+            break 'end;
+        };
+
+        if (gicd_start..gicd_end).contains(&ipa) {
+            is_trapped_mmio = true;
+        }
+
+        let pl011_start = GUEST_PL011.start();
+        let Some(pl011_end) = GUEST_PL011.end() else {
+            result = Err(String::from("Invalid PL011 REG range"));
+            break 'end;
+        };
+
+        if (pl011_start..pl011_end).contains(&ipa) {
+            is_trapped_mmio = true;
+        }
+
+        if !is_trapped_mmio {
+            result = Err(format!("Invalid IPA:{:x}", ipa));
+            break 'end;
+        }
+
+        let exit = *vcpu.exit();
+        let transmit = vcpu
+            .context_mut()
+            .emulate_stage2_mmio(&exit, dispatcher)
+            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
+        if let Some(byte) = transmit {
+            if tvisor_util::debug_util::write_byte(byte).is_err() {
+                result = Err(String::from(
+                    "Virtual PL011 transmit could not reach host console",
+                ));
+            }
+        }
+    }
+
+    result
+}
+
 /// Runs a vCPU until a non-emulated exit. Trapped virtual-device stage-2
 /// aborts are completed and resumed here, keeping host devices host-owned.
 pub fn run_vcpu_with_mmio(
@@ -213,9 +308,6 @@ pub fn run_vcpu_with_mmio(
     dispatcher: &mut MmioDispatcher,
     gic: &gicv2::GicV2,
 ) -> u64 {
-    let host_console_irq = *HOST_CONSOLE_IRQ
-        .get()
-        .expect("host console IRQ must be configured before running a guest");
     loop {
         // An RX IRQ drains the host-owned Mini UART into this FIFO. Recheck
         // the virtual interrupt after every EL2 exit, because Linux can
@@ -229,60 +321,28 @@ pub fn run_vcpu_with_mmio(
         unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
         let vector = unsafe { __vcpu_run(vcpu) };
         unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
+        // IRQ
         if vector == 9 {
-            let irq = unsafe { gic.acknowledge() };
-            if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
-                vcpu.timer_mut().mark_pending_from_irq();
-                gicv2::queue_timer_ppi(vcpu.gic_mut(), irq)
-                    .expect("physical timer PPI arrived while its virtual LR remained active");
-                vcpu.timer_mut().clear_pending_after_list_register();
-                // EOImodeNS is set: this only drops priority. The physical
-                // PPI remains active until the guest GICV_EOIR completes LR0.
-                unsafe { gic.end_interrupt(irq) };
+            if let Err(err) = handle_irq(vcpu, gic, dispatcher) {
+                println!("{}", err);
+                return vector;
+            } else {
                 continue;
             }
-            if irq == host_console_irq {
-                // Drain before EOI: the Mini UART RX source is level-triggered
-                // and would otherwise immediately reassert at the GIC.
-                while let Some(byte) = tvisor_util::debug_util::read_byte() {
-                    let _ = dispatcher.enqueue_pl011_rx(byte);
-                }
-                unsafe { gic.end_interrupt(irq) };
-                unsafe { gic.deactivate_interrupt(irq) };
+        }
+
+        // Synchronous Exception
+        if vector == 8 {
+            if let Err(err) = handle_synchronous_exception(vcpu, dispatcher) {
+                println!("{}", err);
+                return vector;
+            } else {
                 continue;
             }
-            if irq != gicv2::SPURIOUS_IRQ {
-                unsafe { gic.end_interrupt(irq) };
-            }
-            println!("Unexpected physical IRQ {} while guest ran", irq);
-            return vector;
-        }
-        if vector != 8 {
-            return vector;
         }
 
-        let reason = vcpu.exit().decode_reason(vcpu.context());
-        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
-            return vector;
-        };
-        let is_trapped_mmio = (GUEST_GICD.start()
-            ..GUEST_GICD.end().expect("validated guest platform"))
-            .contains(&ipa)
-            || (GUEST_PL011.start()..GUEST_PL011.end().expect("validated guest platform"))
-                .contains(&ipa);
-        if !is_trapped_mmio {
-            return vector;
-        }
-
-        let exit = *vcpu.exit();
-        let transmit = vcpu
-            .context_mut()
-            .emulate_stage2_mmio(&exit, dispatcher)
-            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
-        if let Some(byte) = transmit {
-            tvisor_util::debug_util::write_byte(byte)
-                .unwrap_or_else(|_| panic!("Virtual PL011 transmit could not reach host console"));
-        }
+        println!("Unexpected VM exit reason: {}", vector);
+        return vector;
     }
 }
 
@@ -290,9 +350,8 @@ pub fn run_guest() -> Result<(), GuestRunError> {
     println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
     let mut vm_ctl = VmCtl::new(1);
-    let ret = vm_ctl.run();
+    let ret = vm_ctl.run_linux_vm(linux_image_source().ok_or(TranslationError::Unexpected)?);
 
-    // Disable stage2 after all guest VMs are released.
     unsafe {
         deactivate_stage2();
     }
