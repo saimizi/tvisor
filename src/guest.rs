@@ -217,11 +217,18 @@ fn handle_irq(
     let mut result = Ok(());
     'end: {
         if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
-            vcpu.timer_mut().mark_pending_from_irq();
+            // The timer LR is hardware-backed (HW=1). After EL2 drops the physical interrupt
+            // priority with GICC_EOIR, completion of the virtual interrupt by the guest causes the
+            // GIC virtualization hardware to deactivate the associated physical PPI. Therefore
+            // tvisor must not call GICC_DIR for the successful timer path.
             if gicv2::queue_timer_ppi(vcpu.gic_mut(), irq).is_err() {
-                result = Err(String::from("failed to queue timer ppi"));
+                // A HW-backed timer LR is already in flight. Do not enqueue a duplicate virtual
+                // timer interrupt. Drop the physical interrupt priority and let the guest complete
+                // the existing LR through GICV_EOIR/GICV_DIR, which also completes the associated
+                // PPI.
+                println!("Warning: queue_timer_ppi fails");
             }
-            vcpu.timer_mut().clear_pending_after_list_register();
+
             unsafe { gic.end_interrupt(irq) };
             break 'end;
         }

@@ -223,7 +223,7 @@ pub struct Vcpu {
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
 const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 896);
 const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 928);
-const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 960);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 952);
 const _: () = assert!(core::mem::size_of::<Vcpu>() == 976);
 
 impl Vcpu {
@@ -240,7 +240,6 @@ impl Vcpu {
                 cntvoff_el2: 0,
                 cntv_cval_el0: 0,
                 cntv_ctl_el0: 0,
-                pending_irq: 0,
             },
             gic: VirtualGicV2State {
                 vmcr: 0,
@@ -275,6 +274,7 @@ impl Vcpu {
         &self.exit
     }
 
+    #[allow(unused)]
     pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
         &mut self.timer
     }
