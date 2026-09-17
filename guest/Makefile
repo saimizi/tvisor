@@ -75,7 +75,7 @@ $(BUILD_DIR)/.config: Makefile $(KERNEL_DIR)/Makefile $(INITRAMFS_CPIO)
 	$(KERNEL_DIR)/scripts/config --file $(abspath $@) --set-str INITRAMFS_SOURCE "$(abspath $(INITRAMFS_CPIO))"
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) olddefconfig
 
-image: $(BUILD_DIR)/arch/arm64/boot/Image
+image: $(INITRAMFS_CPIO) $(BUILD_DIR)/arch/arm64/boot/Image
 
 $(BUILD_DIR)/arch/arm64/boot/Image: $(BUILD_DIR)/.config
 	$(MAKE) -C $(KERNEL_DIR) O=$(abspath $(BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) LLVM=$(LLVM) -j$(JOBS) Image
@@ -94,15 +94,7 @@ $(BUSYBOX_DIR)/Makefile: $(BUSYBOX_ARCHIVE)
 # required for this userspace build.
 $(BUSYBOX_BUILD_DIR)/.config: Makefile $(BUSYBOX_DIR)/Makefile
 	mkdir -p $(BUSYBOX_BUILD_DIR)
-	$(MAKE) -C $(BUSYBOX_DIR) O=$(abspath $(BUSYBOX_BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) allnoconfig
-	sed -i \
-		-e 's/^# CONFIG_BUSYBOX is not set/CONFIG_BUSYBOX=y/' \
-		-e 's/^# CONFIG_FEATURE_INSTALLER is not set/CONFIG_FEATURE_INSTALLER=y/' \
-		-e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
-		-e 's/^# CONFIG_MOUNT is not set/CONFIG_MOUNT=y/' \
-		-e 's/^# CONFIG_SH_IS_ASH is not set/CONFIG_SH_IS_ASH=y/' \
-		-e 's/^CONFIG_SH_IS_NONE=y/# CONFIG_SH_IS_NONE is not set/' \
-		-e 's/^# CONFIG_SHELL_ASH is not set/CONFIG_SHELL_ASH=y/' $(abspath $@)
+	cp busybox.config $(abspath $@)
 
 $(BUSYBOX_BUILD_DIR)/busybox: $(BUSYBOX_BUILD_DIR)/.config
 	$(MAKE) -C $(BUSYBOX_DIR) O=$(abspath $(BUSYBOX_BUILD_DIR)) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS)
