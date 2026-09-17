@@ -1,22 +1,16 @@
 //! Guest platform initialization, Stage-2 translation setup, and Linux launch.
 
+use alloc::format;
+use alloc::string::String;
 use core::fmt;
 use spin::Once;
 
 use crate::vmctl::*;
-use tvisor_util::aarch64_reg::{IdAa64Mmfr0El1, VmpidrEl2};
+use tvisor_util::aarch64_reg::VmpidrEl2;
 use tvisor_util::el2_translation::TranslationError;
-use tvisor_util::guest_fdt::{
-    GuestFdtConfig, GuestGicV2, GuestMemoryRegion, GuestPl011, build_guest_dtb,
-};
-use tvisor_util::guest_platform::{
-    self, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ, GUEST_RAM, VIRTUAL_PL011_IRQ,
-};
-use tvisor_util::linux_boot::LinuxBootLayout;
-use tvisor_util::stage2_translation::{
-    Stage2Access, Stage2Exec, Stage2MemoryType, Stage2RegisterValues, stage2_register_values,
-};
-use tvisor_util::{PAGE_SIZE, println};
+use tvisor_util::guest_platform::{GUEST_GICD, GUEST_PL011, VIRTUAL_PL011_IRQ};
+use tvisor_util::println;
+use tvisor_util::stage2_translation::Stage2RegisterValues;
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
@@ -87,8 +81,12 @@ pub fn set_host_console_irq(irq: u32) -> Result<(), ()> {
     Ok(())
 }
 
+pub fn get_host_console_irq() -> u32 {
+    *HOST_CONSOLE_IRQ.get().expect("HOST_CONSOLE_IRQ is not set")
+}
+
 #[inline]
-unsafe fn dcache_line_size() -> usize {
+pub unsafe fn dcache_line_size() -> usize {
     let ctr: u64;
     unsafe {
         core::arch::asm!(
@@ -102,7 +100,7 @@ unsafe fn dcache_line_size() -> usize {
 }
 
 #[inline]
-unsafe fn clean_dcache_poc(start: usize, end: usize) {
+pub unsafe fn clean_dcache_poc(start: usize, end: usize) {
     let line_size = unsafe { dcache_line_size() };
     let mut addr = start & !(line_size - 1);
     while addr < end {
@@ -121,7 +119,7 @@ unsafe fn clean_dcache_poc(start: usize, end: usize) {
 }
 
 #[inline]
-unsafe fn invalidate_icache_all() {
+pub unsafe fn invalidate_icache_all() {
     unsafe {
         core::arch::asm!(
             "ic ialluis",
@@ -137,7 +135,7 @@ unsafe fn invalidate_icache_all() {
 /// Ensures descriptor writes are published (`dsb ishst`), installs virtualization registers,
 /// invalidates prior guest TLB entries for VMID 1, and synchronizes context with `isb`.
 #[inline]
-unsafe fn activate_stage2(regs: &Stage2RegisterValues) {
+pub unsafe fn activate_stage2(regs: &Stage2RegisterValues) {
     unsafe {
         // 1. Ensure descriptor writes are visible to hardware table walkers
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
@@ -210,12 +208,113 @@ unsafe fn deactivate_stage2() {
     }
 }
 
+fn handle_irq(
+    vcpu: &mut Vcpu,
+    gic: &gicv2::GicV2,
+    dispatcher: &mut MmioDispatcher,
+) -> Result<(), String> {
+    let irq = unsafe { gic.acknowledge() };
+    let mut result = Ok(());
+    'end: {
+        if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
+            // The timer LR is hardware-backed (HW=1). After EL2 drops the physical interrupt
+            // priority with GICC_EOIR, completion of the virtual interrupt by the guest causes the
+            // GIC virtualization hardware to deactivate the associated physical PPI. Therefore
+            // tvisor must not call GICC_DIR for the successful timer path.
+            if gicv2::queue_timer_ppi(vcpu.gic_mut(), irq).is_err() {
+                // A HW-backed timer LR is already in flight. Do not enqueue a duplicate virtual
+                // timer interrupt. Drop the physical interrupt priority and let the guest complete
+                // the existing LR through GICV_EOIR/GICV_DIR, which also completes the associated
+                // PPI.
+                println!("Warning: queue_timer_ppi fails");
+            }
+
+            unsafe { gic.end_interrupt(irq) };
+            break 'end;
+        }
+
+        if Some(&irq) == HOST_CONSOLE_IRQ.get() {
+            // Drain before EOI: the Mini UART RX source is level-triggered
+            // and would otherwise immediately reassert at the GIC.
+            while let Some(byte) = tvisor_util::debug_util::read_byte() {
+                let _ = dispatcher.enqueue_pl011_rx(byte);
+            }
+            unsafe { gic.end_interrupt(irq) };
+            unsafe { gic.deactivate_interrupt(irq) };
+            break 'end;
+        }
+
+        result = Err(format!("Unexpected IRQ {}", irq));
+        if irq != gicv2::SPURIOUS_IRQ {
+            unsafe { gic.end_interrupt(irq) };
+        }
+    }
+
+    result
+}
+
+fn handle_synchronous_exception(
+    vcpu: &mut Vcpu,
+    dispatcher: &mut MmioDispatcher,
+) -> Result<(), String> {
+    let mut result = Ok(());
+    'end: {
+        let reason = vcpu.exit().decode_reason(vcpu.context());
+        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
+            result = Err(format!("Unexpected exception:{}", reason));
+            break 'end;
+        };
+
+        let mut is_trapped_mmio = false;
+        let gicd_start = GUEST_GICD.start();
+        let Some(gicd_end) = GUEST_GICD.end() else {
+            result = Err(String::from("Invalid GICD range"));
+            break 'end;
+        };
+
+        if (gicd_start..gicd_end).contains(&ipa) {
+            is_trapped_mmio = true;
+        }
+
+        let pl011_start = GUEST_PL011.start();
+        let Some(pl011_end) = GUEST_PL011.end() else {
+            result = Err(String::from("Invalid PL011 REG range"));
+            break 'end;
+        };
+
+        if (pl011_start..pl011_end).contains(&ipa) {
+            is_trapped_mmio = true;
+        }
+
+        if !is_trapped_mmio {
+            result = Err(format!("Invalid IPA:{:x}", ipa));
+            break 'end;
+        }
+
+        let exit = *vcpu.exit();
+        let transmit = vcpu
+            .context_mut()
+            .emulate_stage2_mmio(&exit, dispatcher)
+            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
+        if let Some(byte) = transmit {
+            if tvisor_util::debug_util::write_byte(byte).is_err() {
+                result = Err(String::from(
+                    "Virtual PL011 transmit could not reach host console",
+                ));
+            }
+        }
+    }
+
+    result
+}
+
 /// Runs a vCPU until a non-emulated exit. Trapped virtual-device stage-2
 /// aborts are completed and resumed here, keeping host devices host-owned.
-fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gicv2::GicV2) -> u64 {
-    let host_console_irq = *HOST_CONSOLE_IRQ
-        .get()
-        .expect("host console IRQ must be configured before running a guest");
+pub fn run_vcpu_with_mmio(
+    vcpu: &mut Vcpu,
+    dispatcher: &mut MmioDispatcher,
+    gic: &gicv2::GicV2,
+) -> u64 {
     loop {
         // An RX IRQ drains the host-owned Mini UART into this FIFO. Recheck
         // the virtual interrupt after every EL2 exit, because Linux can
@@ -229,233 +328,39 @@ fn run_vcpu_with_mmio(vcpu: &mut Vcpu, dispatcher: &mut MmioDispatcher, gic: &gi
         unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
         let vector = unsafe { __vcpu_run(vcpu) };
         unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
+        // IRQ
         if vector == 9 {
-            let irq = unsafe { gic.acknowledge() };
-            if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
-                vcpu.timer_mut().mark_pending_from_irq();
-                gicv2::queue_timer_ppi(vcpu.gic_mut(), irq)
-                    .expect("physical timer PPI arrived while its virtual LR remained active");
-                vcpu.timer_mut().clear_pending_after_list_register();
-                // EOImodeNS is set: this only drops priority. The physical
-                // PPI remains active until the guest GICV_EOIR completes LR0.
-                unsafe { gic.end_interrupt(irq) };
+            if let Err(err) = handle_irq(vcpu, gic, dispatcher) {
+                println!("{}", err);
+                return vector;
+            } else {
                 continue;
             }
-            if irq == host_console_irq {
-                // Drain before EOI: the Mini UART RX source is level-triggered
-                // and would otherwise immediately reassert at the GIC.
-                while let Some(byte) = tvisor_util::debug_util::read_byte() {
-                    let _ = dispatcher.enqueue_pl011_rx(byte);
-                }
-                unsafe { gic.end_interrupt(irq) };
-                unsafe { gic.deactivate_interrupt(irq) };
+        }
+
+        // Synchronous Exception
+        if vector == 8 {
+            if let Err(err) = handle_synchronous_exception(vcpu, dispatcher) {
+                println!("{}", err);
+                return vector;
+            } else {
                 continue;
             }
-            if irq != gicv2::SPURIOUS_IRQ {
-                unsafe { gic.end_interrupt(irq) };
-            }
-            println!("Unexpected physical IRQ {} while guest ran", irq);
-            return vector;
-        }
-        if vector != 8 {
-            return vector;
         }
 
-        let reason = vcpu.exit().decode_reason(vcpu.context());
-        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
-            return vector;
-        };
-        let is_trapped_mmio = (GUEST_GICD.start()
-            ..GUEST_GICD.end().expect("validated guest platform"))
-            .contains(&ipa)
-            || (GUEST_PL011.start()..GUEST_PL011.end().expect("validated guest platform"))
-                .contains(&ipa);
-        if !is_trapped_mmio {
-            return vector;
-        }
-
-        let exit = *vcpu.exit();
-        let transmit = vcpu
-            .context_mut()
-            .emulate_stage2_mmio(&exit, dispatcher)
-            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
-        if let Some(byte) = transmit {
-            tvisor_util::debug_util::write_byte(byte)
-                .unwrap_or_else(|_| panic!("Virtual PL011 transmit could not reach host console"));
-        }
+        println!("Unexpected VM exit reason: {}", vector);
+        return vector;
     }
-}
-
-fn run_linux_guest_inner(
-    vm_ctl: &mut VmCtl,
-    stage2_active: &mut bool,
-) -> Result<(), GuestRunError> {
-    let source = linux_image_source().ok_or(TranslationError::Unexpected)?;
-    let image = unsafe {
-        core::slice::from_raw_parts(source.start().value() as *const u8, source.size() as usize)
-    };
-    let layout = LinuxBootLayout::default_for_image(image, None)
-        .map_err(|_| TranslationError::Unexpected)?;
-    let (image_ipa, image_extent) = layout.image();
-    let (dtb_ipa, dtb_capacity) = layout.dtb();
-
-    println!(
-        "Phase 10: loading Linux Image: source={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
-        source,
-        image.len(),
-        image_ipa,
-        image_extent,
-        dtb_ipa,
-    );
-    let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
-    unsafe {
-        gic.enable_timer_ppi(VIRTUAL_TIMER_PPI);
-        gic.enable_spi(
-            *HOST_CONSOLE_IRQ
-                .get()
-                .expect("host console IRQ must be configured before guest setup"),
-        );
-    }
-    tvisor_util::debug_util::enable_rx_interrupt()
-        .expect("host Mini UART must be initialized before guest setup");
-    guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
-    let gicv_mapping =
-        guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())
-            .map_err(|_| TranslationError::Unexpected)?;
-
-    let guest_ram_pa = vm_ctl
-        .vm_mem_alloc(
-            VmMemUsage::GuestRam,
-            Some(IpaAddr::new(GUEST_RAM.start())),
-            GUEST_RAM.size() as usize,
-        )
-        .map_err(|_| TranslationError::Unexpected)?
-        .ok_or(TranslationError::Unexpected)?
-        .value();
-    let guest_pa_for = |ipa: u64| -> Result<u64, TranslationError> {
-        guest_ram_pa
-            .checked_add(
-                ipa.checked_sub(GUEST_RAM.start())
-                    .ok_or(TranslationError::Unexpected)?,
-            )
-            .ok_or(TranslationError::AddressOverflow)
-    };
-    let image_pa = guest_pa_for(image_ipa)?;
-    let dtb_pa = guest_pa_for(dtb_ipa)?;
-
-    // The U-Boot source contains only initialized bytes. The Image header's
-    // extent includes the zero-initialized tail expected by the kernel.
-    unsafe {
-        core::ptr::copy_nonoverlapping(image.as_ptr(), image_pa as *mut u8, image.len());
-        core::ptr::write_bytes(
-            (image_pa + image.len() as u64) as *mut u8,
-            0,
-            image_extent as usize - image.len(),
-        );
-    }
-
-    let guest_mem_regions = [GuestMemoryRegion {
-        base: GUEST_RAM.start(),
-        size: GUEST_RAM.size(),
-    }];
-    let dtb_slice =
-        unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_capacity as usize) };
-    let dtb_real_size = build_guest_dtb(
-        dtb_slice,
-        &GuestFdtConfig {
-            memory_regions: &guest_mem_regions,
-            bootargs: Some("console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"),
-            pl011: Some(GuestPl011 {
-                base: GUEST_PL011.start(),
-                size: GUEST_PL011.size(),
-                clock_hz: GUEST_PL011_CLOCK_HZ,
-                interrupt: VIRTUAL_PL011_IRQ,
-            }),
-            gicv2: Some(GuestGicV2 {
-                distributor_base: GUEST_GICD.start(),
-                distributor_size: GUEST_GICD.size(),
-                cpu_interface_base: gicv_mapping.device_ipa,
-                cpu_interface_size: gicv_mapping.device.size(),
-            }),
-        },
-    )
-    .map_err(|_| TranslationError::Unexpected)?;
-
-    unsafe {
-        clean_dcache_poc(image_pa as usize, (image_pa + image_extent) as usize);
-        clean_dcache_poc(dtb_pa as usize, (dtb_pa + dtb_real_size as u64) as usize);
-        invalidate_icache_all();
-    }
-
-    vm_ctl
-        .vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
-        .map_err(|_| TranslationError::Unexpected)?;
-    vm_ctl.map(
-        VmMemUsage::GuestRam,
-        Stage2MemoryType::NormalWbWa,
-        Stage2Access::ReadWrite,
-        Stage2Exec::Executable,
-    )?;
-    vm_ctl.map_external_device(
-        IpaAddr::new(GUEST_GICV.start()),
-        gicv_mapping.mapped_pa,
-        gicv_mapping.mapping_size,
-    )?;
-
-    let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
-    let stage2_root_pa = vm_ctl.page_table_root().unwrap().value();
-    let stage2_regs = stage2_register_values(vm_ctl.vm_id(), stage2_root_pa, pa_range)?;
-    unsafe { activate_stage2(&stage2_regs) };
-    *stage2_active = true;
-
-    let registers = layout.initial_registers();
-    let vcpu_id = vm_ctl.add_vcpu(Vcpu::new_linux(registers.pc, registers.x0));
-    let vcpu = vm_ctl
-        .vcpu_mut(vcpu_id)
-        .expect("new Linux vCPU must be present");
-    println!(
-        "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
-        vcpu.context().elr_el2,
-        vcpu.context().x[0]
-    );
-
-    let mut mmio_dispatcher = MmioDispatcher::default();
-    let vector = run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
-    Err(GuestRunError::Exited {
-        vector,
-        esr_el2: vcpu.exit().esr_el2,
-        reason: vcpu.exit().decode_reason(vcpu.context()),
-    })
 }
 
 pub fn run_guest() -> Result<(), GuestRunError> {
     println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
-
     let mut vm_ctl = VmCtl::new(1);
-    let mut stage2_active = false;
+    let ret = vm_ctl.run_linux_vm(linux_image_source().ok_or(TranslationError::Unexpected)?);
 
-    {
-        struct Stage2DeactivationGuard<'a> {
-            active: &'a mut bool,
-        }
-
-        impl Drop for Stage2DeactivationGuard<'_> {
-            fn drop(&mut self) {
-                if *self.active {
-                    unsafe {
-                        deactivate_stage2();
-                    }
-                    *self.active = false;
-                }
-            }
-        }
-
-        let guard = Stage2DeactivationGuard {
-            active: &mut stage2_active,
-        };
-
-        run_linux_guest_inner(&mut vm_ctl, &mut *guard.active)?;
+    unsafe {
+        deactivate_stage2();
     }
 
     vm_ctl.release_all();
@@ -466,9 +371,5 @@ pub fn run_guest() -> Result<(), GuestRunError> {
         "All guest and stage-2 table pages must be fully released upon teardown"
     );
 
-    println!("============================================================");
-    println!("Phase 10 Linux guest returned cleanly");
-    println!("============================================================");
-
-    Ok(())
+    ret
 }

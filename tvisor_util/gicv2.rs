@@ -312,11 +312,8 @@ pub fn queue_timer_ppi(state: &mut VirtualGicV2State, ppi: u32) -> Result<(), ()
     if state.timer_in_flight() || ppi > GICH_LR_INTID_MASK {
         return Err(());
     }
-    state.timer_lr = GICH_LR_HW
-        | GICH_LR_PENDING
-        | lr_priority(0x80)
-        | (ppi << GICH_LR_PHYSICAL_ID_SHIFT)
-        | ppi;
+    state.timer_lr =
+        GICH_LR_HW | GICH_LR_PENDING | lr_priority(0x80) | (ppi << GICH_LR_PHYSICAL_ID_SHIFT) | ppi;
     Ok(())
 }
 

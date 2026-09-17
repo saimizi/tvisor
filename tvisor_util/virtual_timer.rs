@@ -13,32 +13,6 @@ pub struct VirtualTimerState {
     pub cntvoff_el2: u64,
     pub cntv_cval_el0: u64,
     pub cntv_ctl_el0: u64,
-    pub pending_irq: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<VirtualTimerState>() == 32);
-
-impl VirtualTimerState {
-    /// Records an expiration reported by the architectural timer IRQ.
-    pub fn mark_pending_from_irq(&mut self) {
-        self.pending_irq = 1;
-    }
-
-    pub fn clear_pending_after_list_register(&mut self) {
-        self.pending_irq = 0;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn timer_irq_marks_pending() {
-        let mut timer = VirtualTimerState::default();
-        timer.mark_pending_from_irq();
-        assert_eq!(timer.pending_irq, 1);
-        timer.clear_pending_after_list_register();
-        assert_eq!(timer.pending_irq, 0);
-    }
-}
+const _: () = assert!(core::mem::size_of::<VirtualTimerState>() == 24);
