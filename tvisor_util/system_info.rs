@@ -334,6 +334,8 @@ impl ConsoleKind {
 pub struct ConsoleInfo {
     pub kind: ConsoleKind,
     pub registers: PhysRegion,
+    /// Physical GIC interrupt asserted when input arrives at the host console.
+    pub irq: u32,
 }
 
 impl From<Fdt<'_>> for PhysRegion {
@@ -397,6 +399,10 @@ mod tests {
         assert_eq!(
             PhysRegion::new_aligned(PhysAddr::new(0x1fff), 2, 0x1000).unwrap(),
             region(0x1000, 0x2000)
+        );
+        assert_eq!(
+            PhysRegion::new_aligned(PhysAddr::new(0x3100), 0x100, 0x1000).unwrap(),
+            region(0x3000, 0x1000)
         );
     }
 

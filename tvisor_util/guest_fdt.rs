@@ -4,11 +4,12 @@
 //! it into the caller-provided guest-memory buffer. Building the intermediate
 //! tree requires the global Rust heap to have been initialized.
 //!
-//! Generates a minimal, valid Devicetree Blob describing:
+//! Generates a valid Devicetree Blob describing the initial virtual platform:
 //! - `/` (root node with `#address-cells = <2>`, `#size-cells = <2>`)
-//! - `/chosen` (optional `bootargs`)
+//! - `/chosen` (`stdout-path` and optional `bootargs`)
 //! - `/cpus/cpu@0` (compatible `"arm,cortex-a72"`, `reg = <0>`)
 //! - `/memory@<base>` (memory regions covering exact mapped guest RAM)
+//! - an optional fixed-clock and emulated PL011 early console
 
 use alloc::{format, vec::Vec};
 use core::fmt;
@@ -40,12 +41,35 @@ pub struct GuestMemoryRegion {
     pub size: u64,
 }
 
+/// The guest-visible, trapped PL011 used for Linux earlycon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPl011 {
+    pub base: u64,
+    pub size: u64,
+    pub clock_hz: u32,
+    pub interrupt: u32,
+}
+
+const GIC_PHANDLE: u32 = 2;
+const GIC_SPI_BASE: u32 = 32;
+
+/// Guest-visible GICv2 distributor and CPU interface regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestGicV2 {
+    pub distributor_base: u64,
+    pub distributor_size: u64,
+    pub cpu_interface_base: u64,
+    pub cpu_interface_size: u64,
+}
+
 pub const MAX_GUEST_MEMORY_REGIONS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestFdtConfig<'a> {
     pub memory_regions: &'a [GuestMemoryRegion],
     pub bootargs: Option<&'a str>,
+    pub pl011: Option<GuestPl011>,
+    pub gicv2: Option<GuestGicV2>,
 }
 
 fn property(name: &str, value: impl Into<Vec<u8>>) -> DeviceTreeProperty {
@@ -86,6 +110,35 @@ fn validate_config(config: &GuestFdtConfig<'_>) -> Result<(), GuestFdtError> {
         }
     }
 
+    if let Some(pl011) = config.pl011 {
+        if pl011.size == 0
+            || pl011.base & 0xfff != 0
+            || pl011.size & 0xfff != 0
+            || pl011.base.checked_add(pl011.size).is_none()
+            || pl011.clock_hz == 0
+            || (config.gicv2.is_some() && pl011.interrupt < GIC_SPI_BASE)
+        {
+            return Err(GuestFdtError::InvalidConfiguration);
+        }
+    }
+    if let Some(gic) = config.gicv2 {
+        if gic.distributor_size == 0
+            || gic.cpu_interface_size == 0
+            || gic.distributor_base & 0xfff != 0
+            || gic.cpu_interface_base & 0xfff != 0
+            || gic
+                .distributor_base
+                .checked_add(gic.distributor_size)
+                .is_none()
+            || gic
+                .cpu_interface_base
+                .checked_add(gic.cpu_interface_size)
+                .is_none()
+        {
+            return Err(GuestFdtError::InvalidConfiguration);
+        }
+    }
+
     // Preserve the limit enforced by the former fixed-size serializer.
     if config
         .bootargs
@@ -111,6 +164,12 @@ fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
     ));
 
     let mut chosen = DeviceTreeNode::new_unchecked("chosen");
+    if let Some(pl011) = config.pl011 {
+        chosen.add_property(property(
+            "stdout-path",
+            string_value(&format!("serial@{:x}", pl011.base)),
+        ));
+    }
     if let Some(bootargs) = config.bootargs {
         chosen.add_property(property("bootargs", string_value(bootargs)));
     }
@@ -138,6 +197,88 @@ fn build_tree(config: &GuestFdtConfig<'_>) -> DeviceTree {
     }
     memory.add_property(property("reg", reg));
     tree.root.add_child(memory);
+
+    if let Some(gic) = config.gicv2 {
+        let mut node = DeviceTreeNode::new_unchecked(format!("intc@{:x}", gic.distributor_base));
+        node.add_property(property("compatible", string_value("arm,cortex-a15-gic")));
+        node.add_property(property("#interrupt-cells", 3_u32.to_be_bytes().to_vec()));
+        node.add_property(property("interrupt-controller", Vec::new()));
+        node.add_property(property("phandle", GIC_PHANDLE.to_be_bytes().to_vec()));
+        let mut reg = Vec::with_capacity(32);
+        for (base, size) in [
+            (gic.distributor_base, gic.distributor_size),
+            (gic.cpu_interface_base, gic.cpu_interface_size),
+        ] {
+            reg.extend_from_slice(&base.to_be_bytes());
+            reg.extend_from_slice(&size.to_be_bytes());
+        }
+        node.add_property(property("reg", reg));
+        tree.root.add_child(node);
+
+        let mut timer = DeviceTreeNode::new_unchecked("timer");
+        timer.add_property(property("compatible", string_value("arm,armv8-timer")));
+        timer.add_property(property(
+            "interrupt-parent",
+            GIC_PHANDLE.to_be_bytes().to_vec(),
+        ));
+        let mut interrupts = Vec::with_capacity(48);
+        for ppi in [13_u32, 14, 11, 10] {
+            interrupts.extend_from_slice(&1_u32.to_be_bytes());
+            interrupts.extend_from_slice(&ppi.to_be_bytes());
+            interrupts.extend_from_slice(&4_u32.to_be_bytes());
+        }
+        timer.add_property(property("interrupts", interrupts));
+        tree.root.add_child(timer);
+    }
+
+    if let Some(pl011) = config.pl011 {
+        const PL011_CLOCK_PHANDLE: u32 = 1;
+
+        let mut clock = DeviceTreeNode::new_unchecked("clk24mhz");
+        clock.add_property(property("compatible", string_value("fixed-clock")));
+        clock.add_property(property("#clock-cells", 0_u32.to_be_bytes().to_vec()));
+        clock.add_property(property(
+            "clock-frequency",
+            pl011.clock_hz.to_be_bytes().to_vec(),
+        ));
+        clock.add_property(property(
+            "phandle",
+            PL011_CLOCK_PHANDLE.to_be_bytes().to_vec(),
+        ));
+        tree.root.add_child(clock);
+
+        let mut uart = DeviceTreeNode::new_unchecked(format!("serial@{:x}", pl011.base));
+        uart.add_property(property(
+            "compatible",
+            string_list_value(&["arm,pl011", "arm,primecell"]),
+        ));
+        let mut uart_reg = Vec::with_capacity(16);
+        uart_reg.extend_from_slice(&pl011.base.to_be_bytes());
+        uart_reg.extend_from_slice(&pl011.size.to_be_bytes());
+        uart.add_property(property("reg", uart_reg));
+        let mut clocks = Vec::with_capacity(8);
+        clocks.extend_from_slice(&PL011_CLOCK_PHANDLE.to_be_bytes());
+        clocks.extend_from_slice(&PL011_CLOCK_PHANDLE.to_be_bytes());
+        uart.add_property(property("clocks", clocks));
+        uart.add_property(property(
+            "clock-names",
+            string_list_value(&["uartclk", "apb_pclk"]),
+        ));
+        if config.gicv2.is_some() {
+            uart.add_property(property(
+                "interrupt-parent",
+                GIC_PHANDLE.to_be_bytes().to_vec(),
+            ));
+            let mut interrupts = Vec::with_capacity(12);
+            // GICv2 SPI with level-high polarity.
+            interrupts.extend_from_slice(&0_u32.to_be_bytes());
+            interrupts.extend_from_slice(&(pl011.interrupt - GIC_SPI_BASE).to_be_bytes());
+            interrupts.extend_from_slice(&4_u32.to_be_bytes());
+            uart.add_property(property("interrupts", interrupts));
+        }
+        uart.add_property(property("status", string_value("okay")));
+        tree.root.add_child(uart);
+    }
 
     tree
 }
@@ -188,6 +329,8 @@ mod tests {
         let config = GuestFdtConfig {
             memory_regions: &mem_regions,
             bootargs: None,
+            pl011: None,
+            gicv2: None,
         };
 
         let size = build_guest_dtb(&mut buf, &config).expect("build guest dtb");
@@ -262,6 +405,8 @@ mod tests {
         let config = GuestFdtConfig {
             memory_regions: &mem_regions,
             bootargs: Some("console=hvc0"),
+            pl011: None,
+            gicv2: None,
         };
 
         let size = build_guest_dtb(&mut buf, &config).expect("build guest dtb");
@@ -279,6 +424,100 @@ mod tests {
     }
 
     #[test]
+    fn describes_the_pl011_early_console_and_fixed_clock() {
+        let mut buf = [0_u8; 2048];
+        let mem_regions = [GuestMemoryRegion {
+            base: 0x4000_0000,
+            size: 0x0020_0000,
+        }];
+        let config = GuestFdtConfig {
+            memory_regions: &mem_regions,
+            bootargs: Some("console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"),
+            pl011: Some(GuestPl011 {
+                base: 0x0900_0000,
+                size: 0x1000,
+                clock_hz: 24_000_000,
+                interrupt: 33,
+            }),
+            gicv2: Some(GuestGicV2 {
+                distributor_base: 0x0800_0000,
+                distributor_size: 0x1_0000,
+                cpu_interface_base: 0x0801_0000,
+                cpu_interface_size: 0x2_000,
+            }),
+        };
+
+        let size = build_guest_dtb(&mut buf, &config).unwrap();
+        let fdt = Fdt::new(&buf[..size]).unwrap();
+        let root = fdt.root();
+        assert_eq!(
+            root.child("chosen")
+                .unwrap()
+                .property("stdout-path")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "serial@9000000"
+        );
+        assert_eq!(
+            root.child("chosen")
+                .unwrap()
+                .property("bootargs")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8"
+        );
+        let uart = root.child("serial@9000000").unwrap();
+        assert_eq!(
+            uart.property("compatible").unwrap().value(),
+            b"arm,pl011\0arm,primecell\0"
+        );
+        assert_eq!(
+            u64::from_be_bytes(
+                uart.property("reg").unwrap().value()[0..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x0900_0000
+        );
+        assert_eq!(
+            u64::from_be_bytes(
+                uart.property("reg").unwrap().value()[8..16]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x1000
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                root.child("clk24mhz")
+                    .unwrap()
+                    .property("clock-frequency")
+                    .unwrap()
+                    .value()
+                    .try_into()
+                    .unwrap()
+            ),
+            24_000_000
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                uart.property("interrupt-parent")
+                    .unwrap()
+                    .value()
+                    .try_into()
+                    .unwrap()
+            ),
+            GIC_PHANDLE
+        );
+        assert_eq!(
+            uart.property("interrupts").unwrap().value(),
+            &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_ram_config() {
         let mut buf = [0_u8; 1024];
         let invalid_regions = [GuestMemoryRegion {
@@ -288,6 +527,8 @@ mod tests {
         let config = GuestFdtConfig {
             memory_regions: &invalid_regions,
             bootargs: None,
+            pl011: None,
+            gicv2: None,
         };
         assert_eq!(
             build_guest_dtb(&mut buf, &config),
@@ -298,6 +539,8 @@ mod tests {
         let config_empty = GuestFdtConfig {
             memory_regions: &empty_regions,
             bootargs: None,
+            pl011: None,
+            gicv2: None,
         };
         assert_eq!(
             build_guest_dtb(&mut buf, &config_empty),
@@ -315,6 +558,8 @@ mod tests {
         let config = GuestFdtConfig {
             memory_regions: &mem_regions,
             bootargs: None,
+            pl011: None,
+            gicv2: None,
         };
         assert_eq!(
             build_guest_dtb(&mut buf, &config),

@@ -1,6 +1,28 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
 use core::arch::global_asm;
+use tvisor_util::gicv2::VirtualGicV2State;
+use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
+use tvisor_util::virtual_timer::VirtualTimerState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcpuMmioError {
+    Decode(MmioDecodeError),
+    Emulation(MmioEmulationError),
+    ProgramCounterOverflow,
+}
+
+impl core::fmt::Display for VcpuMmioError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(f, "cannot decode trapped MMIO: {error}"),
+            Self::Emulation(error) => write!(f, "cannot emulate trapped MMIO: {error}"),
+            Self::ProgramCounterOverflow => {
+                f.write_str("cannot advance guest PC after MMIO emulation")
+            }
+        }
+    }
+}
 
 #[repr(C, align(16))]
 #[derive(Debug, Clone)]
@@ -23,10 +45,18 @@ pub struct VcpuContext {
     pub mair_el1: u64,
     pub vbar_el1: u64,
     pub contextidr_el1: u64,
-    _pad: [u64; 1],
+    /// Linux current-task pointer, preserved across EL2 exits.
+    pub tpidr_el1: u64,
+    /// EL0 read-only thread pointer, preserved for later userspace support.
+    pub tpidrro_el0: u64,
+    /// Guest FP/Advanced-SIMD registers q0 through q31.
+    pub q: [u128; 32],
+    /// Guest FP control and status registers.
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<VcpuContext>() == 352);
+const _: () = assert!(core::mem::size_of::<VcpuContext>() == 896);
 const _: () = assert!(core::mem::align_of::<VcpuContext>() == 16);
 
 impl VcpuContext {
@@ -46,10 +76,36 @@ impl VcpuContext {
             mair_el1: 0,
             vbar_el1: 0,
             contextidr_el1: 0,
-            _pad: [0; 1],
+            tpidr_el1: 0,
+            tpidrro_el0: 0,
+            q: [0; 32],
+            fpcr: 0,
+            fpsr: 0,
         };
         ctx.x[0] = 0; // x0 argument (e.g. DTB IPA when booting real guest)
         ctx
+    }
+
+    /// Emulates a successfully decoded stage-2 MMIO abort. The guest PC is
+    /// advanced only after the device has completed the access and any read
+    /// result is safely present in the target guest register.
+    pub fn emulate_stage2_mmio(
+        &mut self,
+        exit: &VcpuExit,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<Option<u8>, VcpuMmioError> {
+        let access = MmioAccess::decode_data_abort(exit.esr_el2, exit.fault_ipa())
+            .map_err(VcpuMmioError::Decode)?;
+        let transmit = dispatcher
+            .emulate(access, &mut self.x)
+            .map_err(VcpuMmioError::Emulation)?;
+        // In case of instruction trap, elr_el2 stores the address where the trap exactly happened.
+        // advance it to avoid re-entering;
+        self.elr_el2 = self
+            .elr_el2
+            .checked_add(4)
+            .ok_or(VcpuMmioError::ProgramCounterOverflow)?;
+        Ok(transmit)
     }
 }
 
@@ -132,10 +188,15 @@ impl VcpuExit {
 pub struct Vcpu {
     context: VcpuContext,
     exit: VcpuExit,
+    timer: VirtualTimerState,
+    gic: VirtualGicV2State,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
-const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 352);
+const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 896);
+const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 928);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 960);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 976);
 
 impl Vcpu {
     pub const fn new(entry_pc: u64, sp_el1: u64) -> Self {
@@ -147,7 +208,31 @@ impl Vcpu {
                 far_el2: 0,
                 hpfar_el2: 0,
             },
+            timer: VirtualTimerState {
+                cntvoff_el2: 0,
+                cntv_cval_el0: 0,
+                cntv_ctl_el0: 0,
+                pending_irq: 0,
+            },
+            gic: VirtualGicV2State {
+                vmcr: 0,
+                timer_lr: 0,
+                uart_lr: 0,
+            },
         }
+    }
+
+    /// Constructs the initial EL1 state required by the standard arm64 Linux
+    /// boot ABI. Linux establishes its own stack and translation regime after
+    /// entry, so no Phase-9 test stack or HVC protocol is carried into it.
+    #[allow(dead_code)] // Used by the Phase 10 Linux image-loader path.
+    pub const fn new_linux(entry_pc: u64, dtb_ipa: u64) -> Self {
+        let mut vcpu = Self::new(entry_pc, 0);
+        vcpu.context.x[0] = dtb_ipa;
+        vcpu.context.x[1] = 0;
+        vcpu.context.x[2] = 0;
+        vcpu.context.x[3] = 0;
+        vcpu
     }
 
     pub fn context(&self) -> &VcpuContext {
@@ -160,6 +245,18 @@ impl Vcpu {
 
     pub fn exit(&self) -> &VcpuExit {
         &self.exit
+    }
+
+    pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
+        &mut self.timer
+    }
+
+    pub fn gic(&self) -> &VirtualGicV2State {
+        &self.gic
+    }
+
+    pub fn gic_mut(&mut self) -> &mut VirtualGicV2State {
+        &mut self.gic
     }
 }
 
@@ -210,6 +307,30 @@ __vcpu_run:
     stp  x27, x28, [sp, #-16]!
     stp  x29, x30, [sp, #-16]!
 
+    // Preserve the EL2 FP/Advanced-SIMD state before loading the vCPU's
+    // independent vector context. 528 bytes holds q0-q31 plus FPCR/FPSR.
+    sub  sp, sp, #528
+    stp  q0,  q1,  [sp, #0]
+    stp  q2,  q3,  [sp, #32]
+    stp  q4,  q5,  [sp, #64]
+    stp  q6,  q7,  [sp, #96]
+    stp  q8,  q9,  [sp, #128]
+    stp  q10, q11, [sp, #160]
+    stp  q12, q13, [sp, #192]
+    stp  q14, q15, [sp, #224]
+    stp  q16, q17, [sp, #256]
+    stp  q18, q19, [sp, #288]
+    stp  q20, q21, [sp, #320]
+    stp  q22, q23, [sp, #352]
+    stp  q24, q25, [sp, #384]
+    stp  q26, q27, [sp, #416]
+    stp  q28, q29, [sp, #448]
+    stp  q30, q31, [sp, #480]
+    mrs  x9, fpcr
+    str  x9, [sp, #512]
+    mrs  x9, fpsr
+    str  x9, [sp, #520]
+
     // Save host stack pointer
     adrp x9, __pcpu_state
     add  x9, x9, :lo12:__pcpu_state
@@ -238,6 +359,40 @@ __vcpu_run:
     msr  vbar_el1, x9
     ldr  x9, [x0, #336]
     msr  contextidr_el1, x9
+    ldr  x9, [x0, #344]
+    msr  tpidr_el1, x9
+    ldr  x9, [x0, #352]
+    msr  tpidrro_el0, x9
+
+    // Restore guest FP/Advanced-SIMD context.
+    ldp  q0,  q1,  [x0, #368]
+    ldp  q2,  q3,  [x0, #400]
+    ldp  q4,  q5,  [x0, #432]
+    ldp  q6,  q7,  [x0, #464]
+    ldp  q8,  q9,  [x0, #496]
+    ldp  q10, q11, [x0, #528]
+    ldp  q12, q13, [x0, #560]
+    ldp  q14, q15, [x0, #592]
+    ldp  q16, q17, [x0, #624]
+    ldp  q18, q19, [x0, #656]
+    ldp  q20, q21, [x0, #688]
+    ldp  q22, q23, [x0, #720]
+    ldp  q24, q25, [x0, #752]
+    ldp  q26, q27, [x0, #784]
+    ldp  q28, q29, [x0, #816]
+    ldp  q30, q31, [x0, #848]
+    ldr  x9, [x0, #880]
+    msr  fpcr, x9
+    ldr  x9, [x0, #888]
+    msr  fpsr, x9
+
+    // Restore per-vCPU architectural virtual-timer state.
+    ldr  x9, [x0, #928]
+    msr  cntvoff_el2, x9
+    ldr  x9, [x0, #936]
+    msr  cntv_cval_el0, x9
+    ldr  x9, [x0, #944]
+    msr  cntv_ctl_el0, x9
 
     // Load SP_EL0 and SP_EL1
     ldr  x9, [x0, #248]
@@ -250,14 +405,6 @@ __vcpu_run:
     msr  elr_el2, x9
     ldr  x9, [x0, #272]
     msr  spsr_el2, x9
-
-    // Trap guest FP/Advanced-SIMD use only for the guest execution window.
-    // CPTR_EL2.TFP also affects EL2, so tvisor must not leave it set while
-    // running Rust code that may contain compiler-generated SIMD instructions.
-    mrs  x9, cptr_el2
-    orr  x9, x9, #0x400
-    msr  cptr_el2, x9
-    isb
 
     // Restore guest GPRs x1..x30
     ldp  x2,  x3,  [x0, #16]
@@ -287,19 +434,48 @@ __vcpu_exit_handler:
     // Scratch save x0, x1 on stack
     sub  sp, sp, #32
     stp  x0, x1, [sp, #0]
+    mov  x0, #8
+    str  x0, [sp, #16]
+    b    __vcpu_exit_common
 
-    // Re-enable FP/Advanced SIMD for the EL2 host before any Rust code can
-    // execute. Guest x0/x1 are already safe on the stack, so x0 is scratch.
-    mrs  x0, cptr_el2
-    bic  x0, x0, #0x400
-    msr  cptr_el2, x0
-    isb
+    .global __vcpu_irq_handler
+    .type __vcpu_irq_handler, %function
+__vcpu_irq_handler:
+    // Preserve the same guest state as a synchronous vCPU exit.
+    sub  sp, sp, #32
+    stp  x0, x1, [sp, #0]
+    mov  x0, #9
+    str  x0, [sp, #16]
+
+__vcpu_exit_common:
 
     // Load the active VM-owned vCPU. Its VcpuContext is at offset zero.
     adrp x0, __pcpu_state
     add  x0, x0, :lo12:__pcpu_state
     ldr  x0, [x0, #8]
     cbz  x0, .Lfatal_no_context
+
+    // Save guest FP/Advanced-SIMD state before EL2 code can use it.
+    stp  q0,  q1,  [x0, #368]
+    stp  q2,  q3,  [x0, #400]
+    stp  q4,  q5,  [x0, #432]
+    stp  q6,  q7,  [x0, #464]
+    stp  q8,  q9,  [x0, #496]
+    stp  q10, q11, [x0, #528]
+    stp  q12, q13, [x0, #560]
+    stp  q14, q15, [x0, #592]
+    stp  q16, q17, [x0, #624]
+    stp  q18, q19, [x0, #656]
+    stp  q20, q21, [x0, #688]
+    stp  q22, q23, [x0, #720]
+    stp  q24, q25, [x0, #752]
+    stp  q26, q27, [x0, #784]
+    stp  q28, q29, [x0, #816]
+    stp  q30, q31, [x0, #848]
+    mrs  x1, fpcr
+    str  x1, [x0, #880]
+    mrs  x1, fpsr
+    str  x1, [x0, #888]
 
     // Save guest x2..x30 into context
     stp  x2,  x3,  [x0, #16]
@@ -308,6 +484,7 @@ __vcpu_exit_handler:
     stp  x8,  x9,  [x0, #64]
     ldp  x1,  x2,  [sp, #0]     // Retrieve guest x0, x1 from temporary stack
     stp  x1,  x2,  [x0, #0]      // Save guest x0, x1 into context
+    ldr  x3, [sp, #16]           // Vector selected by the EL2 vector table.
     add  sp,  sp,  #32           // Restore temporary stack
 
     stp  x10, x11, [x0, #80]
@@ -349,12 +526,23 @@ __vcpu_exit_handler:
     str  x1, [x0, #328]
     mrs  x1, contextidr_el1
     str  x1, [x0, #336]
+    mrs  x1, tpidr_el1
+    str  x1, [x0, #344]
+    mrs  x1, tpidrro_el0
+    str  x1, [x0, #352]
+
+    // Save architectural virtual-timer state before returning to EL2 Rust.
+    mrs  x1, cntvoff_el2
+    str  x1, [x0, #928]
+    mrs  x1, cntv_cval_el0
+    str  x1, [x0, #936]
+    mrs  x1, cntv_ctl_el0
+    str  x1, [x0, #944]
 
     // Populate the active VcpuExit, which follows VcpuContext.
-    add  x1, x0, #352
+    add  x1, x0, #896
 
-    mov  x2, #8                  // Vector 8: Lower EL AArch64 Sync
-    str  x2, [x1, #0]
+    str  x3, [x1, #0]
     mrs  x2, esr_el2
     str  x2, [x1, #8]
     mrs  x2, far_el2
@@ -369,6 +557,29 @@ __vcpu_exit_handler:
     str  xzr, [x9, #8]          // no vCPU is active after this exit
     mov  sp, x10
 
+    // Restore the EL2 FP/Advanced-SIMD state saved at guest entry.
+    ldp  q0,  q1,  [sp, #0]
+    ldp  q2,  q3,  [sp, #32]
+    ldp  q4,  q5,  [sp, #64]
+    ldp  q6,  q7,  [sp, #96]
+    ldp  q8,  q9,  [sp, #128]
+    ldp  q10, q11, [sp, #160]
+    ldp  q12, q13, [sp, #192]
+    ldp  q14, q15, [sp, #224]
+    ldp  q16, q17, [sp, #256]
+    ldp  q18, q19, [sp, #288]
+    ldp  q20, q21, [sp, #320]
+    ldp  q22, q23, [sp, #352]
+    ldp  q24, q25, [sp, #384]
+    ldp  q26, q27, [sp, #416]
+    ldp  q28, q29, [sp, #448]
+    ldp  q30, q31, [sp, #480]
+    ldr  x9, [sp, #512]
+    msr  fpcr, x9
+    ldr  x9, [sp, #520]
+    msr  fpsr, x9
+    add  sp, sp, #528
+
     // Restore host callee-saved registers
     ldp  x29, x30, [sp], #16
     ldp  x27, x28, [sp], #16
@@ -377,7 +588,7 @@ __vcpu_exit_handler:
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
 
-    mov  x0, #8                  // Return exit vector 8
+    mov  x0, x3                  // Return Lower-EL Sync (8) or IRQ (9).
     ret
 
 .Lfatal_no_context:

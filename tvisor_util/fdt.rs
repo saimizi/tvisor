@@ -1,13 +1,21 @@
 use core::fmt;
 
-use dtoolkit::{Node, Property, error::FdtParseError, fdt::Fdt, standard::NodeStandard};
+use dtoolkit::{
+    Node, Property,
+    error::FdtParseError,
+    fdt::{Fdt, FdtNode},
+    standard::NodeStandard,
+};
 use spin::Once;
 
+use crate::gicv2::GicV2Info;
 use crate::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 
 const MAX_UBOOT_ARGS: usize = 16;
 const MAX_UBOOT_ARG_LEN: usize = 64;
 const FDT_ARG_PREFIX: &[u8] = b"fdt=";
+const IMAGE_ARG_PREFIX: &[u8] = b"image=";
+const MAX_FDT_PATH: usize = 256;
 
 static GLOBAL_FDT: Once<Fdt<'static>> = Once::new();
 
@@ -22,6 +30,49 @@ pub enum FdtArgError {
     InvalidAddress,
     AddressOverflow,
     ZeroAddress,
+}
+
+/// A separately loaded Linux Image supplied by U-Boot. `size` is the exact
+/// TFTP file length, not the header-declared in-memory Image extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UbootImage {
+    pub address: *const u8,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageArgError {
+    InvalidArgCount,
+    NullArgv,
+    NullArgument,
+    ArgumentTooLong,
+    MissingImage,
+    DuplicateImage,
+    InvalidAddress,
+    InvalidSize,
+    AddressOverflow,
+    ZeroAddress,
+    ZeroSize,
+}
+
+impl fmt::Display for ImageArgError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidArgCount => formatter.write_str("invalid U-Boot argument count"),
+            Self::NullArgv => formatter.write_str("U-Boot argv is null"),
+            Self::NullArgument => formatter.write_str("a U-Boot argument is null"),
+            Self::ArgumentTooLong => formatter.write_str("a U-Boot argument is too long"),
+            Self::MissingImage => formatter.write_str("the image= argument is missing"),
+            Self::DuplicateImage => formatter.write_str("multiple image= arguments were supplied"),
+            Self::InvalidAddress => formatter.write_str("the image address is not hexadecimal"),
+            Self::InvalidSize => formatter.write_str("the image size is not hexadecimal"),
+            Self::AddressOverflow => {
+                formatter.write_str("the image address or size overflows usize")
+            }
+            Self::ZeroAddress => formatter.write_str("the image address is zero"),
+            Self::ZeroSize => formatter.write_str("the image size is zero"),
+        }
+    }
 }
 
 impl fmt::Display for FdtArgError {
@@ -148,6 +199,77 @@ pub unsafe fn fdt_address_from_uboot_args(
     Ok(address as *const u8)
 }
 
+/// Finds `image=<hex-address>,<hex-byte-size>` in U-Boot's standalone
+/// arguments. The explicit source byte count lets tvisor zero-fill a compact
+/// Image's BSS tail instead of reading beyond the TFTP payload.
+///
+/// # Safety
+///
+/// Has the same `argc`/`argv` requirements as [`fdt_address_from_uboot_args`].
+pub unsafe fn image_from_uboot_args(
+    argc: isize,
+    argv: *const *const u8,
+) -> Result<UbootImage, ImageArgError> {
+    let argc = usize::try_from(argc).map_err(|_| ImageArgError::InvalidArgCount)?;
+    if argc == 0 || argc > MAX_UBOOT_ARGS {
+        return Err(ImageArgError::InvalidArgCount);
+    }
+    if argv.is_null() {
+        return Err(ImageArgError::NullArgv);
+    }
+
+    let mut image = None;
+    for index in 0..argc {
+        let argument = unsafe { *argv.add(index) };
+        if argument.is_null() {
+            return Err(ImageArgError::NullArgument);
+        }
+        let argument = unsafe { bounded_c_string(argument) }.map_err(|error| match error {
+            FdtArgError::ArgumentTooLong => ImageArgError::ArgumentTooLong,
+            _ => unreachable!("bounded_c_string only returns ArgumentTooLong"),
+        })?;
+        let Some(value) = argument.strip_prefix(IMAGE_ARG_PREFIX) else {
+            continue;
+        };
+        if image.is_some() {
+            return Err(ImageArgError::DuplicateImage);
+        }
+        let Some(separator) = value.iter().position(|byte| *byte == b',') else {
+            return Err(ImageArgError::InvalidSize);
+        };
+        let (address, size) = (&value[..separator], &value[separator + 1..]);
+        let address = parse_hex_address(address).map_err(map_image_address_error)?;
+        let size = parse_hex_address(size).map_err(map_image_size_error)?;
+        if address == 0 {
+            return Err(ImageArgError::ZeroAddress);
+        }
+        if size == 0 {
+            return Err(ImageArgError::ZeroSize);
+        }
+        image = Some(UbootImage {
+            address: address as *const u8,
+            size,
+        });
+    }
+    image.ok_or(ImageArgError::MissingImage)
+}
+
+const fn map_image_address_error(error: FdtArgError) -> ImageArgError {
+    match error {
+        FdtArgError::InvalidAddress => ImageArgError::InvalidAddress,
+        FdtArgError::AddressOverflow => ImageArgError::AddressOverflow,
+        _ => ImageArgError::InvalidAddress,
+    }
+}
+
+const fn map_image_size_error(error: FdtArgError) -> ImageArgError {
+    match error {
+        FdtArgError::InvalidAddress => ImageArgError::InvalidSize,
+        FdtArgError::AddressOverflow => ImageArgError::AddressOverflow,
+        _ => ImageArgError::InvalidSize,
+    }
+}
+
 unsafe fn bounded_c_string<'a>(pointer: *const u8) -> Result<&'a [u8], FdtArgError> {
     for length in 0..MAX_UBOOT_ARG_LEN {
         // SAFETY: The caller guarantees that pointer identifies a valid
@@ -198,6 +320,8 @@ pub enum ConsoleDiscoveryError {
     UnsupportedConsole,
     MissingRegister,
     InvalidRegister,
+    MissingInterrupt,
+    InvalidInterrupt,
     MissingParent,
     MissingRanges,
     AddressNotMapped,
@@ -217,6 +341,8 @@ impl fmt::Display for ConsoleDiscoveryError {
             Self::UnsupportedConsole => "the stdout-path console type is unsupported",
             Self::MissingRegister => "the console has no reg entry",
             Self::InvalidRegister => "the console reg entry is invalid",
+            Self::MissingInterrupt => "the console has no interrupt specifier",
+            Self::InvalidInterrupt => "the console interrupt specifier is unsupported or invalid",
             Self::MissingParent => "the console path has no parent bus",
             Self::MissingRanges => "a console parent bus has no ranges property",
             Self::AddressNotMapped => "the console address is not covered by parent ranges",
@@ -278,7 +404,51 @@ pub fn discover_console(fdt: Fdt<'_>) -> Result<ConsoleInfo, ConsoleDiscoveryErr
     let registers = PhysRegion::new(PhysAddr::new(physical_address), register_size)
         .map_err(|_| ConsoleDiscoveryError::InvalidRegister)?;
 
-    Ok(ConsoleInfo { kind, registers })
+    // Raspberry Pi's Mini UART is wired to the GIC with the standard
+    // three-cell SPI specifier: <0, spi-number, level-high>.  Keep this
+    // physical source in the console description so EL2 can wake an idle
+    // guest when host-console input arrives.
+    let interrupt_property = node
+        .property("interrupts")
+        .ok_or(ConsoleDiscoveryError::MissingInterrupt)?;
+    let interrupts = interrupt_property.value();
+    let irq = decode_console_gic_spi(interrupts)?;
+
+    Ok(ConsoleInfo {
+        kind,
+        registers,
+        irq,
+    })
+}
+
+fn decode_console_gic_spi(interrupts: &[u8]) -> Result<u32, ConsoleDiscoveryError> {
+    let interrupt_cells: [u8; 12] = interrupts
+        .get(..12)
+        .ok_or(ConsoleDiscoveryError::MissingInterrupt)?
+        .try_into()
+        .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?;
+    let interrupt_type = u32::from_be_bytes(
+        interrupt_cells[0..4]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    let interrupt_number = u32::from_be_bytes(
+        interrupt_cells[4..8]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    let interrupt_flags = u32::from_be_bytes(
+        interrupt_cells[8..12]
+            .try_into()
+            .map_err(|_| ConsoleDiscoveryError::InvalidInterrupt)?,
+    );
+    if interrupt_type != 0 || interrupt_flags != 4 {
+        return Err(ConsoleDiscoveryError::InvalidInterrupt);
+    }
+    interrupt_number
+        .checked_add(32)
+        .filter(|irq| *irq < 1020)
+        .ok_or(ConsoleDiscoveryError::InvalidInterrupt)
 }
 
 fn resolve_stdout_path<'a>(fdt: Fdt<'a>) -> Result<&'a str, ConsoleDiscoveryError> {
@@ -370,9 +540,234 @@ fn parent_path(path: &str) -> Option<&str> {
         &path[..separator]
     })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GicV2DiscoveryError {
+    MissingController,
+    DisabledController,
+    InvalidRegister,
+    MissingRegister,
+    InvalidRegion,
+    MissingParent,
+    MissingRanges,
+    AddressNotMapped,
+    AddressOverflow,
+    PathTooLong,
+}
+
+impl fmt::Display for GicV2DiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingController => "no supported GICv2 interrupt controller is present",
+            Self::DisabledController => "the GICv2 interrupt controller is disabled",
+            Self::InvalidRegister => "the GICv2 reg property is invalid",
+            Self::MissingRegister => "the GICv2 reg property lacks a required interface",
+            Self::InvalidRegion => "a GICv2 interface is too small or unaligned",
+            Self::MissingParent => "the GICv2 node has no parent bus",
+            Self::MissingRanges => "a GICv2 parent bus has no ranges property",
+            Self::AddressNotMapped => "a GICv2 register address is not covered by parent ranges",
+            Self::AddressOverflow => "a GICv2 register address overflows",
+            Self::PathTooLong => "the GICv2 DTB path exceeds the supported length",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Discovers the four GICv2 interfaces required for hardware-backed List
+/// Register delivery. The `reg` entries are translated through parent buses to
+/// CPU physical addresses; their order is GICD, GICC, GICH, then GICV.
+pub fn discover_gic_v2(fdt: Fdt<'_>) -> Result<GicV2Info, GicV2DiscoveryError> {
+    let mut path = [0_u8; MAX_FDT_PATH];
+    path[0] = b'/';
+    find_gic_v2(fdt, fdt.root(), &mut path, 1)?.ok_or(GicV2DiscoveryError::MissingController)
+}
+
+fn find_gic_v2(
+    fdt: Fdt<'_>,
+    node: FdtNode<'_>,
+    path: &mut [u8; MAX_FDT_PATH],
+    path_len: usize,
+) -> Result<Option<GicV2Info>, GicV2DiscoveryError> {
+    if node.is_compatible("arm,gic-400") || node.is_compatible("arm,cortex-a15-gic") {
+        if node
+            .status()
+            .map_err(|_| GicV2DiscoveryError::DisabledController)?
+            != dtoolkit::standard::Status::Okay
+        {
+            return Err(GicV2DiscoveryError::DisabledController);
+        }
+        let path = core::str::from_utf8(&path[..path_len])
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        return decode_gic_v2(fdt, node, path).map(Some);
+    }
+
+    for child in node.children() {
+        let separator = usize::from(path_len != 1);
+        let child_name = child.name().as_bytes();
+        let next_len = path_len
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(GicV2DiscoveryError::PathTooLong)?;
+        if next_len > path.len() {
+            return Err(GicV2DiscoveryError::PathTooLong);
+        }
+        if separator != 0 {
+            path[path_len] = b'/';
+        }
+        path[path_len + separator..next_len].copy_from_slice(child_name);
+        if let Some(info) = find_gic_v2(fdt, child, path, next_len)? {
+            return Ok(Some(info));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_gic_v2(
+    fdt: Fdt<'_>,
+    node: FdtNode<'_>,
+    path: &str,
+) -> Result<GicV2Info, GicV2DiscoveryError> {
+    let mut registers = node
+        .reg()
+        .map_err(|_| GicV2DiscoveryError::InvalidRegister)?
+        .ok_or(GicV2DiscoveryError::MissingRegister)?;
+    let mut regions = [None; 4];
+    for region in &mut regions {
+        let register = registers
+            .next()
+            .ok_or(GicV2DiscoveryError::MissingRegister)?;
+        let address = register
+            .address::<u64>()
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        let size = register
+            .size::<u64>()
+            .map_err(|_| GicV2DiscoveryError::InvalidRegister)?;
+        let address = translate_gic_to_cpu_address(fdt, path, address)?;
+        *region = Some(
+            PhysRegion::new(PhysAddr::new(address), size)
+                .map_err(|_| GicV2DiscoveryError::InvalidRegion)?,
+        );
+    }
+
+    if let [
+        Some(distributor),
+        Some(cpu_interface),
+        Some(hypervisor_interface),
+        Some(virtual_cpu_interface),
+    ] = regions
+    {
+        GicV2Info::new(
+            distributor,
+            cpu_interface,
+            hypervisor_interface,
+            virtual_cpu_interface,
+        )
+        .ok_or(GicV2DiscoveryError::InvalidRegion)
+    } else {
+        Err(GicV2DiscoveryError::MissingRegister)
+    }
+}
+
+fn translate_gic_to_cpu_address(
+    fdt: Fdt<'_>,
+    device_path: &str,
+    mut address: u64,
+) -> Result<u64, GicV2DiscoveryError> {
+    let mut bus_path = parent_path(device_path).ok_or(GicV2DiscoveryError::MissingParent)?;
+    while bus_path != "/" {
+        let bus = fdt
+            .find_node(bus_path)
+            .ok_or(GicV2DiscoveryError::MissingParent)?;
+        let mut ranges = bus
+            .ranges()
+            .map_err(|_| GicV2DiscoveryError::MissingRanges)?
+            .ok_or(GicV2DiscoveryError::MissingRanges)?;
+        if let Some(first) = ranges.next() {
+            let mut translated = None;
+            for range in core::iter::once(first).chain(ranges) {
+                let child = range
+                    .child_bus_address::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let parent = range
+                    .parent_bus_address::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let length = range
+                    .length::<u64>()
+                    .map_err(|_| GicV2DiscoveryError::AddressOverflow)?;
+                let Some(offset) = address.checked_sub(child) else {
+                    continue;
+                };
+                if offset < length {
+                    translated = Some(
+                        parent
+                            .checked_add(offset)
+                            .ok_or(GicV2DiscoveryError::AddressOverflow)?,
+                    );
+                    break;
+                }
+            }
+            address = translated.ok_or(GicV2DiscoveryError::AddressNotMapped)?;
+        }
+        bus_path = parent_path(bus_path).ok_or(GicV2DiscoveryError::MissingParent)?;
+    }
+    Ok(address)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dtoolkit::fdt::Fdt;
+    use dtoolkit::model::{DeviceTree, DeviceTreeNode, DeviceTreeProperty};
+    use std::vec::Vec;
+
+    fn property(name: &str, value: Vec<u8>) -> DeviceTreeProperty {
+        DeviceTreeProperty::new_unchecked(name, value)
+    }
+
+    fn gic_registers() -> Vec<u8> {
+        let mut registers = Vec::new();
+        for (address, size) in [
+            (0x1000_u32, 0x1000_u32),
+            (0x2000, 0x2000),
+            (0x4000, 0x1000),
+            (0x6000, 0x2000),
+        ] {
+            registers.extend_from_slice(&address.to_be_bytes());
+            registers.extend_from_slice(&size.to_be_bytes());
+        }
+        registers
+    }
+
+    #[test]
+    fn discovers_gicv2_regions_through_parent_ranges() {
+        let mut tree = DeviceTree::new();
+        tree.root
+            .add_property(property("#address-cells", 2_u32.to_be_bytes().to_vec()));
+        tree.root
+            .add_property(property("#size-cells", 1_u32.to_be_bytes().to_vec()));
+
+        let mut gic = DeviceTreeNode::new_unchecked("interrupt-controller@1000");
+        gic.add_property(property("compatible", b"arm,gic-400\0".to_vec()));
+        gic.add_property(property("reg", gic_registers()));
+
+        let mut soc = DeviceTreeNode::new_unchecked("soc");
+        soc.add_property(property("#address-cells", 1_u32.to_be_bytes().to_vec()));
+        soc.add_property(property("#size-cells", 1_u32.to_be_bytes().to_vec()));
+        let mut ranges = Vec::new();
+        ranges.extend_from_slice(&0_u32.to_be_bytes());
+        ranges.extend_from_slice(&0xff84_0000_u64.to_be_bytes());
+        ranges.extend_from_slice(&0x0010_0000_u32.to_be_bytes());
+        soc.add_property(property("ranges", ranges));
+        soc.add_child(gic);
+        tree.root.add_child(soc);
+
+        let blob = tree.to_dtb();
+        let info = discover_gic_v2(Fdt::new(&blob).unwrap()).unwrap();
+        assert_eq!(info.distributor().start().value(), 0xff84_1000);
+        assert_eq!(info.cpu_interface().start().value(), 0xff84_2000);
+        assert_eq!(info.hypervisor_interface().start().value(), 0xff84_4000);
+        assert_eq!(info.virtual_cpu_interface().start().value(), 0xff84_6000);
+        assert_eq!(info.virtual_cpu_interface().size(), 0x2000);
+    }
 
     #[test]
     fn decodes_bootelf_argument_layout() {
@@ -393,6 +788,29 @@ mod tests {
         let address = unsafe { fdt_address_from_uboot_args(argv.len() as isize, argv.as_ptr()) };
 
         assert_eq!(address, Ok(0x37b3_aca0 as *const u8));
+    }
+
+    #[test]
+    fn decodes_image_address_and_exact_file_size() {
+        let entry = b"4001010\0";
+        let image = b"image=0x04000000,0x305008\0";
+        let argv = [entry.as_ptr(), image.as_ptr()];
+
+        let source = unsafe { image_from_uboot_args(argv.len() as isize, argv.as_ptr()) }
+            .expect("valid image argument");
+
+        assert_eq!(source.address, 0x0400_0000 as *const u8);
+        assert_eq!(source.size, 0x305008);
+    }
+
+    #[test]
+    fn rejects_image_without_a_file_size() {
+        let image = b"image=4000000\0";
+        let argv = [image.as_ptr()];
+        assert_eq!(
+            unsafe { image_from_uboot_args(argv.len() as isize, argv.as_ptr()) },
+            Err(ImageArgError::InvalidSize)
+        );
     }
 
     #[test]
@@ -442,5 +860,17 @@ mod tests {
         assert_eq!(parent_path("/soc"), Some("/"));
         assert_eq!(parent_path("/"), None);
         assert_eq!(parent_path("relative"), None);
+    }
+
+    #[test]
+    fn decodes_level_high_gic_spi_for_console() {
+        assert_eq!(
+            decode_console_gic_spi(&[0, 0, 0, 0, 0, 0, 0, 93, 0, 0, 0, 4]),
+            Ok(125)
+        );
+        assert_eq!(
+            decode_console_gic_spi(&[0, 0, 0, 1, 0, 0, 0, 93, 0, 0, 0, 4]),
+            Err(ConsoleDiscoveryError::InvalidInterrupt)
+        );
     }
 }

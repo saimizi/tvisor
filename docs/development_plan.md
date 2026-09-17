@@ -731,86 +731,293 @@ initial implementation does not add synchronization for inactive CPUs.
   access assigned RAM/UART and produces a diagnosed stage-2 fault for an
   unassigned IPA.
 
-## 15. Phase 10: boot a real single-vCPU guest
+## 15. Phase 10: boot a real single-vCPU Linux guest
 
 ### Goal
 
-Boot one real guest operating system while tvisor and the guest both remain on
-the boot physical CPU. Establish image loading, guest boot data, interrupts,
-timers, trap handling, and a guest console before introducing physical
-concurrency. The first console is an emulated PL011 whose output is forwarded
-through tvisor's physical Mini UART; Linux never owns the physical debug UART.
+Boot a real AArch64 Linux guest on exactly one vCPU and one physical CPU before
+introducing any physical or guest SMP. Use this phase to validate the complete
+single-CPU virtualization path end to end: Linux boot ABI, guest RAM ownership,
+stage-2 translation, guest stage-1 MMU enablement, trapped MMIO, early console,
+timer virtualization, interrupt delivery, and finally userspace.
+
+The virtual platform presented to Linux should remain independent of Raspberry
+Pi physical devices where practical. In particular, Linux should see an
+emulated PL011 UART while tvisor keeps exclusive ownership of the Raspberry Pi
+Mini UART used for host diagnostics.
+
+The phase is complete only when Linux can boot reliably to an initramfs or
+equivalent userspace checkpoint on one vCPU. Physical SMP begins only after
+that checkpoint is stable.
 
 ### Registers, memory structures, and exception levels
 
-- Guest kernel, optional initrd, and generated-DTB placement in guest IPA
-  space, backed by allocator-owned physical pages.
-- One persistent vCPU context containing the guest-visible EL1 registers and
+- Guest kernel `Image`, optional initrd, and generated-DTB placement in guest
+  IPA space, backed by allocator-owned physical pages.
+- One persistent VM-owned `Vcpu` containing guest EL1 architectural state and
   the EL2 return state required by `ERET`.
-- `HCR_EL2`, `CPTR_EL2`, `CNTHCTL_EL2`, `CNTVOFF_EL2`, `VTCR_EL2`, and
-  `VTTBR_EL2` policies for a single guest.
-- Physical and virtual interrupt-controller state required by the selected
-  guest boot milestone.
-- Guest timer state and EL2 handling for trapped or virtualized timer access.
+- One pCPU-local world-switch state containing the host stack and active-vCPU
+  association.
+- `HCR_EL2`, `CPTR_EL2`, `VTCR_EL2`, `VTTBR_EL2`, and per-vCPU `VMPIDR_EL2`
+  state required to run a Linux guest.
+- Guest EL1 translation state, including `SCTLR_EL1`, `TTBR0_EL1`,
+  `TTBR1_EL1`, `TCR_EL1`, `MAIR_EL1`, and `VBAR_EL1`, preserved across exits.
+- `CNTHCTL_EL2`, `CNTVOFF_EL2`, architectural timer state, and any trap policy
+  required by the selected timer virtualization design.
+- Physical and virtual interrupt-controller state required by Linux.
 - A guest-visible PL011 register page at a fixed IPA. It remains absent from
-  the stage-2 map so accesses trap to EL2 for emulation.
+  the normal stage-2 RAM map so accesses trap to EL2 for emulation.
 - Stage-2 MMIO-abort state, including `ESR_EL2`, `FAR_EL2`, `HPFAR_EL2`,
   `ELR_EL2`, and the guest general-purpose register named by the syndrome.
-- Virtual PL011 transmit, status, configuration, and peripheral-identification
-  registers, followed later by interrupt/receive state. Tvisor retains
-  exclusive control of the physical Mini UART.
-- Stage-2 mappings for guest RAM and intentionally assigned or emulated
-  devices; host-only RAM and MMIO remain inaccessible.
+- Stage-2 mappings for guest RAM and intentionally assigned resources only;
+  host-only RAM and MMIO remain inaccessible to the guest.
 
-Bring up the console in two steps:
+### Phase 10.1: define the Linux boot ABI and guest memory layout
 
-1. Implement TX-only, polled early-console support. Emulate `UARTDR` writes by
-   forwarding the low byte to the Mini UART, report a ready transmitter through
-   `UARTFR`, and accept or ignore configuration writes without exposing the
-   physical UART. No guest UART interrupt or RX path is required for this
-   checkpoint.
-2. After early Linux output is stable, implement enough PL011 state for the
-   normal AMBA probe and `ttyAMA0` console, including the PL011 peripheral and
-   PrimeCell identification registers. Add receive buffering and virtual-GIC
-   interrupt injection only when an interactive guest console is required.
+Boot Linux using the standard arm64 boot convention rather than a
+tvisor-specific register protocol.
 
-VirtIO console and the general VirtIO device framework are deferred until
-after the physical and guest SMP phases.
+Initial guest state must include:
+
+```text
+EL1:     AArch64
+PC:      Linux kernel entry IPA
+x0:      guest DTB IPA
+x1-x3:   0
+```
+
+Do not make the Phase 9 test stack or HVC checkpoint protocol part of the guest
+ABI. Linux owns its EL1 stack and stage-1 translation setup after entry.
+
+Define one simple contiguous guest-RAM region first. Place the kernel, DTB, and
+optional initrd at explicit non-overlapping IPAs within or adjacent to that
+layout according to the Linux arm64 boot requirements. `VmCtl` remains the
+authority for the guest IPA-to-PA ownership model.
+
+The generated guest DTB must describe only the virtual platform presented by
+tvisor. At minimum it should contain:
+
+- one `/memory` region;
+- one enabled CPU;
+- `/chosen` with `stdout-path` and boot arguments;
+- the architectural timer;
+- the selected virtual interrupt controller;
+- a fixed clock if required by PL011;
+- the emulated PL011 node.
+
+#### Acceptance checkpoint
+
+Linux reaches its first instructions at EL1 with the expected `x0` DTB pointer,
+and DTB parsing succeeds without exposing host physical addresses.
+
+### Phase 10.2: implement PL011 earlycon through trapped MMIO
+
+Provide a virtual PL011 at a fixed guest IPA, for example within a dedicated
+virtual-device window. Do not map that IPA directly to the physical Mini UART.
+
+The intended path is:
+
+```text
+Linux PL011 MMIO access
+        |
+        v
+unmapped/emulated guest IPA
+        |
+        v
+Stage-2 Data Abort to EL2
+        |
+        v
+tvisor MMIO decoder
+        |
+        v
+virtual PL011 state
+        |
+        v
+tvisor host console
+        |
+        v
+Raspberry Pi Mini UART
+```
+
+Implement the generic MMIO-emulation path before making the PL011 device large.
+For a supported trapped access, tvisor must:
+
+1. identify the faulting guest IPA;
+2. decode read/write direction and access width from `ESR_EL2`;
+3. identify the guest register used by the load/store;
+4. dispatch the access to the virtual device;
+5. write the returned value into the guest register for reads;
+6. advance `ELR_EL2` only after successful emulation;
+7. resume the same vCPU.
+
+Start with TX-only polled earlycon support:
+
+- `UARTDR` write: forward the low byte to tvisor's host console;
+- `UARTFR` read: report a transmitter-ready state;
+- harmless initialization/configuration writes may initially be retained or
+  ignored where Linux does not require their behavior;
+- unsupported accesses must fail visibly instead of being silently accepted.
+
+Configure the guest DTB and boot arguments for the virtual PL011. Prefer DT
+selection through `stdout-path`; an explicit
+`earlycon=pl011,mmio32,<virtual-ipa>` argument may be used during bring-up.
+
+#### Acceptance checkpoint
+
+Linux prints stable early boot messages through the physical Mini UART while
+tvisor continues to own and use that UART for host diagnostics.
+
+### Phase 10.3: validate Linux guest stage-1 MMU bring-up
+
+A real Linux boot must continue after Linux programs its own EL1 translation
+regime. This is the point where Phase 9's small payload becomes a real
+virtual-machine test.
+
+Verify that Linux can safely program and preserve:
+
+- `TTBR0_EL1` and `TTBR1_EL1`;
+- `TCR_EL1`;
+- `MAIR_EL1`;
+- `VBAR_EL1`;
+- `SCTLR_EL1`, including enabling the EL1 MMU and caches.
+
+The vCPU world switch must save and restore all EL1 state needed by Linux.
+Stage-2 translation remains the ownership/isolation layer beneath Linux's own
+stage-1 page tables.
+
+The conceptual path must remain:
+
+```text
+Linux VA
+   |
+Guest Stage-1
+   |
+   v
+Guest IPA
+   |
+EL2 Stage-2
+   |
+   v
+Host PA
+```
+
+Do not mirror Linux's RX/RW/XN page policy into EL2 stage-1 mappings. Guest
+stage-1 owns Linux's internal memory permissions; stage 2 owns VM access to
+host physical resources.
+
+#### Acceptance checkpoint
+
+Linux successfully enables its stage-1 MMU and continues producing earlycon
+output afterward. A failure immediately after `SCTLR_EL1.M` becomes enabled is
+treated as a dedicated milestone failure rather than being debugged together
+with timer or interrupt work.
+
+### Phase 10.4: provide the architectural timer and virtual interrupts
+
+After Linux runs reliably with its own stage-1 MMU, add the minimum timer and
+interrupt virtualization required for normal kernel progress.
+
+Define and document:
+
+- the guest-visible architectural timer behavior;
+- `CNTHCTL_EL2` policy;
+- `CNTVOFF_EL2` policy;
+- which timer registers are directly accessible and which trap;
+- virtual timer state saved per vCPU;
+- the virtual interrupt-controller model;
+- how virtual interrupts are injected into the running vCPU.
+
+Keep this milestone single-vCPU. No PSCI CPU_ON, secondary vCPU startup, SGI
+routing between vCPUs, or scheduler is required yet.
+
+#### Acceptance checkpoint
+
+Linux receives timer interrupts and advances through scheduler/timekeeping
+initialization without requiring a second vCPU.
+
+### Phase 10.5: hand off from earlycon to the normal console and reach userspace
+
+Once timer and interrupt delivery are stable, implement enough PL011 behavior
+for Linux's normal AMBA/PL011 driver to probe and take over from earlycon.
+
+Add as required:
+
+- PL011 peripheral and PrimeCell identification registers;
+- configuration/control register state used by the Linux driver;
+- TX behavior beyond the earlycon subset;
+- RX buffering;
+- virtual UART interrupt injection.
+
+The first userspace target should be deliberately small, such as an embedded
+initramfs with a minimal `/init`. Block devices, networking, and general VirtIO
+support are not prerequisites for this milestone.
+
+VirtIO console and the general VirtIO device framework are deferred until after
+the physical and guest SMP phases unless they become necessary for a specific
+userspace experiment.
+
+#### Acceptance checkpoint
+
+A one-vCPU Linux guest reaches an initramfs or equivalent userspace checkpoint
+and provides a usable console through the virtual PL011.
+
+### Phase 10.6: single-vCPU Linux completion gate before SMP
+
+Do not begin Phase 11 merely because Linux prints early boot text. The
+single-vCPU virtualization path should first be stable enough that later SMP
+failures can be attributed to concurrency rather than unfinished basic VM
+support.
+
+Before enabling a secondary physical CPU, require all of the following:
+
+- Linux boot ABI and guest DTB are stable;
+- guest RAM and stage-2 mappings are stable;
+- Linux enables and runs with its own stage-1 MMU;
+- trapped PL011 MMIO resumes correctly;
+- architectural timer operation is stable;
+- virtual interrupt delivery is stable;
+- Linux reaches initramfs/userspace repeatedly;
+- no Phase 9 HVC checkpoint mechanism is required for normal guest operation;
+- tvisor remains able to diagnose guest exits without corrupting vCPU state.
+
+Only after this gate passes should development move to tvisor physical SMP.
 
 ### Files and modules
 
-- Add a guest-image loader and explicit guest boot-configuration structures.
-- Add a single-vCPU context module and guest entry/resume loop.
+- Add or refine a guest-image loader and explicit Linux boot-configuration
+  structures.
+- Keep VM-wide ownership in `VmCtl` and persistent architectural state in
+  `Vcpu`; do not move vCPU ownership into pCPU state.
+- Move per-vCPU virtualization state such as `VMPIDR_EL2` out of VM-wide
+  stage-2 register bundles when the vCPU abstraction requires it.
 - Add a generic trapped-MMIO dispatcher and a virtual-PL011 device module.
 - Decode supported stage-2 MMIO accesses, update the referenced guest register
   for reads, and advance `ELR_EL2` only after successful emulation.
-- Add the minimal interrupt, timer, and device policy required by the chosen
-  guest.
+- Add the minimal architectural-timer and virtual-interrupt support required by
+  Linux.
 - Extend the guest-DTB builder with `/chosen`, memory, CPU, interrupt, timer,
   fixed-clock, and emulated-PL011 descriptions that match the implemented
-  virtual platform. Give the PL011 node its virtual IPA, compatible strings,
-  clock references, and—when implemented—virtual interrupt. Set `stdout-path`
-  and an appropriate `earlycon=pl011,mmio32,<ipa>` boot argument without
-  copying the host UART node or its physical address.
-- Document the supported guest image format and boot protocol.
+  virtual platform.
+- Document the Linux `Image` loading convention, guest IPA layout, DTB
+  placement, boot arguments, and supported virtual hardware.
 
 ### Acceptance criteria and verification
 
-- **Host:** Image placement, DTB generation, IPA-to-PA mappings, and guest boot
+- **Host:** Image placement, DTB generation, IPA-to-PA mappings, and Linux boot
   arguments agree at every boundary. Malformed or overlapping images fail
   without modifying allocator state. MMIO tests cover supported access widths,
   read/write direction, guest-register updates, transmitter status, ignored or
   retained configuration state, peripheral-identification values, unsupported
   offsets, and correct PC advance.
-- **AArch64 build:** Guest entry/resume code and interrupt/timer register
-  encodings build without relying on physical SMP support. The stage-2 abort
-  path can distinguish the virtual PL011 IPA from invalid guest accesses and
-  resume an emulated access without corrupting the vCPU context.
-- **Raspberry Pi 4:** A single-vCPU guest reaches a defined boot checkpoint or
-  userspace console. Linux early-console bytes appear through the physical Mini
-  UART while tvisor retains its own diagnostic output. Deliberate stage-2 and
-  trapped-register tests return to the EL2 handler with decoded diagnostics;
-  an unsupported UART access fails visibly instead of being silently accepted.
+- **AArch64 build:** Guest entry/resume code, EL1 register save/restore, timer
+  controls, and interrupt-controller register encodings build without relying
+  on physical SMP support. The stage-2 abort path can distinguish virtual-MMIO
+  accesses from invalid guest accesses and resume an emulated instruction
+  without corrupting the vCPU context.
+- **Raspberry Pi 4:** Verify the Phase 10.1 through 10.6 checkpoints in order.
+  The final hardware criterion is a repeatable single-vCPU Linux boot to
+  initramfs/userspace with timer interrupts and a working virtual-PL011 console,
+  while tvisor retains exclusive ownership of the physical Mini UART.
 
 ## 16. Phase 11: add tvisor physical SMP
 

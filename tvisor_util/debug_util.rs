@@ -12,9 +12,15 @@ struct MiniUart {
 
 impl MiniUart {
     const IO_OFFSET: usize = 0x00;
+    const IER_OFFSET: usize = 0x04;
     const LSR_OFFSET: usize = 0x14;
+    const CNTL_OFFSET: usize = 0x20;
     const LSR_TX_READY: u32 = 1 << 5;
     const LSR_IDLE: u32 = 1 << 6;
+    const LSR_RX_READY: u32 = 1;
+    const IER_RX_INTERRUPT: u32 = 1;
+    const CNTL_RX_ENABLE: u32 = 1;
+    const CNTL_TX_ENABLE: u32 = 1 << 1;
 
     fn configured() -> Option<Self> {
         let register_base = MINI_UART_BASE.load(Ordering::Relaxed);
@@ -60,6 +66,24 @@ impl MiniUart {
         }
         self.write_byte_raw(byte)
     }
+
+    fn read_byte(&self) -> Option<u8> {
+        (unsafe { mmio_read32(self.register(Self::LSR_OFFSET)) } & Self::LSR_RX_READY != 0)
+            .then(|| unsafe { mmio_read32(self.register(Self::IO_OFFSET)) as u8 })
+    }
+
+    fn enable_rx_interrupt(&self) {
+        let cntl = unsafe { mmio_read32(self.register(Self::CNTL_OFFSET)) };
+        unsafe {
+            mmio_write32(
+                self.register(Self::CNTL_OFFSET),
+                cntl | Self::CNTL_RX_ENABLE | Self::CNTL_TX_ENABLE,
+            );
+            // tvisor does not use TX-ready interrupts, which would otherwise
+            // continuously assert while the transmitter is idle.
+            mmio_write32(self.register(Self::IER_OFFSET), Self::IER_RX_INTERRUPT);
+        };
+    }
 }
 
 impl Write for MiniUart {
@@ -84,6 +108,28 @@ unsafe fn mmio_write32(address: usize, value: u32) {
 pub fn print(args: fmt::Arguments<'_>) -> fmt::Result {
     let mut uart = MiniUart::configured().ok_or(fmt::Error)?;
     uart.write_fmt(args)
+}
+
+/// Sends one byte through tvisor's host-owned Mini UART.
+///
+/// This is used by virtual devices after their guest access has been fully
+/// emulated; it never makes the physical UART visible to a guest.
+pub fn write_byte(byte: u8) -> Result<(), ()> {
+    MiniUart::configured().ok_or(())?.write_byte(byte)
+}
+
+/// Returns one pending host-console byte without exposing the Mini UART to a
+/// guest. The guest runner routes it to the selected virtual UART.
+pub fn read_byte() -> Option<u8> {
+    MiniUart::configured()?.read_byte()
+}
+
+/// Enables the host-owned Mini UART receive interrupt. The EL2 IRQ path
+/// drains received bytes and routes them to the selected virtual UART.
+pub fn enable_rx_interrupt() -> Result<(), ()> {
+    let uart = MiniUart::configured().ok_or(())?;
+    uart.enable_rx_interrupt();
+    Ok(())
 }
 
 #[macro_export]

@@ -9,9 +9,10 @@ use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
+use tvisor_util::gicv2::GicV2Info;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
-    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap, page_covering,
+    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap,
 };
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 use tvisor_util::*;
@@ -50,8 +51,6 @@ static BOOTSTRAP_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;
-    static __payload_start: u8;
-    static __payload_end: u8;
     static __vectors_start: u8;
     static __vectors_end: u8;
     static __rodata_start: u8;
@@ -106,7 +105,9 @@ pub struct BootstrapPageTable {
 
 pub fn setup_bootstrap_page_table(
     live_dtb_pages: PhysRegion,
+    linux_image_pages: PhysRegion,
     uart_region: PhysRegion,
+    gic: GicV2Info,
 ) -> Result<BootstrapPageTable, PrepareError> {
     if BOOTSTRAP_TABLES_CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(PrepareError::Validation);
@@ -215,23 +216,36 @@ pub fn setup_bootstrap_page_table(
         false,
     )?;
 
-    // __payload_start
-    // TODO: This is for test.
-    map_identity(
-        &mut tables,
-        link_addr!(__payload_start),
-        link_addr!(__payload_end),
-        false,
-        false,
-    )?;
-
     // Complete live DTB pages are mapped read-only Normal.
     let dtb_start = live_dtb_pages.start().value();
     let dtb_end = live_dtb_pages.end().value();
     map_identity(&mut tables, dtb_start, dtb_end, false, false)?;
 
+    // U-Boot loaded the Linux Image separately. Keep this source readable
+    // across the private-EL2 switch until it is copied into guest RAM.
+    map_identity(
+        &mut tables,
+        linux_image_pages.start().value(),
+        linux_image_pages.end().value(),
+        false,
+        false,
+    )?;
+
     // UART page is mapped RW Device.
     map_identity_device(&mut tables, uart_region)?;
+
+    // Host GIC topology comes from the U-Boot DTB. The four architecture
+    // interfaces are independently mapped because DTB regions need not be
+    // physically contiguous.
+    for region in [
+        gic.distributor(),
+        gic.cpu_interface(),
+        gic.hypervisor_interface(),
+        gic.virtual_cpu_interface(),
+    ] {
+        map_identity_device(&mut tables, region)?;
+    }
+
     validate_bootstrap_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
     let root_pa = tables.root_pa();
@@ -280,7 +294,9 @@ pub fn initialize_allocator_after_takeover(
     }
 
     validate_live_dtb(live_dtb)?;
-    let live_dtb_pages = page_covering(live_dtb)?;
+    let live_dtb_pages =
+        PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
+            .map_err(|_| AllocatorInitError::InvalidDtb)?;
 
     // SAFETY: initialization runs once after takeover on the boot CPU before
     // any allocator client or asynchronous exception can access this state.
@@ -315,15 +331,28 @@ pub fn initialize_allocator_after_takeover(
 
 pub fn map_usable_ram(
     memory_map: &MemoryMap,
-    live_dtb_pages: PhysRegion,
+    live_dtb: PhysRegion,
+    linux_image_pages: PhysRegion,
 ) -> Result<(), PrepareError> {
     let mut exclusions = FixedList::<PhysRegion, 1>::new();
+
+    let live_dtb_aligned =
+        PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
+            .map_err(|_| PrepareError::AddressOverflow)?;
+
     exclusions
-        .push(live_dtb_pages)
+        .push(live_dtb_aligned)
         .map_err(|_| PrepareError::Validation)?;
 
     with_tables(|tables| {
         map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
+        map_identity(
+            tables,
+            linux_image_pages.start().value(),
+            linux_image_pages.end().value(),
+            false,
+            false,
+        )?;
         Ok(())
     })?;
 
@@ -441,15 +470,13 @@ pub fn map_identity_device<const N: usize>(
     tables: &mut TableSet<'_, N>,
     region: PhysRegion,
 ) -> Result<(), PrepareError> {
-    if !is_page_aligned(region.start().value() as usize)
-        || !is_page_aligned(region.end().value() as usize)
-    {
-        return Err(PrepareError::Validation);
-    }
+    let aligned_region = PhysRegion::new_aligned(region.start(), region.size(), PAGE_SIZE as u64)
+        .map_err(|_| PrepareError::AddressOverflow)?;
+
     tables.map(Mapping {
-        va: region.start().value(),
-        pa: region.start().value(),
-        size: region.size(),
+        va: aligned_region.start().value(),
+        pa: aligned_region.start().value(),
+        size: aligned_region.size(),
         memory_type: MemoryType::Device,
         writable: true,
         executable: false,
@@ -508,18 +535,6 @@ pub fn validate_bootstrap_page_table<const N: usize>(
     let arena_end = link_addr!(__bootstrap_tables_end);
     let checks = [
         (link_addr!(__text_start), false, true, MemoryType::Normal),
-        (
-            link_addr!(__payload_start),
-            false,
-            false,
-            MemoryType::Normal,
-        ),
-        (
-            link_addr!(__payload_end) - 1,
-            false,
-            false,
-            MemoryType::Normal,
-        ),
         (link_addr!(__vectors_start), false, true, MemoryType::Normal),
         (link_addr!(__rodata_start), false, false, MemoryType::Normal),
         (

@@ -82,7 +82,8 @@ __el2_vectors:
     b __vcpu_exit_handler
     .balign 128
     // Lower EL executing AArch64: IRQ.
-    VECTOR_SLOT 9
+    b __vcpu_irq_handler
+    .balign 128
     // Lower EL executing AArch64: FIQ.
     VECTOR_SLOT 10
     // Lower EL executing AArch64: SError.

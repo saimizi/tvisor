@@ -8,8 +8,11 @@ use dtoolkit::fdt::Fdt;
 use tvisor_util::PAGE_SIZE;
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::{debug_init, stop};
-use tvisor_util::fdt::{discover_console, fdt_address_from_uboot_args, fdt_init};
-use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysRegion};
+use tvisor_util::fdt::{
+    discover_console, discover_gic_v2, fdt_address_from_uboot_args, fdt_init, image_from_uboot_args,
+};
+use tvisor_util::gicv2;
+use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 use tvisor_util::{halt, println};
 
 mod boot;
@@ -123,6 +126,47 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         halt();
     }
 
+    let image = match unsafe { image_from_uboot_args(argc, argv) } {
+        Ok(image) => image,
+        Err(error) => {
+            println!("Linux Image handoff failed: {}", error);
+            halt();
+        }
+    };
+    let image_source = match PhysRegion::new(PhysAddr::new(image.address as u64), image.size as u64)
+    {
+        Ok(region) => region,
+        Err(error) => {
+            println!(
+                "Linux Image handoff has an invalid source region: {}",
+                error
+            );
+            halt();
+        }
+    };
+    let image_source_pages = match PhysRegion::new_aligned(
+        image_source.start(),
+        image_source.size(),
+        PAGE_SIZE as u64,
+    ) {
+        Ok(region) => region,
+        Err(error) => {
+            println!(
+                "Linux Image handoff cannot page-align source region: {}",
+                error
+            );
+            halt();
+        }
+    };
+    if guest::set_linux_image_source(image_source).is_err() {
+        println!("Linux Image handoff was already initialized differently");
+        halt();
+    }
+    println!(
+        "Linux Image handoff: source={} bytes={}",
+        image_source, image.size
+    );
+
     let live_dtb: PhysRegion = (*fdt).into();
     let live_dtb_pages =
         match PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64) {
@@ -137,9 +181,33 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         Ok(region) => region,
         Err(_) => halt(),
     };
+    let gic = match discover_gic_v2(*fdt) {
+        Ok(gic) => gic,
+        Err(error) => {
+            println!("GICv2 discovery failed: {}", error);
+            halt();
+        }
+    };
+    println!(
+        "GICv2 DTB discovery:\n GICD={}\n GICC={}\n GICH={}\n GICV={}",
+        gic.distributor(),
+        gic.cpu_interface(),
+        gic.hypervisor_interface(),
+        gic.virtual_cpu_interface(),
+    );
+    gicv2::initialize(gic);
+    if guest::set_host_console_irq(console.irq).is_err() {
+        println!("Host console IRQ discovery failed: {}", console.irq);
+        halt();
+    }
 
     // Set up bootstrap page table
-    let bootstrap = match mm::setup_bootstrap_page_table(live_dtb_pages, uart_region) {
+    let bootstrap = match mm::setup_bootstrap_page_table(
+        live_dtb_pages,
+        image_source_pages,
+        uart_region,
+        gic,
+    ) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             println!("Failed to setup bootstrap page tables: {}", error);

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::el2_translation::*;
+use tvisor_util::guest_platform::DEFAULT_GUEST_RAM_SIZE;
 use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::stage2_translation::*;
 use tvisor_util::*;
@@ -12,10 +13,12 @@ use tvisor_util::*;
 use core::fmt::Display;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 
-pub const MAX_GUEST_MEM_BYTES: usize = 1024 * 1024;
+/// The fixed 512 MiB guest RAM backing plus room for Stage-2 tables.
+pub const MAX_GUEST_MEM_BYTES: usize = DEFAULT_GUEST_RAM_SIZE as usize + 2 * 1024 * 1024;
 pub const MAX_GUEST_MEM_PAGES: usize = (MAX_GUEST_MEM_BYTES) / PAGE_SIZE;
 
 pub type AddressType = PhysAddr;
+#[cfg_attr(not(test), allow(dead_code))]
 pub type RegionType = PhysRegion;
 
 /// Guest intermediate physical address (IPA).
@@ -81,7 +84,9 @@ impl IpaRegion {
 }
 
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained for VmCtl tests and the forthcoming Linux image loader.
 pub enum VmMemUsage {
+    GuestRam,
     Image,
     Scratch,
     Stack,
@@ -93,6 +98,7 @@ pub enum VmMemUsage {
 impl VmMemUsage {
     pub fn need_physical_memory(&self) -> bool {
         match self {
+            VmMemUsage::GuestRam => true,
             VmMemUsage::Image => true,
             VmMemUsage::Dtb => true,
             VmMemUsage::Stack => true,
@@ -106,6 +112,7 @@ impl VmMemUsage {
 impl Display for VmMemUsage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
+            VmMemUsage::GuestRam => "GuestRam",
             VmMemUsage::Image => "Image",
             VmMemUsage::Dtb => "DTB",
             VmMemUsage::Stack => "Stack",
@@ -204,6 +211,7 @@ enum VmMem {
 ///
 /// IpaPa entries are contiguous and yield one region. Page-table entries can
 /// grow one page at a time, so they yield one region for each tracked page.
+#[cfg_attr(not(test), allow(dead_code))]
 struct EntryPaIter<'a> {
     entry: Option<&'a VmMem>,
     next_page: usize,
@@ -353,6 +361,78 @@ impl VmCtl {
 
         #[cfg(target_arch = "aarch64")]
         self.map_with_pa_bits(usage, mem_type, access, exec, pa_bits)
+    }
+
+    /// Maps a host-owned device page into a guest IPA without making it a VM
+    /// allocation. This is only for explicitly selected virtualization
+    /// hardware, such as the GICv2 virtual CPU interface.
+    pub fn map_external_device(
+        &mut self,
+        ipa: IpaAddr,
+        pa: PhysAddr,
+        size: usize,
+    ) -> Result<(), TranslationError> {
+        if !is_page_aligned(ipa.value() as usize)
+            || !is_page_aligned(pa.value() as usize)
+            || !is_aligned(size, PAGE_SIZE)
+        {
+            return Err(TranslationError::UnalignedMapping);
+        }
+        #[cfg(target_arch = "aarch64")]
+        let pa_bits = IdAa64Mmfr0El1::dump()
+            .ok_or(TranslationError::Unexpected)?
+            .pa_bits()
+            .ok_or(TranslationError::Unexpected)?;
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (ipa, pa, size);
+            return Err(TranslationError::Unexpected);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        self.map_external_device_with_pa_bits(ipa, pa, size, pa_bits)
+    }
+
+    fn map_external_device_with_pa_bits(
+        &mut self,
+        ipa: IpaAddr,
+        pa: PhysAddr,
+        size: usize,
+        pa_bits: u8,
+    ) -> Result<(), TranslationError> {
+        if size == 0
+            || !is_page_aligned(ipa.value() as usize)
+            || !is_page_aligned(pa.value() as usize)
+            || !is_page_aligned(size)
+        {
+            return Err(TranslationError::UnalignedMapping);
+        }
+        let ipa_end = ipa
+            .value()
+            .checked_add(size as u64)
+            .ok_or(TranslationError::AddressOverflow)?;
+        let pa_end = pa
+            .value()
+            .checked_add(size as u64)
+            .ok_or(TranslationError::AddressOverflow)?;
+        if ipa_end - 1 > (1_u64 << IPA_BITS) - 1 {
+            return Err(TranslationError::VirtualAddressOutOfRange);
+        }
+        if pa_end - 1 > (1_u64 << pa_bits) - 1 {
+            return Err(TranslationError::PhysicalAddressOutOfRange);
+        }
+
+        for offset in (0..size).step_by(PAGE_SIZE) {
+            self.map_l3_page(
+                ipa.value() + offset as u64,
+                pa.value() + offset as u64,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )?;
+        }
+        Ok(())
     }
 
     fn map_with_pa_bits(
@@ -530,6 +610,7 @@ impl VmCtl {
         let needs_ipa = matches!(
             usage,
             VmMemUsage::Image
+                | VmMemUsage::GuestRam
                 | VmMemUsage::Scratch
                 | VmMemUsage::Dtb
                 | VmMemUsage::Stack
@@ -572,7 +653,11 @@ impl VmCtl {
 
                 VmMem::PaOnly(PaRegion { usage, pa })
             }
-            VmMemUsage::Image | VmMemUsage::Scratch | VmMemUsage::Dtb | VmMemUsage::Stack => {
+            VmMemUsage::GuestRam
+            | VmMemUsage::Image
+            | VmMemUsage::Scratch
+            | VmMemUsage::Dtb
+            | VmMemUsage::Stack => {
                 let ipa = ipa.expect("validated IpaPa ipa");
                 VmMem::IpaPa(IpaPaRegion {
                     usage,
@@ -623,6 +708,7 @@ impl VmCtl {
         Ok(phy)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn entry_pa(&self, usage: VmMemUsage) -> impl Iterator<Item = RegionType> + '_ {
         EntryPaIter {
             entry: self.vm_mem.iter().find(|entry| entry.usage() == usage),
@@ -804,6 +890,40 @@ mod tests {
         assert_eq!(guard.start(), IpaAddr::new(GUARD_IPA));
         assert_eq!(guard.size(), PAGE_SIZE as u64);
         assert_eq!(leaf_descriptor(&vm, GUARD_IPA), 0);
+    }
+
+    #[test]
+    fn vmctl_maps_host_owned_virtual_cpu_interface_as_device() {
+        let mut vm = VmCtl::new(1);
+        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+            .expect("allocate root page table");
+
+        vm.map_external_device_with_pa_bits(
+            IpaAddr::new(0x0801_0000),
+            PhysAddr::new(0xff84_6000),
+            2 * PAGE_SIZE,
+            TEST_PA_BITS,
+        )
+        .expect("map GIC virtual CPU interface");
+
+        assert_eq!(
+            leaf_descriptor(&vm, 0x0801_0000),
+            encode_l3_page_descriptor(
+                0xff84_6000,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
+        assert_eq!(
+            leaf_descriptor(&vm, 0x0801_1000),
+            encode_l3_page_descriptor(
+                0xff84_7000,
+                Stage2MemoryType::DeviceNgNre,
+                Stage2Access::ReadWrite,
+                Stage2Exec::ExecuteNever,
+            )
+        );
     }
 
     #[test]
