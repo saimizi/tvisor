@@ -14,7 +14,7 @@ use tvisor_util::stage2_translation::Stage2RegisterValues;
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
-use tvisor_util::gicv2;
+use tvisor_util::gicv2::{self, GicV2Error};
 use tvisor_util::mmio::MmioDispatcher;
 use tvisor_util::system_info::PhysRegion;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
@@ -26,11 +26,18 @@ static HOST_CONSOLE_IRQ: Once<u32> = Once::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestRunError {
     Translation(TranslationError),
+    GicV2(GicV2Error),
     Exited {
         vector: u64,
         esr_el2: u64,
         reason: VcpuExitReason,
     },
+}
+
+impl From<GicV2Error> for GuestRunError {
+    fn from(value: GicV2Error) -> Self {
+        Self::GicV2(value)
+    }
 }
 
 impl From<TranslationError> for GuestRunError {
@@ -43,6 +50,7 @@ impl fmt::Display for GuestRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Translation(error) => write!(f, "guest translation setup failed: {error}"),
+            Self::GicV2(error) => write!(f, "GicV2 setup failed: {error}"),
             Self::Exited {
                 vector,
                 esr_el2,
