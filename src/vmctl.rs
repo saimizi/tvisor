@@ -19,7 +19,6 @@ use tvisor_util::*;
 
 use core::fmt::Display;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
-use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 /// The fixed 512 MiB guest RAM backing plus room for Stage-2 tables.
 pub const MAX_GUEST_MEM_BYTES: usize = DEFAULT_GUEST_RAM_SIZE as usize + 2 * 1024 * 1024;
@@ -793,7 +792,7 @@ impl VmCtl {
 
         let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
         unsafe {
-            gic.enable_timer_ppi(VIRTUAL_TIMER_PPI);
+            gic.enable_virtual_timer_ppi();
             gic.enable_spi(guest::get_host_console_irq());
         }
 

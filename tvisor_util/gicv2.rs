@@ -1,6 +1,7 @@
 //! GICv2 architecture definitions and DTB-discovered driver state.
 
 use crate::system_info::PhysRegion;
+use crate::virtual_timer::VIRTUAL_TIMER_PPI;
 use spin::Once;
 
 pub const SPURIOUS_IRQ: u32 = 1023;
@@ -143,21 +144,28 @@ impl GicV2 {
         self.cpu_interface_base() + GICC_DIR
     }
 
-    /// Enables a banked PPI from the GICv2 Non-secure register view.
-    /// The platform handoff must classify the timer PPI as Non-secure Group 1.
-    pub unsafe fn enable_timer_ppi(&self, ppi: u32) {
-        debug_assert!(ppi < 32);
+    /// Enables a banked virtual timer PPI (27) from the GICv2 Non-secure register view.
+    pub unsafe fn enable_virtual_timer_ppi(&self) {
+        let ppi_bit = 1_u32 << VIRTUAL_TIMER_PPI;
         unsafe {
+            // Explicitly classify PPI 27 as Non-Secure interrupt (Group 1)
+            write32(self.gicd_igroupr(), read32(self.gicd_igroupr()) | ppi_bit);
+
+            // Enable Group 1 forwarding
             write32(
                 self.gicd_ctlr(),
                 read32(self.gicd_ctlr()) | GICD_CTLR_ENABLE_GRP1_NS,
             );
+
+            // Allow all normal priorities through the CPU interface
             write32(self.gicc_pmr(), 0xff);
+
             write32(
                 self.gicc_ctlr(),
                 read32(self.gicc_ctlr()) | GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS,
             );
-            write32(self.gicd_isenabler(), 1 << ppi);
+
+            write32(self.gicd_isenabler(), ppi_bit);
         }
     }
 
