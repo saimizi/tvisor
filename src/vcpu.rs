@@ -1,6 +1,9 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
+use alloc::format;
+use alloc::string::String;
 use core::arch::global_asm;
+use core::fmt::Display;
 use tvisor_util::gicv2::VirtualGicV2State;
 use tvisor_util::mmio::{MmioAccess, MmioDecodeError, MmioDispatcher, MmioEmulationError};
 use tvisor_util::virtual_timer::VirtualTimerState;
@@ -132,6 +135,31 @@ pub enum VcpuExitReason {
     Unknown { ec: u8, iss: u32 },
 }
 
+impl Display for VcpuExitReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let msg = match self {
+            VcpuExitReason::Hvc { imm, arg0 } => format!("Hvc{{imm:{}, arg0:{}}}", imm, arg0),
+            VcpuExitReason::Stage2DataAbort {
+                ipa,
+                is_write,
+                dfsc,
+            } => format!(
+                "Stage2DataAbort{{ipa:{:x}, is_write:{:?}, dfsc:{}}}",
+                ipa, is_write, dfsc
+            ),
+            VcpuExitReason::Stage2InstructionAbort { ipa, ifsc } => {
+                format!("Stage2InstructionAbort{{ipa:{:x}, ifsc:{}}}", ipa, ifsc)
+            }
+            VcpuExitReason::SmcTrap => String::from("SmcTrap"),
+            VcpuExitReason::SysRegTrap => String::from("SysRegTrap"),
+            VcpuExitReason::FpSimdTrap => String::from("FpSimdTrap"),
+            VcpuExitReason::Unknown { ec, iss } => format!("Unknown{{ec:{}, iss:{}}}", ec, iss),
+        };
+
+        write!(f, "{}", msg)
+    }
+}
+
 impl VcpuExit {
     pub fn decode_reason(&self, context: &VcpuContext) -> VcpuExitReason {
         let ec = ((self.esr_el2 >> 26) & 0x3f) as u8;
@@ -195,7 +223,7 @@ pub struct Vcpu {
 const _: () = assert!(core::mem::offset_of!(Vcpu, context) == 0);
 const _: () = assert!(core::mem::offset_of!(Vcpu, exit) == 896);
 const _: () = assert!(core::mem::offset_of!(Vcpu, timer) == 928);
-const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 960);
+const _: () = assert!(core::mem::offset_of!(Vcpu, gic) == 952);
 const _: () = assert!(core::mem::size_of::<Vcpu>() == 976);
 
 impl Vcpu {
@@ -212,7 +240,6 @@ impl Vcpu {
                 cntvoff_el2: 0,
                 cntv_cval_el0: 0,
                 cntv_ctl_el0: 0,
-                pending_irq: 0,
             },
             gic: VirtualGicV2State {
                 vmcr: 0,
@@ -247,6 +274,7 @@ impl Vcpu {
         &self.exit
     }
 
+    #[allow(unused)]
     pub fn timer_mut(&mut self) -> &mut VirtualTimerState {
         &mut self.timer
     }
