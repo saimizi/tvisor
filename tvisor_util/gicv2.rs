@@ -1,12 +1,10 @@
 //! GICv2 architecture definitions and DTB-discovered driver state.
 
-use alloc::format;
 use core::error::Error;
 use core::fmt::Display;
 
 use crate::system_info::PhysRegion;
 use crate::virtual_timer::VIRTUAL_TIMER_PPI;
-use alloc::string::ToString;
 use spin::Once;
 
 pub const SPURIOUS_IRQ: u32 = 1023;
@@ -22,13 +20,11 @@ impl Error for GicV2Error {}
 
 impl Display for GicV2Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let msg = match self {
-            GicV2Error::InvalidIRQ(irq) => format!("InvalidIRQ({})", irq),
-            GicV2Error::InvalidSPI(irq) => format!("InvalidSPI({})", irq),
-            GicV2Error::Unexpected => "Unexpected".to_string(),
-        };
-
-        write!(f, "{}", msg)
+        match self {
+            GicV2Error::InvalidIRQ(irq) => write!(f, "InvalidIRQ({})", irq),
+            GicV2Error::InvalidSPI(irq) => write!(f, "InvalidSPI({})", irq),
+            GicV2Error::Unexpected => write!(f, "Unexpected"),
+        }
     }
 }
 
