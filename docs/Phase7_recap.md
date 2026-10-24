@@ -44,7 +44,7 @@ boundary unless:
 - `ID_AA64MMFR0_EL1.TGran4` reports 4 KiB granule support;
 - `ID_AA64MMFR0_EL1.PARange` represents every mapped physical address;
 - a UART physical address was discovered from the DTB;
-- the linker-owned 64 KiB bootstrap table arena has the required size and
+- the linker-owned 64 KiB EL2 stage-1 table arena has the required size and
   alignment; and
 - every mandatory mapping passes the software table walker.
 
@@ -81,7 +81,7 @@ without sharing a page between incompatible regions.
 | `.rodata` and unwind data | Normal WB/WA | No | No |
 | `.data`, `.got`, and `.bss` | Normal WB/WA | Yes | No |
 | Private EL2 stack | Normal WB/WA | Yes | No |
-| Bootstrap table arena | Normal WB/WA | Yes | No |
+| EL2 stage-1 table arena | Normal WB/WA | Yes | No |
 | UART page | Device-nGnRE | Yes | No |
 | Stack guard page | Unmapped | No | No |
 
@@ -123,7 +123,7 @@ TCR_EL2 = 0x0000_0000_8084_3519 on the tested Raspberry Pi 4
   PS    = PARange  44-bit PA on the tested board
 
 TTBR0_EL2 = 0x0000_0000_3000_0000
-  BADDR = bootstrap L1 root
+  BADDR = EL2 L1 root
   CnP   = 0
 
 SCTLR_EL2 = 0x0000_0000_30cd_183d
@@ -198,7 +198,7 @@ The positive Raspberry Pi 4 test completed with UART active under the new
 tables and printed:
 
 ```text
-Phase 7 checkpoint 2: tvisor EL2 page tables active
+Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active
   MAIR_EL2=0x00000000000004ff
    TCR_EL2=0x0000000080843519
  TTBR0_EL2=0x0000000030000000
@@ -224,7 +224,7 @@ reporting remain usable after the switch.
 ## 12. Suggested review order
 
 1. `scripts/rpi.ld`: verify page boundaries and section ordering.
-2. `tvisor_util/el2_translation.rs`: review descriptor bits, table allocation,
+2. `tvisor_util/el2_stage1_translation.rs`: review descriptor bits, table allocation,
    mapping conflict rules, walker, and constructed register values.
 3. `src/mm.rs`: review arena selection, mandatory mappings, guard omission,
    validation, and table-publication barrier.

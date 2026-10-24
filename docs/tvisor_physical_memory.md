@@ -12,7 +12,7 @@
 |  | `0x0406_8000–0x040a_c000` | 272 KiB | Tvisor image | `.data`, `.got`, and `.bss` | Includes allocator bitmaps, post-switch memory-map storage, and the global heap wrapper |
 |  | `0x040a_c000–0x040a_d000` | 4 KiB | Tvisor guard | Unmapped boot-stack guard | Deliberately has no EL2 descriptor |
 |  | `0x040a_d000–0x040b_d000` | 64 KiB | Tvisor stack | Private EL2 boot stack | Initial `SP` is `0x040b_d000`; the stack grows downward |
-|  | `0x040b_d000–0x040c_d000` | 64 KiB | Tvisor page tables | Linker-owned bootstrap-table arena | `NOLOAD`, explicitly zeroed before use, Normal RW/XN, and never allocator-managed |
+|  | `0x040b_d000–0x040c_d000` | 64 KiB | Tvisor page tables | Linker-owned EL2-stage-1-table arena | `NOLOAD`, explicitly zeroed before use, Normal RW/XN, and never allocator-managed |
 |  | `0x040c_d000–0x2eff_1000` | ≈683 MiB | RAM | Unassigned low RAM | Below `0x3000_0000`, so currently excluded by the conservative dynamic-reservation policy |
 |  | `0x2eff_1000–0x2f00_0000` | 60 KiB | Tvisor reservation | Pages containing the live DTB | Identity-mapped read-only/XN and retained without copying |
 |  | `0x2f00_0000–0x3000_0000` | 16 MiB | RAM | Unassigned low RAM | Currently excluded by the conservative dynamic-reservation policy |

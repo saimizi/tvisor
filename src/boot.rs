@@ -5,15 +5,16 @@ use core::{
 };
 
 use spin::Mutex;
-use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::stop;
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::platform::discover_memory_map;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 use tvisor_util::*;
+use tvisor_util::{aarch64_reg::*, gicv2::global};
 
 use crate::{
+    guest::get_host_console_irq,
     heap::{self, stats},
     mm,
 };
@@ -26,7 +27,12 @@ static MEMORY_MAP: Mutex<MemoryMap> = Mutex::new(MemoryMap::empty());
 
 unsafe extern "C" {
     fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
-    fn __switch_el2_page_tables(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
+    fn __switch_el2_stage1_page_tables(
+        mair_el2: u64,
+        tcr_el2: u64,
+        ttbr0_el2: u64,
+        sctlr_el2: u64,
+    ) -> !;
     static __image_start: u8;
     static __image_end: u8;
 }
@@ -59,9 +65,9 @@ __enter_private_el2:
 "#,
 );
 
-pub unsafe fn enter_private_el2(bootstrap: mm::BootstrapPageTable) -> ! {
-    if !is_page_aligned(bootstrap.root_pa as usize) {
-        println!("Bootstrap page table is not page aligned");
+pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -> ! {
+    if !is_page_aligned(el2_stage1_page_table.root_pa as usize) {
+        println!("EL2 stage-1 page table is not page aligned");
         stop()
     }
 
@@ -70,14 +76,21 @@ pub unsafe fn enter_private_el2(bootstrap: mm::BootstrapPageTable) -> ! {
         | TCR_EL2_IRGN0_MEM_WB_RA_WA
         | TCR_EL2_ORGN0_MEM_WB_RA_WA
         | TCR_EL2_SH0_INNER_SHAREABLE
-        | ((bootstrap.pa_range as u64) << 16);
+        | ((el2_stage1_page_table.pa_range as u64) << 16);
 
     const SCTLR_EL2_RES1: u64 =
         (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
     const SCTLR_EL2_VALUE: u64 =
         SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
 
-    unsafe { __enter_private_el2(MAIR_EL2_VALUE, tcr_el2, bootstrap.root_pa, SCTLR_EL2_VALUE) }
+    unsafe {
+        __enter_private_el2(
+            MAIR_EL2_VALUE,
+            tcr_el2,
+            el2_stage1_page_table.root_pa,
+            SCTLR_EL2_VALUE,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -90,18 +103,18 @@ extern "C" fn private_el2_main(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctl
     if let Some(vbar) = VbarEl2::dump() {
         println!("VBAR_EL2: {:#018x}", vbar.value);
     }
-    println!("Phase 7 checkpoint 1: switching EL2 page tables");
+    println!("Phase 7 checkpoint 1: switching EL2 stage-1 page tables");
     // SAFETY: All values were validated before takeover, table stores were
     // published, and this routine never returns to the inherited regime.
-    unsafe { __switch_el2_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2) }
+    unsafe { __switch_el2_stage1_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2) }
 }
 
 global_asm!(
     r#"
     .section .text.takeover, "ax"
-    .global __switch_el2_page_tables
-    .type __switch_el2_page_tables, %function
-__switch_el2_page_tables:
+    .global __switch_el2_stage1_page_tables
+    .type __switch_el2_stage1_page_tables, %function
+__switch_el2_stage1_page_tables:
     // x0=MAIR_EL2, x1=TCR_EL2, x2=TTBR0_EL2, x3=SCTLR_EL2,
     // it uses no stack, literal pool, call, or return address.
 
@@ -120,7 +133,7 @@ __switch_el2_page_tables:
     // Install tvisor's page table property like virtual adderss space, translation granule...
     msr  tcr_el2, x1
 
-    // Install tvisor's bootstrap L1 root table
+    // Install tvisor's EL2 L1 root table
     msr  ttbr0_el2, x2
     isb
 
@@ -136,7 +149,7 @@ __switch_el2_page_tables:
 
     // Same parameter order  MAIR_EL2, TCR_EL2, TTBR0_EL2, SCTLR_EL2.
     b    post_switch_page_tables
-    .size __switch_el2_page_tables, . - __switch_el2_page_tables
+    .size __switch_el2_stage1_page_tables, . - __switch_el2_stage1_page_tables
 "#,
 );
 
@@ -147,7 +160,7 @@ fn check_switched_environment(
     expected_sctlr: u64,
 ) {
     let stack_canary = 0x7476_6973_6f72_5037_u64;
-    println!("Phase 7 checkpoint 2: tvisor EL2 page tables active");
+    println!("Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active");
     let actual_mair = MairEl2::dump().expect("EL2 MAIR readback").value;
     let actual_tcr = TcrEl2::dump().expect("EL2 TCR readback").value;
     let actual_ttbr0 = Ttbr0El2::dump().expect("EL2 TTBR0 readback").value;
@@ -179,6 +192,12 @@ extern "C" fn post_switch_page_tables(
 ) -> ! {
     'wait: {
         check_switched_environment(expected_mair, expected_tcr, expected_ttbr0, expected_sctlr);
+
+        // After EL2 stage1 is mapped, we recheck the console IRQ
+        let Some(gicv2) = global() else { break 'wait };
+        if get_host_console_irq() >= gicv2.num_interrupts() {
+            break 'wait;
+        }
 
         let image_start = core::ptr::addr_of!(__image_start) as u64;
         let image_end = core::ptr::addr_of!(__image_end) as u64;

@@ -11,11 +11,12 @@ extern crate std;
 pub mod debug_util;
 
 pub mod aarch64_reg;
-pub mod el2_translation;
+pub mod el2_stage1_translation;
 pub mod fdt;
 pub mod gicv2;
 pub mod guest_fdt;
 pub mod guest_platform;
+pub mod guest_stage2_translation;
 pub mod heap_allocator;
 pub mod linux_boot;
 pub mod memory_map;
@@ -23,7 +24,6 @@ pub mod mmio;
 pub mod page;
 pub mod page_allocator;
 pub mod platform;
-pub mod stage2_translation;
 pub mod system_info;
 pub mod virtual_timer;
 

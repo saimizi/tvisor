@@ -1,4 +1,4 @@
-# Phase 7: EL2 page tables and takeover transition
+# Phase 7: EL2 stage-1 page tables and takeover transition
 
 ## 1. Purpose and safety boundary
 
@@ -31,17 +31,21 @@ The takeover path must stop before writing registers unless all of these hold:
 - asynchronous exceptions are masked;
 - the UART CPU physical page is known;
 - the final memory map has been moved into tvisor-owned static storage;
-- page-table storage lies entirely in the linker-owned bootstrap arena; and
+- page-table storage lies entirely in the linker-owned EL2 stage-1 page-table arena; and
 - all mandatory identity mappings pass a software table walk.
 
 Failure before the no-return boundary uses the diagnostic error path and
 halts. Failure after it enters the private exception handler and also halts.
 
-## 3. Bootstrap table storage
+## 3. EL2 table storage
 
 The linker reserves sixteen 4 KiB pages in a dedicated, aligned
-`.bootstrap_tables` `NOLOAD` section inside the tvisor runtime footprint.
+`.el2_stage1_tables` `NOLOAD` section inside the tvisor runtime footprint.
 Linker assertions and runtime checks validate its size and alignment.
+
+These are tvisor's runtime EL2 stage-1 page tables, retained after takeover.
+They are constructed before the physical-page allocator is available; the
+linker-owned storage does not make them temporary bootstrap tables.
 
 The first provider is monotonic:
 
@@ -83,7 +87,7 @@ The initial requests are:
 - `.rodata`: Normal, read-only, XN;
 - `.data`, `.bss`, and `.got`: Normal, read/write, XN;
 - private boot stack: Normal, read/write, XN;
-- bootstrap page-table arena: Normal, read/write, XN;
+- EL2 stage-1 page-table arena: Normal, read/write, XN;
 - UART page: Device-nGnRE, read/write, XN; and
 - no descriptor for the stack guard page.
 
@@ -169,7 +173,7 @@ An allocation-free walker checks every mandatory address:
 For each address it verifies output PA, memory type, write permission, and
 execute permission. It also proves the guard page and representative holes
 are invalid. The root address, all next-table addresses, and every table page
-must lie within the reserved bootstrap arena.
+must lie within the reserved EL2 stage-1 page-table arena.
 
 ## 8. Cache and table visibility policy
 

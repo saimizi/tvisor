@@ -1,13 +1,20 @@
 use crate::alloc::string::ToString;
+use crate::guest::{self, GuestRunError};
 use crate::mm;
 use crate::vcpu::Vcpu;
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use tvisor_util::aarch64_reg::*;
-use tvisor_util::el2_translation::*;
-use tvisor_util::guest_platform::DEFAULT_GUEST_RAM_SIZE;
+use tvisor_util::el2_stage1_translation::*;
+use tvisor_util::guest_fdt;
+use tvisor_util::guest_platform::{
+    self, DEFAULT_GUEST_RAM_SIZE, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ,
+    GUEST_RAM, VIRTUAL_PL011_IRQ,
+};
+use tvisor_util::guest_stage2_translation::*;
+use tvisor_util::linux_boot;
+use tvisor_util::mmio;
 use tvisor_util::page_allocator::AllocatorError;
-use tvisor_util::stage2_translation::*;
 use tvisor_util::*;
 
 use core::fmt::Display;
@@ -92,7 +99,7 @@ pub enum VmMemUsage {
     Stack,
     Dtb,
     Guard,
-    PageTable,
+    GuestStage2PageTable,
 }
 
 impl VmMemUsage {
@@ -104,7 +111,7 @@ impl VmMemUsage {
             VmMemUsage::Stack => true,
             VmMemUsage::Guard => false,
             VmMemUsage::Scratch => true,
-            VmMemUsage::PageTable => true,
+            VmMemUsage::GuestStage2PageTable => true,
         }
     }
 }
@@ -118,7 +125,7 @@ impl Display for VmMemUsage {
             VmMemUsage::Stack => "Stack",
             VmMemUsage::Guard => "Guard",
             VmMemUsage::Scratch => "Scratch",
-            VmMemUsage::PageTable => "PageTable",
+            VmMemUsage::GuestStage2PageTable => "GuestStage2PageTable",
         };
 
         write!(f, "{}", msg)
@@ -328,11 +335,11 @@ pub struct VmCtl {
 }
 
 impl VmCtl {
-    pub fn page_table_root(&self) -> Option<AddressType> {
+    pub fn guest_stage2_page_table_root(&self) -> Option<AddressType> {
         if let Some(VmMem::PaOnly(pa)) = self
             .vm_mem
             .iter()
-            .find(|&a| a.usage() == VmMemUsage::PageTable)
+            .find(|&a| a.usage() == VmMemUsage::GuestStage2PageTable)
         {
             Some(pa.pa[0])
         } else {
@@ -343,9 +350,9 @@ impl VmCtl {
     pub fn map(
         &mut self,
         usage: VmMemUsage,
-        mem_type: Stage2MemoryType,
-        access: Stage2Access,
-        exec: Stage2Exec,
+        mem_type: GuestStage2MemoryType,
+        access: GuestStage2Access,
+        exec: GuestStage2Exec,
     ) -> Result<(), TranslationError> {
         #[cfg(target_arch = "aarch64")]
         let pa_bits = IdAa64Mmfr0El1::dump()
@@ -427,9 +434,9 @@ impl VmCtl {
             self.map_l3_page(
                 ipa.value() + offset as u64,
                 pa.value() + offset as u64,
-                Stage2MemoryType::DeviceNgNre,
-                Stage2Access::ReadWrite,
-                Stage2Exec::ExecuteNever,
+                GuestStage2MemoryType::DeviceNgNre,
+                GuestStage2Access::ReadWrite,
+                GuestStage2Exec::ExecuteNever,
             )?;
         }
         Ok(())
@@ -438,9 +445,9 @@ impl VmCtl {
     fn map_with_pa_bits(
         &mut self,
         usage: VmMemUsage,
-        mem_type: Stage2MemoryType,
-        access: Stage2Access,
-        exec: Stage2Exec,
+        mem_type: GuestStage2MemoryType,
+        access: GuestStage2Access,
+        exec: GuestStage2Exec,
         pa_bits: u8,
     ) -> Result<(), TranslationError> {
         let Some(VmMem::IpaPa(mapping)) = self.vm_mem.iter().find(|f| f.usage() == usage) else {
@@ -481,16 +488,16 @@ impl VmCtl {
         &mut self,
         ipa: u64,
         pa: u64,
-        mem_type: Stage2MemoryType,
-        access: Stage2Access,
-        exec: Stage2Exec,
+        mem_type: GuestStage2MemoryType,
+        access: GuestStage2Access,
+        exec: GuestStage2Exec,
     ) -> Result<(), TranslationError> {
         let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
         let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
         let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
 
         // Level 1 lookup
-        let Some(root) = self.page_table_root() else {
+        let Some(root) = self.guest_stage2_page_table_root() else {
             return Err(TranslationError::Unexpected);
         };
         let root_table = unsafe { &mut *(root.as_ptr() as *mut TablePage) };
@@ -502,7 +509,7 @@ impl VmCtl {
             l1_entry & ADDRESS_MASK
         } else {
             let next_pa = self
-                .vm_mem_alloc_sub_page_table()
+                .vm_mem_alloc_sub_guest_stage2_page_table()
                 .map_err(|_e| TranslationError::TableExhausted)?
                 .value();
             root_table.entries_mut()[l1_idx] = VALID | TABLE_OR_PAGE | (next_pa & ADDRESS_MASK);
@@ -519,7 +526,7 @@ impl VmCtl {
             l2_entry & ADDRESS_MASK
         } else {
             let next_pa = self
-                .vm_mem_alloc_sub_page_table()
+                .vm_mem_alloc_sub_guest_stage2_page_table()
                 .map_err(|_| TranslationError::TableExhausted)?
                 .value();
 
@@ -645,7 +652,7 @@ impl VmCtl {
         }
 
         let mem = match usage {
-            VmMemUsage::PageTable => {
+            VmMemUsage::GuestStage2PageTable => {
                 let mut pa = Vec::new();
                 for p in 0..size_aligned / PAGE_SIZE {
                     pa.push(AddressType::new(phy.value() + (p * PAGE_SIZE) as u64));
@@ -687,7 +694,7 @@ impl VmCtl {
         ret
     }
 
-    fn vm_mem_alloc_sub_page_table(&mut self) -> Result<AddressType, AllocatorError> {
+    fn vm_mem_alloc_sub_guest_stage2_page_table(&mut self) -> Result<AddressType, AllocatorError> {
         if self.allocated_physical_pages() >= MAX_GUEST_MEM_PAGES {
             return Err(AllocatorError::Exhausted);
         }
@@ -695,7 +702,7 @@ impl VmCtl {
         let Some(VmMem::PaOnly(pt)) = self
             .vm_mem
             .iter_mut()
-            .find(|f| f.usage() == VmMemUsage::PageTable)
+            .find(|f| f.usage() == VmMemUsage::GuestStage2PageTable)
         else {
             return Err(AllocatorError::Unexpected);
         };
@@ -760,6 +767,154 @@ impl VmCtl {
 
         self.vm_mem.clear();
     }
+
+    pub fn run_linux_vm(
+        &mut self,
+        linux_image: PhysRegion,
+        need_deactivate: &mut bool,
+    ) -> Result<(), GuestRunError> {
+        let image = unsafe {
+            core::slice::from_raw_parts(
+                linux_image.start().value() as *const u8,
+                linux_image.size() as usize,
+            )
+        };
+
+        let layout = linux_boot::LinuxBootLayout::default_for_image(image, None)
+            .map_err(|_| TranslationError::Unexpected)?;
+        let (image_ipa, image_extent) = layout.image();
+        let (dtb_ipa, dtb_capacity) = layout.dtb();
+
+        println!(
+            "Phase 10: loading Linux Image: linux_image={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
+            linux_image,
+            image.len(),
+            image_ipa,
+            image_extent,
+            dtb_ipa,
+        );
+
+        let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
+        unsafe {
+            gic.enable_virtual_timer_ppi()?;
+            gic.enable_spi(guest::get_host_console_irq())?;
+        }
+
+        tvisor_util::debug_util::enable_rx_interrupt()
+            .expect("host Mini UART must be initialized before guest setup");
+        guest_platform::validate().map_err(|_| TranslationError::Unexpected)?;
+
+        let gicv_mapping =
+            guest_platform::map_device_into_window(GUEST_GICV, gic.info().virtual_cpu_interface())
+                .map_err(|_| TranslationError::Unexpected)?;
+
+        let guest_ram_pa = self
+            .vm_mem_alloc(
+                VmMemUsage::GuestRam,
+                Some(IpaAddr::new(GUEST_RAM.start())),
+                GUEST_RAM.size() as usize,
+            )
+            .map_err(|_| TranslationError::Unexpected)?
+            .ok_or(TranslationError::Unexpected)?
+            .value();
+        let guest_pa_for = |ipa: u64| -> Result<u64, TranslationError> {
+            guest_ram_pa
+                .checked_add(
+                    ipa.checked_sub(GUEST_RAM.start())
+                        .ok_or(TranslationError::Unexpected)?,
+                )
+                .ok_or(TranslationError::AddressOverflow)
+        };
+        let image_pa = guest_pa_for(image_ipa)?;
+        let dtb_pa = guest_pa_for(dtb_ipa)?;
+
+        // The U-Boot source contains only initialized bytes. The Image header's
+        // extent includes the zero-initialized tail expected by the kernel.
+        unsafe {
+            core::ptr::copy_nonoverlapping(image.as_ptr(), image_pa as *mut u8, image.len());
+            core::ptr::write_bytes(
+                (image_pa + image.len() as u64) as *mut u8,
+                0,
+                image_extent as usize - image.len(),
+            );
+        }
+
+        let guest_mem_regions = [guest_fdt::GuestMemoryRegion {
+            base: GUEST_RAM.start(),
+            size: GUEST_RAM.size(),
+        }];
+        let dtb_slice =
+            unsafe { core::slice::from_raw_parts_mut(dtb_pa as *mut u8, dtb_capacity as usize) };
+        let dtb_real_size = guest_fdt::build_guest_dtb(
+            dtb_slice,
+            &guest_fdt::GuestFdtConfig {
+                memory_regions: &guest_mem_regions,
+                bootargs: Some(
+                    "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x09000000 loglevel=8",
+                ),
+                pl011: Some(guest_fdt::GuestPl011 {
+                    base: GUEST_PL011.start(),
+                    size: GUEST_PL011.size(),
+                    clock_hz: GUEST_PL011_CLOCK_HZ,
+                    interrupt: VIRTUAL_PL011_IRQ,
+                }),
+                gicv2: Some(guest_fdt::GuestGicV2 {
+                    distributor_base: GUEST_GICD.start(),
+                    distributor_size: GUEST_GICD.size(),
+                    cpu_interface_base: gicv_mapping.device_ipa,
+                    cpu_interface_size: gicv_mapping.device.size(),
+                }),
+            },
+        )
+        .map_err(|_| TranslationError::Unexpected)?;
+
+        unsafe {
+            guest::clean_dcache_poc(image_pa as usize, (image_pa + image_extent) as usize);
+            guest::clean_dcache_poc(dtb_pa as usize, (dtb_pa + dtb_real_size as u64) as usize);
+            guest::invalidate_icache_all();
+        }
+
+        self.vm_mem_alloc(VmMemUsage::GuestStage2PageTable, None, PAGE_SIZE)
+            .map_err(|_| TranslationError::Unexpected)?;
+        self.map(
+            VmMemUsage::GuestRam,
+            GuestStage2MemoryType::NormalWbWa,
+            GuestStage2Access::ReadWrite,
+            GuestStage2Exec::Executable,
+        )?;
+        self.map_external_device(
+            IpaAddr::new(guest_platform::GUEST_GICV.start()),
+            gicv_mapping.mapped_pa,
+            gicv_mapping.mapping_size,
+        )?;
+
+        let pa_range = IdAa64Mmfr0El1::dump().unwrap().pa_range();
+        let guest_stage2_root_pa = self.guest_stage2_page_table_root().unwrap().value();
+        let guest_stage2_regs =
+            guest_stage2_register_values(self.vm_id(), guest_stage2_root_pa, pa_range)?;
+        unsafe { guest::activate_guest_stage2(&guest_stage2_regs) };
+        *need_deactivate = true;
+
+        let registers = layout.initial_registers();
+        let vcpu_id = self.add_vcpu(Vcpu::new_linux(registers.pc, registers.x0));
+        let vcpu = self
+            .vcpu_mut(vcpu_id)
+            .expect("new Linux vCPU must be present");
+        println!(
+            "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
+            vcpu.context().elr_el2,
+            vcpu.context().x[0]
+        );
+
+        let mut mmio_dispatcher = mmio::MmioDispatcher::default();
+        let vector = guest::run_vcpu_with_mmio(vcpu, &mut mmio_dispatcher, gic);
+
+        Err(GuestRunError::Exited {
+            vector,
+            esr_el2: vcpu.exit().esr_el2,
+            reason: vcpu.exit().decode_reason(vcpu.context()),
+        })
+    }
 }
 
 impl Drop for VmCtl {
@@ -788,7 +943,7 @@ mod tests {
     const GUARD_IPA: u64 = IMAGE_IPA + 2 * PAGE_SIZE as u64;
 
     fn leaf_descriptor(vm: &VmCtl, ipa: u64) -> u64 {
-        let root = vm.page_table_root().expect("page-table root");
+        let root = vm.guest_stage2_page_table_root().expect("page-table root");
         let l1_idx = ((ipa >> L1_SHIFT) & 0x1ff) as usize;
         let l2_idx = ((ipa >> L2_SHIFT) & 0x1ff) as usize;
         let l3_idx = ((ipa >> L3_SHIFT) & 0x1ff) as usize;
@@ -808,7 +963,7 @@ mod tests {
     #[test]
     fn vmctl_maps_stage2_pages_with_expected_permissions() {
         let mut vm = VmCtl::new(1);
-        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+        vm.vm_mem_alloc(VmMemUsage::GuestStage2PageTable, None, PAGE_SIZE)
             .expect("allocate root page table");
         vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
             .expect("allocate image");
@@ -821,17 +976,17 @@ mod tests {
 
         vm.map_with_pa_bits(
             VmMemUsage::Image,
-            Stage2MemoryType::NormalWbWa,
-            Stage2Access::ReadOnly,
-            Stage2Exec::Executable,
+            GuestStage2MemoryType::NormalWbWa,
+            GuestStage2Access::ReadOnly,
+            GuestStage2Exec::Executable,
             TEST_PA_BITS,
         )
         .expect("map image");
         vm.map_with_pa_bits(
             VmMemUsage::Scratch,
-            Stage2MemoryType::NormalWbWa,
-            Stage2Access::ReadWrite,
-            Stage2Exec::ExecuteNever,
+            GuestStage2MemoryType::NormalWbWa,
+            GuestStage2Access::ReadWrite,
+            GuestStage2Exec::ExecuteNever,
             TEST_PA_BITS,
         )
         .expect("map scratch");
@@ -850,27 +1005,27 @@ mod tests {
             leaf_descriptor(&vm, IMAGE_IPA),
             encode_l3_page_descriptor(
                 image_pa.value(),
-                Stage2MemoryType::NormalWbWa,
-                Stage2Access::ReadOnly,
-                Stage2Exec::Executable,
+                GuestStage2MemoryType::NormalWbWa,
+                GuestStage2Access::ReadOnly,
+                GuestStage2Exec::Executable,
             )
         );
         assert_eq!(
             leaf_descriptor(&vm, SCRATCH_IPA),
             encode_l3_page_descriptor(
                 scratch_pa.value(),
-                Stage2MemoryType::NormalWbWa,
-                Stage2Access::ReadWrite,
-                Stage2Exec::ExecuteNever,
+                GuestStage2MemoryType::NormalWbWa,
+                GuestStage2Access::ReadWrite,
+                GuestStage2Exec::ExecuteNever,
             )
         );
-        assert_eq!(vm.entry_pa(VmMemUsage::PageTable).count(), 3);
+        assert_eq!(vm.entry_pa(VmMemUsage::GuestStage2PageTable).count(), 3);
     }
 
     #[test]
     fn vmctl_keeps_guard_ipa_unmapped() {
         let mut vm = VmCtl::new(1);
-        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+        vm.vm_mem_alloc(VmMemUsage::GuestStage2PageTable, None, PAGE_SIZE)
             .expect("allocate root page table");
         vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
             .expect("allocate image");
@@ -879,9 +1034,9 @@ mod tests {
 
         vm.map_with_pa_bits(
             VmMemUsage::Image,
-            Stage2MemoryType::NormalWbWa,
-            Stage2Access::ReadOnly,
-            Stage2Exec::Executable,
+            GuestStage2MemoryType::NormalWbWa,
+            GuestStage2Access::ReadOnly,
+            GuestStage2Exec::Executable,
             TEST_PA_BITS,
         )
         .expect("map image");
@@ -895,7 +1050,7 @@ mod tests {
     #[test]
     fn vmctl_maps_host_owned_virtual_cpu_interface_as_device() {
         let mut vm = VmCtl::new(1);
-        vm.vm_mem_alloc(VmMemUsage::PageTable, None, PAGE_SIZE)
+        vm.vm_mem_alloc(VmMemUsage::GuestStage2PageTable, None, PAGE_SIZE)
             .expect("allocate root page table");
 
         vm.map_external_device_with_pa_bits(
@@ -910,18 +1065,18 @@ mod tests {
             leaf_descriptor(&vm, 0x0801_0000),
             encode_l3_page_descriptor(
                 0xff84_6000,
-                Stage2MemoryType::DeviceNgNre,
-                Stage2Access::ReadWrite,
-                Stage2Exec::ExecuteNever,
+                GuestStage2MemoryType::DeviceNgNre,
+                GuestStage2Access::ReadWrite,
+                GuestStage2Exec::ExecuteNever,
             )
         );
         assert_eq!(
             leaf_descriptor(&vm, 0x0801_1000),
             encode_l3_page_descriptor(
                 0xff84_7000,
-                Stage2MemoryType::DeviceNgNre,
-                Stage2Access::ReadWrite,
-                Stage2Exec::ExecuteNever,
+                GuestStage2MemoryType::DeviceNgNre,
+                GuestStage2Access::ReadWrite,
+                GuestStage2Exec::ExecuteNever,
             )
         );
     }
@@ -932,7 +1087,7 @@ mod tests {
         vm.vm_mem_alloc(VmMemUsage::Image, Some(IpaAddr::new(IMAGE_IPA)), PAGE_SIZE)
             .expect("allocate image");
         vm.vm_mem_alloc(
-            VmMemUsage::PageTable,
+            VmMemUsage::GuestStage2PageTable,
             None,
             (MAX_GUEST_MEM_PAGES - 1) * PAGE_SIZE,
         )
@@ -941,15 +1096,15 @@ mod tests {
         assert_eq!(
             vm.map_with_pa_bits(
                 VmMemUsage::Image,
-                Stage2MemoryType::NormalWbWa,
-                Stage2Access::ReadOnly,
-                Stage2Exec::Executable,
+                GuestStage2MemoryType::NormalWbWa,
+                GuestStage2Access::ReadOnly,
+                GuestStage2Exec::Executable,
                 TEST_PA_BITS,
             ),
             Err(TranslationError::TableExhausted)
         );
         assert_eq!(
-            vm.entry_pa(VmMemUsage::PageTable).count(),
+            vm.entry_pa(VmMemUsage::GuestStage2PageTable).count(),
             MAX_GUEST_MEM_PAGES - 1
         );
     }

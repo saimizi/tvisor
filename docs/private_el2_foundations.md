@@ -144,7 +144,7 @@ recovery must be available before the first run.
 ## 10. Phase boundary
 
 Phase 6 finishes when tvisor can run and report an exception using only its
-own stack and vector table. It still uses U-Boot's EL2 page tables. Phase 7
+own stack and vector table. It still uses U-Boot's EL2 stage-1 page tables. Phase 7
 then maps these exact foundations and replaces the inherited translation
 regime.
 

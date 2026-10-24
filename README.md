@@ -129,7 +129,7 @@ U-Boot> go <main-address> fdt=${fdt_addr}
 ```
 
 The complete tvisor runtime footprint must not overlap live U-Boot or firmware
-state. Initial EL2 tables come from tvisor's linker-owned bootstrap arena, so
+state. Initial EL2 tables come from tvisor's linker-owned EL2 stage-1 page-table arena, so
 no `lmb=` or `bootmem=` arguments are accepted or required.
 
 ### 5. Check the result
@@ -143,7 +143,7 @@ A successful run should print:
 - the private-environment checkpoints:
 
 ```text
-Phase 7 checkpoint 2: tvisor EL2 page tables active
+Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active
 Phase 7 checkpoint 3: register, stack, and image validation passed
 Phase 9 Guest Preparation & Execution Verification: PASSED
 ```
@@ -159,7 +159,7 @@ test; there is no return path to the U-Boot prompt.
 - [Address translation](docs/address_translation.md)
 - [Draft tvisor EL2 memory map](docs/tvisor_memory_map.md)
 - [Private EL2 foundations](docs/private_el2_foundations.md)
-- [EL2 page-table transition](docs/el2_page_table_transition.md)
+- [EL2 stage-1 page-table transition](docs/el2_stage1_page_table_transition.md)
 - [U-Boot handoff-state diagnostics](docs/check_handoff_state.md)
 - [Peripheral address translation](docs/peripheral_address_translation.md)
 

@@ -6,7 +6,7 @@ use core::{
 
 use spin::Mutex;
 use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
-use tvisor_util::el2_translation::{
+use tvisor_util::el2_stage1_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
 };
 use tvisor_util::gicv2::GicV2Info;
@@ -46,7 +46,7 @@ impl GlobalPageAllocator {
 }
 
 static PAGE_ALLOCATOR: GlobalPageAllocator = GlobalPageAllocator::new();
-static BOOTSTRAP_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
+static EL2_STAGE1_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static __text_start: u8;
@@ -61,8 +61,8 @@ unsafe extern "C" {
     static __boot_stack_guard_end: u8;
     static __boot_stack_bottom: u8;
     static __boot_stack_top: u8;
-    static __bootstrap_tables_start: u8;
-    static __bootstrap_tables_end: u8;
+    static __el2_stage1_tables_start: u8;
+    static __el2_stage1_tables_end: u8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,19 +97,20 @@ macro_rules! link_addr {
     };
 }
 
+/// Root and physical-address range of tvisor's runtime EL2 stage-1 page tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BootstrapPageTable {
+pub struct El2Stage1PageTable {
     pub root_pa: u64,
     pub pa_range: u8,
 }
 
-pub fn setup_bootstrap_page_table(
+pub fn setup_el2_stage1_page_table(
     live_dtb_pages: PhysRegion,
     linux_image_pages: PhysRegion,
     uart_region: PhysRegion,
     gic: GicV2Info,
-) -> Result<BootstrapPageTable, PrepareError> {
-    if BOOTSTRAP_TABLES_CLAIMED.swap(true, Ordering::AcqRel) {
+) -> Result<El2Stage1PageTable, PrepareError> {
+    if EL2_STAGE1_TABLES_CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(PrepareError::Validation);
     }
 
@@ -143,8 +144,8 @@ pub fn setup_bootstrap_page_table(
 
     let pa_range = mmfr0.pa_range();
 
-    let pt_area_start = link_addr!(__bootstrap_tables_start);
-    let pt_area_end = link_addr!(__bootstrap_tables_end);
+    let pt_area_start = link_addr!(__el2_stage1_tables_start);
+    let pt_area_end = link_addr!(__el2_stage1_tables_end);
 
     if !is_page_aligned(pt_area_start as usize) || !is_page_aligned(pt_area_end as usize) {
         return Err(PrepareError::Validation);
@@ -207,11 +208,11 @@ pub fn setup_bootstrap_page_table(
         false,
     )?;
 
-    // .bootstrap_tables
+    // .el2_stage1_tables
     map_identity(
         &mut tables,
-        link_addr!(__bootstrap_tables_start),
-        link_addr!(__bootstrap_tables_end),
+        link_addr!(__el2_stage1_tables_start),
+        link_addr!(__el2_stage1_tables_end),
         true,
         false,
     )?;
@@ -246,12 +247,12 @@ pub fn setup_bootstrap_page_table(
         map_identity_device(&mut tables, region)?;
     }
 
-    validate_bootstrap_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
+    validate_el2_stage1_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
     let root_pa = tables.root_pa();
     *TVISOR_TABLES.lock() = Some(tables);
 
-    Ok(BootstrapPageTable { root_pa, pa_range })
+    Ok(El2Stage1PageTable { root_pa, pa_range })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,13 +527,13 @@ pub fn map_identity_regions_excluding<const T: usize, const R: usize, const E: u
     Ok(())
 }
 
-pub fn validate_bootstrap_page_table<const N: usize>(
+pub fn validate_el2_stage1_page_table<const N: usize>(
     tables: &TableSet<'_, N>,
     uart: u64,
     live_dtb_pages: PhysRegion,
 ) -> Result<(), PrepareError> {
-    let arena_start = link_addr!(__bootstrap_tables_start);
-    let arena_end = link_addr!(__bootstrap_tables_end);
+    let arena_start = link_addr!(__el2_stage1_tables_start);
+    let arena_end = link_addr!(__el2_stage1_tables_end);
     let checks = [
         (link_addr!(__text_start), false, true, MemoryType::Normal),
         (link_addr!(__vectors_start), false, true, MemoryType::Normal),
