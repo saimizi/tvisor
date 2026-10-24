@@ -5,15 +5,16 @@ use core::{
 };
 
 use spin::Mutex;
-use tvisor_util::aarch64_reg::*;
 use tvisor_util::debug_util::stop;
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::platform::discover_memory_map;
 use tvisor_util::system_info::{PhysAddr, PhysRegion};
 use tvisor_util::*;
+use tvisor_util::{aarch64_reg::*, gicv2::global};
 
 use crate::{
+    guest::get_host_console_irq,
     heap::{self, stats},
     mm,
 };
@@ -191,6 +192,12 @@ extern "C" fn post_switch_page_tables(
 ) -> ! {
     'wait: {
         check_switched_environment(expected_mair, expected_tcr, expected_ttbr0, expected_sctlr);
+
+        // After EL2 stage1 is mapped, we recheck the console IRQ
+        let Some(gicv2) = global() else { break 'wait };
+        if get_host_console_irq() >= gicv2.num_interrupts() {
+            break 'wait;
+        }
 
         let image_start = core::ptr::addr_of!(__image_start) as u64;
         let image_end = core::ptr::addr_of!(__image_end) as u64;

@@ -79,15 +79,14 @@ pub fn linux_image_source() -> Option<PhysRegion> {
 
 /// Records the physical Mini UART SPI discovered from the host DTB.
 pub fn set_host_console_irq(irq: u32) -> Result<(), ()> {
-    let Some(gicv2) = gicv2::global() else {
-        return Err(());
-    };
-    if !(32..gicv2.num_interrupts()).contains(&irq) {
+    if !(32..gicv2::SPURIOUS_IRQ).contains(&irq) {
         return Err(());
     }
+
     if let Some(existing) = HOST_CONSOLE_IRQ.get() {
         return if *existing == irq { Ok(()) } else { Err(()) };
     }
+
     HOST_CONSOLE_IRQ.call_once(|| irq);
     Ok(())
 }

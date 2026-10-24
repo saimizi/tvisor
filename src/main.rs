@@ -196,6 +196,8 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         gic.virtual_cpu_interface(),
     );
     gicv2::initialize(gic);
+
+    // Use gicv::SPURIOUS_IRQ to check console IRQ.
     if guest::set_host_console_irq(console.irq).is_err() {
         println!("Host console IRQ discovery failed: {}", console.irq);
         halt();
