@@ -34,7 +34,7 @@ order:
      tvisor virtual-memory-map design
                  |
                  v
- private stack, vectors, allocator, and EL2 page tables
+ private stack, vectors, allocator, and EL2 stage-1 page tables
 ```
 
 This document records the phased implementation plan through the physical-page
@@ -57,7 +57,7 @@ The current implementation has these properties:
 - `src/mm.rs` owns the global physical-page allocator, page-table preparation,
   retained-DTB mapping, and one-shot post-switch memory-map storage.
 - `scripts/rpi.ld` links tvisor at physical address `0x0400_0000` and exports
-  page-aligned image, section, guard, stack, and bootstrap-table symbols.
+  page-aligned image, section, guard, stack, and EL2-stage-1-table symbols.
 - `docs/address_translation.md` describes EL2 stage 1 and guest stage 2.
 - `docs/check_handoff_state.md` records the completed historical diagnostic
   phase and the observed U-Boot handoff register state.
@@ -604,7 +604,7 @@ valid under both the old and new regimes.
 
 ### Files and modules
 
-- Review the transition design in `docs/el2_page_table_transition.md` before
+- Review the transition design in `docs/el2_stage1_page_table_transition.md` before
   implementing any control-register writes.
 - Add `src/mm.rs` and, if useful, reusable descriptor helpers under
   `tvisor_util`.

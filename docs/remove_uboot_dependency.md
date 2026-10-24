@@ -65,7 +65,7 @@ The fixed address was selected and tested using the Raspberry Pi 4 DTB,
 `bdinfo`, U-Boot load configuration, and captured hardware behavior. It is a
 board boot contract, not a universally portable address.
 
-Embedding the bootstrap tables does not introduce a new kind of placement
+Embedding the EL2 tables does not introduce a new kind of placement
 assumption. It expands and makes explicit the footprint covered by the
 existing assumption:
 
@@ -78,7 +78,7 @@ safe before U-Boot transfers control.
 
 ## 4. Design
 
-### 4.1 Linker-owned bootstrap table arena
+### 4.1 Linker-owned EL2 stage-1 table arena
 
 Reserve 64 KiB for the initial EL2 stage-1 translation tables in a dedicated,
 page-aligned linker section. The section is BSS-like but remains distinct from
@@ -87,10 +87,10 @@ ordinary `.bss` so its purpose, bounds, mapping, and size are visible.
 An illustrative linker layout is:
 
 ```ld
-.bootstrap_tables (NOLOAD) : ALIGN(0x1000) {
-    __bootstrap_tables_start = .;
+.el2_stage1_tables (NOLOAD) : ALIGN(0x1000) {
+    __el2_stage1_tables_start = .;
     . += 0x10000;
-    __bootstrap_tables_end = .;
+    __el2_stage1_tables_end = .;
 }
 
 . = ALIGN(0x1000);
@@ -112,7 +112,7 @@ must not depend on its power-on or U-Boot-provided contents.
 
 ### 4.2 No pre-switch physical allocation
 
-`mm::setup_bootstrap_page_table` must construct the initial table set directly
+`mm::setup_el2_stage1_page_table` must construct the initial table set directly
 in the linker-owned arena. It must not initialize or call the general
 physical-page allocator to find table storage before replacing `TTBR0_EL2`.
 The pre-switch boot path then adds platform-derived RAM, DTB, and UART mappings
@@ -128,7 +128,7 @@ tvisor runtime footprint
 ├── exception vectors
 ├── boot-stack guard
 ├── private boot stack
-└── 64 KiB bootstrap table arena
+└── 64 KiB EL2 stage-1 table arena
 ```
 
 Consequently, the no-return transition needs no unidentified free RAM. Every
@@ -199,14 +199,14 @@ LMB arguments
     -> transition reservations
     -> INITIAL_USABLE
     -> physical allocator
-    -> bootstrap table arena
+    -> EL2 stage-1 table arena
 ```
 
 With linker-owned tables, that chain disappears:
 
 ```text
 linker symbols
-    -> bootstrap table arena inside tvisor
+    -> EL2 stage-1 table arena inside tvisor
     -> TTBR0_EL2 switch
     -> post-switch physical allocator
 ```
@@ -228,7 +228,7 @@ file footprint    = downloaded bytes
 runtime footprint = __image_end - __image_start
 ```
 
-The runtime footprint includes `.bss`, stack storage, guards, and bootstrap
+The runtime footprint includes `.bss`, stack storage, guards, and EL2 page
 tables even if they occupy no bytes in the ELF or raw binary payload.
 
 The build and boot documentation records:
@@ -236,7 +236,7 @@ The build and boot documentation records:
 - `__image_start`;
 - `__image_end`;
 - the total runtime size;
-- bootstrap-table start, end, alignment, and page count;
+- EL2-stage-1-table start, end, alignment, and page count;
 - the maximum permitted runtime footprint inside the validated Pi 4 load
   window.
 
@@ -250,7 +250,7 @@ The implementation affects these areas.
 
 ### `scripts/rpi.ld`
 
-- Add the dedicated bootstrap-table section and symbols.
+- Add the dedicated EL2-stage-1-table section and symbols.
 - Include its end in `__image_end`.
 - Add linker assertions for alignment and exact size.
 
@@ -320,7 +320,7 @@ placement distinguishable from regressions in memory-map simplification.
 ### Host and build validation
 
 - The AArch64 ELF links successfully.
-- `__bootstrap_tables_start` and `__bootstrap_tables_end` are page aligned.
+- `__el2_stage1_tables_start` and `__el2_stage1_tables_end` are page aligned.
 - The arena is exactly 64 KiB and lies within the tvisor runtime footprint.
 - The table-capacity calculation still fits within 16 pages.
 - No pre-switch path calls the general physical-page allocator.
@@ -360,7 +360,7 @@ Raspberry Pi 4 boot contract smaller, explicit, and testable.
 
 ## 11. Decision summary
 
-Phase 9 embeds the initial 64-KiB EL2 page-table arena in a dedicated linker
+Phase 9 embeds the initial 64-KiB EL2 stage-1 page-table arena in a dedicated linker
 section within the complete tvisor runtime footprint. It performs no general
 physical-memory allocation before installing its private EL2 translation
 regime. After takeover, it initializes the allocator directly from

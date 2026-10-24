@@ -260,7 +260,7 @@ EL2 address 0xFE21_5040 → physical address 0xFE21_5040
 
 ### MMU enabled
 
-When `SCTLR_EL2.M == 1`, the EL2 page tables translate the virtual address to a
+When `SCTLR_EL2.M == 1`, the EL2 stage-1 page tables translate the virtual address to a
 physical address:
 
 ```text

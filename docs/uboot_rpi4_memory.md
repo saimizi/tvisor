@@ -156,7 +156,7 @@ Tvisor scans the bounded argument array, so it does not depend on the
 different `argv[0]` conventions of `go` and `bootelf`.
 
 Before switching translation regimes, tvisor writes only its complete
-linker-defined runtime interval, including the `NOLOAD` stack and bootstrap
+linker-defined runtime interval, including the `NOLOAD` stack and EL2 page
 tables. After takeover, the allocator is initialized directly from DTB RAM
 minus permanent reservations. No `HANDOFF` or `INITIAL` runtime view is
 constructed.

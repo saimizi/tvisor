@@ -5,7 +5,7 @@
 
 use crate::{
     PAGE_SIZE,
-    stage2_translation::IPA_BITS,
+    guest_stage2_translation::IPA_BITS,
     system_info::{PhysAddr, PhysRegion},
 };
 

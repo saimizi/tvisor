@@ -230,7 +230,7 @@ the stage-2 mapper exposes.
 ## 7. Proposed Phase 9 Implementation Roadmap
 
 1. **Step 1 — Design Documentation**: Write `docs/guest_memory_map.md` capturing agreed layouts and register configurations.
-2. **Step 2 — Stage-2 Translation Engine**: Implement Stage-2 descriptor encodings, table allocation, and host tests in `tvisor_util/stage2_translation.rs`.
+2. **Step 2 — Stage-2 Translation Engine**: Implement Stage-2 descriptor encodings, table allocation, and host tests in `tvisor_util/guest_stage2_translation.rs`.
 3. **Step 3 — Guest DTB Builder**: Implement guest FDT writer in `tvisor_util/guest_fdt.rs` and verify roundtrip parsing with `Fdt`.
 4. **Step 4 — vCPU Context & World Switch**: Implement `VcpuContext` and assembly `__vcpu_run` in `src/guest.rs` / `src/vcpu.rs`.
 5. **Step 5 — Lower-EL Exception Handling**: Extend `src/exception.rs` to handle Lower-EL synchronous aborts, `HVC` calls, and stage-2 syndrome decoding.

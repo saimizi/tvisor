@@ -27,7 +27,7 @@
 //! [54:53]  XN         00 = Executable; 10 = Execute-Never (XN)
 //! ```
 
-use crate::el2_translation::{TranslationError, pa_bits_from_pa_range};
+use crate::el2_stage1_translation::{TranslationError, pa_bits_from_pa_range};
 use crate::is_page_aligned;
 
 pub const IPA_BITS: u8 = 39;
@@ -81,13 +81,13 @@ pub const CPTR_EL2_STAGE2_VALUE: u64 = CPTR_EL2_RES1;
 pub const VMPIDR_EL2_VCPU0: u64 = (1 << 31) | (1 << 30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage2MemoryType {
+pub enum GuestStage2MemoryType {
     NormalWbWa,
     DeviceNgNre,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage2Access {
+pub enum GuestStage2Access {
     None,
     ReadOnly,
     WriteOnly,
@@ -95,13 +95,13 @@ pub enum Stage2Access {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage2Exec {
+pub enum GuestStage2Exec {
     Executable,
     ExecuteNever,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stage2RegisterValues {
+pub struct GuestStage2RegisterValues {
     pub vtcr_el2: u64,
     pub vttbr_el2: u64,
     pub hcr_el2: u64,
@@ -111,37 +111,37 @@ pub struct Stage2RegisterValues {
 
 pub fn encode_l3_page_descriptor(
     pa: u64,
-    mem_type: Stage2MemoryType,
-    access: Stage2Access,
-    exec: Stage2Exec,
+    mem_type: GuestStage2MemoryType,
+    access: GuestStage2Access,
+    exec: GuestStage2Exec,
 ) -> u64 {
     let mem_attr = match mem_type {
-        Stage2MemoryType::NormalWbWa => MEM_ATTR_NORMAL_WB_WA,
-        Stage2MemoryType::DeviceNgNre => MEM_ATTR_DEVICE_NGNRE,
+        GuestStage2MemoryType::NormalWbWa => MEM_ATTR_NORMAL_WB_WA,
+        GuestStage2MemoryType::DeviceNgNre => MEM_ATTR_DEVICE_NGNRE,
     };
     let s2ap = match access {
-        Stage2Access::None => S2AP_NONE,
-        Stage2Access::ReadOnly => S2AP_READ_ONLY,
-        Stage2Access::WriteOnly => S2AP_WRITE_ONLY,
-        Stage2Access::ReadWrite => S2AP_READ_WRITE,
+        GuestStage2Access::None => S2AP_NONE,
+        GuestStage2Access::ReadOnly => S2AP_READ_ONLY,
+        GuestStage2Access::WriteOnly => S2AP_WRITE_ONLY,
+        GuestStage2Access::ReadWrite => S2AP_READ_WRITE,
     };
     let sh = match mem_type {
-        Stage2MemoryType::NormalWbWa => SH_INNER,
-        Stage2MemoryType::DeviceNgNre => SH_NONE,
+        GuestStage2MemoryType::NormalWbWa => SH_INNER,
+        GuestStage2MemoryType::DeviceNgNre => SH_NONE,
     };
     let xn = match exec {
-        Stage2Exec::Executable => XN_EXEC,
-        Stage2Exec::ExecuteNever => XN_NON_EXEC,
+        GuestStage2Exec::Executable => XN_EXEC,
+        GuestStage2Exec::ExecuteNever => XN_NON_EXEC,
     };
 
     VALID | TABLE_OR_PAGE | mem_attr | s2ap | sh | ACCESS_FLAG | xn | (pa & ADDRESS_MASK)
 }
 
-pub fn stage2_register_values(
+pub fn guest_stage2_register_values(
     vm_id: u8,
     root_table_pa: u64,
     pa_range: u8,
-) -> Result<Stage2RegisterValues, TranslationError> {
+) -> Result<GuestStage2RegisterValues, TranslationError> {
     let pa_bits = pa_bits_from_pa_range(pa_range)?;
     let max_root_pa = (1_u64 << pa_bits) - 1;
     if !is_page_aligned(root_table_pa as usize) || root_table_pa > max_root_pa {
@@ -160,7 +160,7 @@ pub fn stage2_register_values(
 
     let vttbr_el2 = ((vm_id as u64) << 48) | (root_table_pa & ADDRESS_MASK);
 
-    Ok(Stage2RegisterValues {
+    Ok(GuestStage2RegisterValues {
         vtcr_el2,
         vttbr_el2,
         hcr_el2: HCR_EL2_STAGE2_VALUE,
@@ -174,9 +174,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage2_register_values_encodes_expected_fields() {
+    fn guest_stage2_register_values_encodes_expected_fields() {
         let root_pa = 0x0500_0000;
-        let regs = stage2_register_values(1, root_pa, 0b0010).expect("valid regs");
+        let regs = guest_stage2_register_values(1, root_pa, 0b0010).expect("valid regs");
 
         assert_eq!(regs.vtcr_el2 & 0x3f, 25); // T0SZ = 25 (39 bits)
         assert_eq!((regs.vtcr_el2 >> 6) & 0x3, 0b01); // SL0 = Level 1
@@ -198,9 +198,9 @@ mod tests {
     fn stage2_encodes_device_and_readonly_attributes() {
         let desc = encode_l3_page_descriptor(
             0x2000_0000,
-            Stage2MemoryType::DeviceNgNre,
-            Stage2Access::ReadOnly,
-            Stage2Exec::ExecuteNever,
+            GuestStage2MemoryType::DeviceNgNre,
+            GuestStage2Access::ReadOnly,
+            GuestStage2Exec::ExecuteNever,
         );
         assert_eq!(desc & VALID, VALID);
         assert_eq!(desc & TABLE_OR_PAGE, TABLE_OR_PAGE);

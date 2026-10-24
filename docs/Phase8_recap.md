@@ -59,7 +59,7 @@ Permanent exclusions include:
 
 - the linked tvisor image, including allocator bitmap metadata;
 - private stack and unmapped guard page;
-- active EL2 page tables and the complete bootstrap table arena;
+- active EL2 stage-1 page tables and the complete EL2 stage-1 table arena;
 - firmware carve-outs and permanent DTB reservations;
 - MMIO and device-owned ranges; and
 - any future runtime object explicitly retained by tvisor.
@@ -85,7 +85,7 @@ and attribute boundaries must remain exact.
 
 The complete 64 KiB page-table store is a dedicated, 4 KiB-aligned linker
 `NOLOAD` section inside tvisor's runtime footprint.
-`mm::setup_bootstrap_page_table` explicitly zeros
+`mm::setup_el2_stage1_page_table` explicitly zeros
 the arena and constructs the linker-owned mappings without initializing the
 allocator. `rust_main` adds usable-RAM, retained-DTB, and UART mappings, then
 moves the final memory map into static storage. Descriptor stores are published
@@ -101,7 +101,7 @@ usable without copying.
 
 - Add a host-testable allocator module under `tvisor_util/` containing bitmap,
   region, allocation, free, statistics, and error logic.
-- Extend `scripts/rpi.ld` with the linker-owned bootstrap-table arena.
+- Extend `scripts/rpi.ld` with the linker-owned EL2-stage-1-table arena.
 - Make `src/mm.rs::prepare` construct tables in that arena and move the final
   `MemoryMap` into one-shot tvisor-owned `.bss` storage.
 - Initialize the allocator in the post-switch path directly from `USABLE`;

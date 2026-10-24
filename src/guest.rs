@@ -7,10 +7,10 @@ use spin::Once;
 
 use crate::vmctl::*;
 use tvisor_util::aarch64_reg::VmpidrEl2;
-use tvisor_util::el2_translation::TranslationError;
+use tvisor_util::el2_stage1_translation::TranslationError;
 use tvisor_util::guest_platform::{GUEST_GICD, GUEST_PL011, VIRTUAL_PL011_IRQ};
+use tvisor_util::guest_stage2_translation::GuestStage2RegisterValues;
 use tvisor_util::println;
-use tvisor_util::stage2_translation::Stage2RegisterValues;
 
 use crate::mm;
 use crate::vcpu::{__vcpu_run, Vcpu, VcpuExitReason};
@@ -143,7 +143,7 @@ pub unsafe fn invalidate_icache_all() {
 /// Ensures descriptor writes are published (`dsb ishst`), installs virtualization registers,
 /// invalidates prior guest TLB entries for VMID 1, and synchronizes context with `isb`.
 #[inline]
-pub unsafe fn activate_stage2(regs: &Stage2RegisterValues) {
+pub unsafe fn activate_guest_stage2(regs: &GuestStage2RegisterValues) {
     unsafe {
         // 1. Ensure descriptor writes are visible to hardware table walkers
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
@@ -191,7 +191,7 @@ pub unsafe fn activate_stage2(regs: &Stage2RegisterValues) {
 /// VMID installed so that invalidation targets the correct VMID. Stage-2 translation
 /// and `VTTBR_EL2` are only cleared after invalidation is fully synchronized.
 #[inline]
-unsafe fn deactivate_stage2() {
+unsafe fn deactivate_guest_stage2() {
     unsafe {
         // 1. Invalidate all Stage 1 & 2 translations for the current VMID while VTTBR_EL2 is active
         core::arch::asm!("tlbi vmalls12e1is", options(nostack, preserves_flags));
@@ -368,7 +368,7 @@ pub fn run_guest() -> Result<(), GuestRunError> {
     let ret = vm_ctl.run_linux_vm(linux_image_source().ok_or(TranslationError::Unexpected)?);
 
     unsafe {
-        deactivate_stage2();
+        deactivate_guest_stage2();
     }
 
     vm_ctl.release_all();

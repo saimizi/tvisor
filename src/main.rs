@@ -201,23 +201,20 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         halt();
     }
 
-    // Set up bootstrap page table
-    let bootstrap = match mm::setup_bootstrap_page_table(
-        live_dtb_pages,
-        image_source_pages,
-        uart_region,
-        gic,
-    ) {
-        Ok(bootstrap) => bootstrap,
-        Err(error) => {
-            println!("Failed to setup bootstrap page tables: {}", error);
-            stop();
-        }
-    };
+    // Set up EL2 stage-1 page table
+    let el2_stage1_page_table =
+        match mm::setup_el2_stage1_page_table(live_dtb_pages, image_source_pages, uart_region, gic)
+        {
+            Ok(el2_stage1_page_table) => el2_stage1_page_table,
+            Err(error) => {
+                println!("Failed to setup EL2 stage-1 page tables: {}", error);
+                stop();
+            }
+        };
 
     // SAFETY: Handoff validation has completed and tvisor never returns to
     // U-Boot after replacing the inherited stack and translation regime.
-    unsafe { boot::enter_private_el2(bootstrap) }
+    unsafe { boot::enter_private_el2(el2_stage1_page_table) }
 }
 
 #[panic_handler]

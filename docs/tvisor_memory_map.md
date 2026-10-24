@@ -69,18 +69,18 @@ The initial VA equals the PA for every valid mapping:
 EL2 virtual address                         CPU physical address
 
 0x00000000_04000000  tvisor image     ---> 0x00000000_04000000
-0x00000000_040c2000  bootstrap arena  ---> 0x00000000_040c2000
+0x00000000_040c2000  EL2 stage-1 page-table arena  ---> 0x00000000_040c2000
 0x00000000_FE215000  mini UART page   ---> 0x00000000_FE215000
 ```
 
-Exact image and bootstrap ends are derived rather than hard-coded:
+Exact image and EL2 table-arena ends are derived rather than hard-coded:
 
 - the image uses linker section symbols;
-- the bootstrap arena uses linker symbols within the tvisor runtime image;
+- the EL2 stage-1 page-table arena uses linker symbols within the tvisor runtime image;
 - the UART page is derived from the DTB-selected console register range.
 
 The address above is from the current debug build and is not an ABI. Code uses
-`__bootstrap_tables_start` and `__bootstrap_tables_end`; source changes may
+`__el2_stage1_tables_start` and `__el2_stage1_tables_end`; source changes may
 move both symbols.
 
 ### 4.1 Mandatory takeover mappings
@@ -94,7 +94,7 @@ The first table must contain only the mappings needed to survive takeover:
 | `.rodata` | Permanent image | Normal, read-only, execute-never |
 | `.data`, `.bss`, `.got` | Permanent image | Normal, read/write, execute-never |
 | Tvisor vector table | Permanent image | Normal, read-only, executable at EL2 |
-| Bootstrap page tables | Tvisor-owned | Normal, read/write, execute-never |
+| EL2 stage-1 page tables | Tvisor-owned | Normal, read/write, execute-never |
 | Private EL2 boot stack | Tvisor-owned | Normal, read/write, execute-never |
 | Stack guard page | Tvisor-owned VA gap | Invalid descriptor |
 | Allocator metadata, if needed | Tvisor-owned | Normal, read/write, execute-never |
@@ -122,13 +122,13 @@ mapped into EL2 only when tvisor needs to access it. Later phases may add:
 
 These additions must not weaken the initial W^X or MMIO attribute policy.
 
-## 5. Bootstrap arena
+## 5. EL2 stage-1 page-table arena
 
 The first private page tables and stack must exist before the general physical
 allocator. The linker reserves a dedicated 64 KiB, page-aligned `NOLOAD`
-bootstrap-table arena inside `[__image_start, __image_end)`. Table preparation
+EL2-stage-1-table arena inside `[__image_start, __image_end)`. Table preparation
 is split into explicit construction and policy steps:
-`mm::setup_bootstrap_page_table` zeros the arena and maps linker-owned boot
+`mm::setup_el2_stage1_page_table` zeros the arena and maps linker-owned boot
 objects, while `rust_main` adds usable RAM, the retained DTB, and UART MMIO
 before validating the completed table set.
 
@@ -214,7 +214,7 @@ The future table switch will construct register values from named fields:
 - `TCR_EL2.SH0 = 0b11` for Inner Shareable walks;
 - `TCR_EL2.IRGN0 = 0b01` and `ORGN0 = 0b01` for WB/WA walks;
 - `TCR_EL2.PS` encoded from the validated `PARange` capability;
-- `TTBR0_EL2.BADDR` set to the bootstrap root-table PA;
+- `TTBR0_EL2.BADDR` set to the EL2 root-table PA;
 - `MAIR_EL2` containing Attr0 `0xFF` and Attr1 `0x04`; and
 - final `SCTLR_EL2.M/C/I/WXN` enabled with the reviewed alignment policy.
 
@@ -251,7 +251,7 @@ After the no-return boundary:
 - U-Boot runtime, old stack, old translation tables, and staging buffers need
   no runtime reservation or explicit reclamation pass;
 - the live DTB may be released only after all required information is owned;
-- the bootstrap arena remains tvisor-owned;
+- the EL2 stage-1 page-table arena remains tvisor-owned;
 - firmware carve-outs, permanent reservations, and MMIO never enter the RAM
   allocator; and
 - allocating a physical page does not automatically create an EL2 mapping.
@@ -286,7 +286,7 @@ Before Phase 6 begins, review must confirm:
 - stack guard pages remain invalid;
 - Normal RAM and MMIO use different MAIR attributes;
 - page-table memory is sourced only from the linker-owned tvisor runtime;
-- table count and bootstrap-arena size can be calculated without allocation;
+- table count and EL2-stage-1-table-arena size can be calculated without allocation;
 - the diagnostic return path remains separate from the no-return path; and
 - no U-Boot address becomes a permanent board constant.
 
@@ -296,7 +296,7 @@ are resolved. No Raspberry Pi register writes are required for this phase.
 ## 14. Open questions
 
 1. What private boot-stack size and exception-stack policy should Phase 6 use?
-2. Should the bootstrap arena have a maximum size independent of its calculated
+2. Should the EL2 stage-1 page-table arena have a maximum size independent of its calculated
    minimum?
 3. Should Device-nGnRnE replace Device-nGnRE for the first UART mapping?
 4. Should tvisor keep or discard the DTB's Linux-oriented dynamic CMA request?
