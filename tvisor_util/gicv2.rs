@@ -110,6 +110,17 @@ impl GicV2 {
         self.info.hypervisor_interface.start().value() as usize
     }
 
+    pub const fn gicd_typer(&self) -> usize {
+        self.distributor_base() + GICD_TYPER
+    }
+
+    pub fn num_interrupts(&self) -> u32 {
+        let typer = unsafe { read32(self.gicd_typer()) };
+        let it_lines_number = typer & 0x1f;
+
+        (32 * (it_lines_number + 1)).min(1020)
+    }
+
     pub const fn gicd_ctlr(&self) -> usize {
         self.distributor_base() + GICD_CTLR
     }
@@ -155,7 +166,7 @@ impl GicV2 {
     }
 
     pub fn gicd_isenabler_n(&self, irq: u32) -> Result<usize, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let word_offset =
                 usize::try_from((irq / 32) * 4).map_err(|_| GicV2Error::InvalidIRQ(irq))?;
             Ok(self.gicd_isenabler() + word_offset as usize)
@@ -167,7 +178,7 @@ impl GicV2 {
     // GICD_ISENABLER is a write-one-set register
     // write 0 doesn't take effect, so no need to do read-modify-write.
     pub fn gicd_isenabler_n_set(&self, irq: u32) -> Result<(), GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let isenabler = self.gicd_isenabler_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             unsafe {
@@ -181,7 +192,7 @@ impl GicV2 {
     }
 
     pub fn gicd_isenabler_n_get(&self, irq: u32) -> Result<bool, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let isenabler = self.gicd_isenabler_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             unsafe { Ok(read32(isenabler) & bit == bit) }
@@ -195,7 +206,7 @@ impl GicV2 {
     }
 
     pub fn gicd_icenabler_n(&self, irq: u32) -> Result<usize, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let word_offset =
                 usize::try_from((irq / 32) * 4).map_err(|_| GicV2Error::InvalidIRQ(irq))?;
             Ok(self.gicd_icenabler() + word_offset as usize)
@@ -207,7 +218,7 @@ impl GicV2 {
     // GICD_ICENABLER is a write-one-clear register
     // write 0 doesn't take effect, so no need to do read-modify-write.
     pub fn gicd_icenabler_n_set(&self, irq: u32) -> Result<(), GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let icenabler = self.gicd_icenabler_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             unsafe {
@@ -221,7 +232,7 @@ impl GicV2 {
     }
 
     pub fn gicd_icenabler_n_get(&self, irq: u32) -> Result<bool, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let icenabler = self.gicd_icenabler_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             unsafe { Ok(read32(icenabler) & bit == bit) }
@@ -243,7 +254,7 @@ impl GicV2 {
     }
 
     pub fn gicd_igroupr_n(&self, irq: u32) -> Result<usize, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let word_offset =
                 usize::try_from((irq / 32) * 4).map_err(|_| GicV2Error::InvalidIRQ(irq))?;
             Ok(self.gicd_igroupr() + word_offset as usize)
@@ -253,7 +264,7 @@ impl GicV2 {
     }
 
     pub fn gicd_igroupr_n_get(&self, irq: u32) -> Result<bool, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let igroupr = self.gicd_igroupr_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             let value = unsafe { read32(igroupr) & bit };
@@ -264,7 +275,7 @@ impl GicV2 {
     }
 
     pub fn gicd_igroupr_n_set(&self, irq: u32, on: bool) -> Result<(), GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let igroupr = self.gicd_igroupr_n(irq)?;
             let bit = 1_u32 << (irq % 32);
             unsafe {
@@ -306,7 +317,7 @@ impl GicV2 {
     }
 
     pub fn gicd_icfgr_n(&self, irq: u32) -> Result<usize, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let word_offset =
                 usize::try_from((irq / 16) * 4).map_err(|_| GicV2Error::InvalidIRQ(irq))?;
             Ok(self.gicd_icfgr() + word_offset)
@@ -316,7 +327,7 @@ impl GicV2 {
     }
 
     pub fn gicd_icfgr_n_get(&self, irq: u32) -> Result<bool, GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let ifcfgr = self.gicd_icfgr_n(irq)?;
             let bit = 1_u32 << ((irq % 16) * 2 + 1);
             let value = unsafe { read32(ifcfgr) & bit };
@@ -327,7 +338,7 @@ impl GicV2 {
     }
 
     pub fn gicd_icfgr_n_set(&self, irq: u32, on: bool) -> Result<(), GicV2Error> {
-        if irq < SPURIOUS_IRQ {
+        if irq < self.num_interrupts() {
             let ifcfgr = self.gicd_icfgr_n(irq)?;
             let bit = 1_u32 << ((irq % 16) * 2 + 1);
             unsafe {
@@ -453,7 +464,7 @@ impl GicV2 {
     /// This is used for host-owned EL2 devices; it is never exposed directly
     /// to a guest.
     pub unsafe fn enable_spi(&self, spi: u32) -> Result<(), GicV2Error> {
-        if !(32..SPURIOUS_IRQ).contains(&spi) {
+        if !(32..self.num_interrupts()).contains(&spi) {
             return Err(GicV2Error::InvalidSPI(spi));
         }
 
@@ -518,6 +529,7 @@ pub const REQUIRED_GICH_SIZE: u64 = 0x104; // GICH_LR0 at 0x100
 pub const REQUIRED_GICV_SIZE: u64 = 0x1004; // GICV_DIR at 0x1000, if needed
 
 const GICD_CTLR: usize = 0x000;
+const GICD_TYPER: usize = 0x004;
 const GICD_IGROUPR: usize = 0x080;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
