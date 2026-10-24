@@ -269,50 +269,44 @@ fn handle_synchronous_exception(
     dispatcher: &mut MmioDispatcher,
 ) -> Result<(), String> {
     let mut result = Ok(());
-    'end: {
-        let reason = vcpu.exit().decode_reason(vcpu.context());
-        let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
-            result = Err(format!("Unexpected exception:{}", reason));
-            break 'end;
-        };
+    let reason = vcpu.exit().decode_reason(vcpu.context());
+    let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
+        return Err(format!("Unexpected exception:{}", reason));
+    };
 
-        let mut is_trapped_mmio = false;
-        let gicd_start = GUEST_GICD.start();
-        let Some(gicd_end) = GUEST_GICD.end() else {
-            result = Err(String::from("Invalid GICD range"));
-            break 'end;
-        };
+    let mut is_trapped_mmio = false;
+    let gicd_start = GUEST_GICD.start();
+    let Some(gicd_end) = GUEST_GICD.end() else {
+        return Err(String::from("Invalid GICD range"));
+    };
 
-        if (gicd_start..gicd_end).contains(&ipa) {
-            is_trapped_mmio = true;
-        }
+    if (gicd_start..gicd_end).contains(&ipa) {
+        is_trapped_mmio = true;
+    }
 
-        let pl011_start = GUEST_PL011.start();
-        let Some(pl011_end) = GUEST_PL011.end() else {
-            result = Err(String::from("Invalid PL011 REG range"));
-            break 'end;
-        };
+    let pl011_start = GUEST_PL011.start();
+    let Some(pl011_end) = GUEST_PL011.end() else {
+        return Err(String::from("Invalid PL011 REG range"));
+    };
 
-        if (pl011_start..pl011_end).contains(&ipa) {
-            is_trapped_mmio = true;
-        }
+    if (pl011_start..pl011_end).contains(&ipa) {
+        is_trapped_mmio = true;
+    }
 
-        if !is_trapped_mmio {
-            result = Err(format!("Invalid IPA:{:x}", ipa));
-            break 'end;
-        }
+    if !is_trapped_mmio {
+        return Err(format!("Invalid IPA:{:x}", ipa));
+    }
 
-        let exit = *vcpu.exit();
-        let transmit = vcpu
-            .context_mut()
-            .emulate_stage2_mmio(&exit, dispatcher)
-            .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
-        if let Some(byte) = transmit {
-            if tvisor_util::debug_util::write_byte(byte).is_err() {
-                result = Err(String::from(
-                    "Virtual PL011 transmit could not reach host console",
-                ));
-            }
+    let exit = *vcpu.exit();
+    let transmit = vcpu
+        .context_mut()
+        .emulate_stage2_mmio(&exit, dispatcher)
+        .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
+    if let Some(byte) = transmit {
+        if tvisor_util::debug_util::write_byte(byte).is_err() {
+            result = Err(String::from(
+                "Virtual PL011 transmit could not reach host console",
+            ));
         }
     }
 
