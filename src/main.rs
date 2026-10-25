@@ -126,6 +126,33 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         halt();
     }
 
+    // Discovery only: no release-cell writes or firmware calls. Run before
+    // allocator initialization, while the live DT is still available.
+    let boot_mpidr = MpidrEl1::dump().unwrap().value;
+    match tvisor_util::cpu_topology::discover_cpu_topology(*fdt, boot_mpidr) {
+        Ok(topology) => {
+            println!("Physical CPU discovery: boot MPIDR={:#x}", boot_mpidr);
+            for cpu in topology.cpus() {
+                println!("    {:?}", cpu);
+            }
+            println!("    PSCI DT description: {:?}", topology.psci);
+            if topology.psci.is_some() {
+                println!(
+                    "    PSCI EL2 eligibility/version/CPU_ON/entry contract: unverified; no firmware calls"
+                );
+            } else {
+                println!("    PSCI: not advertised; conduit/version/CPU_ON queries skipped");
+            }
+            println!(
+                "    Secondary activation disabled; parking-memory contract requires verification"
+            );
+        }
+        Err(error) => {
+            println!("Physical CPU discovery failed: {:?}", error);
+            halt();
+        }
+    }
+
     let image = match unsafe { image_from_uboot_args(argc, argv) } {
         Ok(image) => image,
         Err(error) => {

@@ -4,6 +4,9 @@ Status: initial design, 2026-10-25. No secondary CPU has been released by this
 change. Architectural decisions below are proposed implementation contracts;
 board startup details remain an explicit discovery milestone.
 
+Implementation progress and board observations for 11.0 are recorded in
+[Phase 11.0 status](phase11_0_status.md). The startup-contract gate remains open.
+
 ## Scope and starting checkpoint
 
 Phase 11 brings Raspberry Pi 4 physical CPUs under tvisor's EL2 control while

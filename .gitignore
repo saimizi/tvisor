@@ -1,3 +1,4 @@
 /target
 .aider*
 /.codex/config.toml
+/docs/evidence/

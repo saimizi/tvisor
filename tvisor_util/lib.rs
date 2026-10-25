@@ -8,6 +8,7 @@ use core::arch::asm;
 #[cfg(test)]
 extern crate std;
 
+pub mod cpu_topology;
 pub mod debug_util;
 
 pub mod aarch64_reg;
