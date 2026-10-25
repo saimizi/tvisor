@@ -1,7 +1,7 @@
 # Phase 11: tvisor physical SMP design
 
-Status: approved design, 2026-10-25. Phase 11.0 validates the DT boot
-interface and startup-memory ownership. No secondary CPU has been released by tvisor;
+Status: approved design, 2026-10-25. Phases 11.0 and 11.1 are implemented;
+11.1 passed the single-vCPU quick regression. No secondary CPU has been released by tvisor;
 later milestones remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in
@@ -74,8 +74,8 @@ flowchart TD
 |---|---|
 | `src/main.rs` assembly `main` | Secondary entry must bypass `.bss` clearing and U-Boot argc/argv parsing |
 | `src/boot.rs` takeover path | Split once-only platform initialization from per-CPU EL2 initialization |
-| `scripts/rpi.ld` | Replace the single stack layout with individually guarded stacks; validate the larger runtime footprint |
-| `src/vcpu.rs::__pcpu_state` | Replace the global world-switch scratch block with per-CPU storage at all assembly access sites |
+| `scripts/rpi.ld` | Four guarded stacks and runtime bounds validated in 11.1; secondary entry must select its assigned stack |
+| `src/pcpu.rs`, `src/vcpu.rs` | Per-CPU context and all TPIDR_EL2 world-switch lookups implemented in 11.1; mutable state remains owner-only |
 | `src/mm.rs::GlobalPageAllocator` | Bitmap `UnsafeCell` accesses currently rely on single-core/DAIF policy, not a lock |
 | `src/mm.rs::TVISOR_TABLES` | Its mutex serializes writers but does not by itself make remote translations safe |
 | `tvisor_util/heap_allocator.rs` | Existing mutex serializes heap metadata, but interrupt-side re-entry remains forbidden |
@@ -83,7 +83,7 @@ flowchart TD
 | `src/exception.rs` | Current-EL IRQ vector is fatal today; add EL2 management-IRQ dispatch before unmasking it |
 | `tvisor_util/gicv2.rs` | Separate shared distributor setup from banked CPU-interface/SGI/PPI setup |
 | `src/guest.rs` | Error paths still allocate `String`; they must not become general EL2 IRQ-handler paths |
-| `tvisor_util/platform.rs`, `system_info.rs` | Add an owned CPU/startup description; memory discovery alone is not CPU discovery |
+| `tvisor_util/cpu_topology.rs`, `cpu_startup.rs` | Owned topology and startup-memory descriptions implemented in 11.0; secondary activation remains gated |
 
 `spin::Once` publication can support immutable post-initialization data, but it
 does not grant concurrent mutable access to the objects published through it.
@@ -198,6 +198,8 @@ All CPUs that can reach the trampoline must have valid startup records and
 reserved storage, including unrequested CPUs woken by a shared release cell.
 
 ## 11.1: Per-CPU structures and guarded stacks
+
+Implementation and validation are tracked in [Phase 11.1 status](phase11_1_status.md).
 
 Add `src/pcpu.rs` for storage/access and `src/smp.rs` for lifecycle orchestration.
 Add a pure `tvisor_util/cpu_topology.rs` model/parser support for host tests.
@@ -516,17 +518,16 @@ allocation/IPI bursts during a separate guest run to test actual concurrency.
 Keep guest DT CPU count one throughout. Preserve artifacts and power off the
 board after tests. Do not combine first secondary release and first guest SMP.
 
-## Implementation checkpoint after 11.0
+## Implementation checkpoint after 11.1
 
 11.0 provides DT-described CPU/startup discovery, release-cell validation and
-pre-allocation protection of advertised firmware reservations. Firmware binary
-matching is not a runtime dependency; identification and disassembly remain
-optional diagnostic evidence. PSCI queries are not applicable to this board's
-spin-table DTB. A future PSCI path requires its own reviewed EL2-callable adapter.
+protection of advertised firmware reservations. Firmware binary matching is not
+a runtime dependency. 11.1 adds boot-CPU TPIDR_EL2 context, separate startup
+metadata, four private guarded stacks and explicit guest-entry/return checks.
+Its complete single-vCPU quick regression passed; see the linked 11.1 report.
 
-Next implement 11.1 on the boot CPU, then validate 11.2 synchronization before
-secondary release in 11.3. Actual secondary EL2/MMU/cache/coherency state,
-guarded-stack access, release maintenance/publication, management-SGI ownership,
-table-arena capacity after the new layout, and cross-core cache/TLB behavior
-remain later milestone gates. DT startup descriptions do not replace those
-checks or turn firmware implementation details into boot-time requirements.
+Next implement 11.2 synchronization before secondary release in 11.3. Actual
+secondary EL2/MMU/cache/coherency state, release maintenance/publication,
+management-SGI ownership and cross-core cache/TLB behavior remain later gates.
+Workers still wait in firmware; their prepared metadata is not evidence of
+secondary execution. The single-vCPU test does not validate physical SMP.

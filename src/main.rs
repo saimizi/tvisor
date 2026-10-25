@@ -20,6 +20,7 @@ mod exception;
 mod guest;
 mod heap;
 mod mm;
+mod pcpu;
 mod smp;
 mod vcpu;
 mod vmctl;
@@ -30,6 +31,8 @@ global_asm!(
     .global main
     .type main, %function
 main:
+    msr daifset, #0xf
+    isb
     // U-Boot's `go` command jumps into the bytes loaded by TFTP and does not
     // process the ELF NOBITS segment. Initialize Rust's zero-initialized
     // statics before entering any Rust code.

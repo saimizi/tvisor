@@ -26,7 +26,14 @@ static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
 static MEMORY_MAP: Mutex<MemoryMap> = Mutex::new(MemoryMap::empty());
 
 unsafe extern "C" {
-    fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
+    fn __enter_private_el2(
+        mair_el2: u64,
+        tcr_el2: u64,
+        ttbr0_el2: u64,
+        sctlr_el2: u64,
+        pcpu: *mut tvisor_util::pcpu::PcpuContext<crate::vcpu::Vcpu>,
+        stack_top: u64,
+    ) -> !;
     fn __switch_el2_stage1_page_tables(
         mair_el2: u64,
         tcr_el2: u64,
@@ -50,9 +57,10 @@ __enter_private_el2:
     isb
     msr  spsel, #1
     isb
-    adrp x9, __boot_stack_top
-    add  x9, x9, :lo12:__boot_stack_top
-    mov  sp, x9
+    // x4 = prepared boot CPU context, x5 = private stack top.
+    mov  sp, x5
+    msr  tpidr_el2, x4
+    isb
     adrp x9, __el2_vectors
     add  x9, x9, :lo12:__el2_vectors
     msr  vbar_el2, x9
@@ -83,18 +91,22 @@ pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -
     const SCTLR_EL2_VALUE: u64 =
         SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
 
+    let (pcpu, stack_top) = crate::pcpu::boot_entry();
     unsafe {
         __enter_private_el2(
             MAIR_EL2_VALUE,
             tcr_el2,
             el2_stage1_page_table.root_pa,
             SCTLR_EL2_VALUE,
+            pcpu,
+            stack_top,
         )
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn private_el2_main(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> ! {
+    crate::pcpu::assert_boot_cpu_idle();
     println!("Phase 6 private EL2 foundations active");
     println!("    SP: {:#018x}", Sp::dump().value);
     if let Some(spsel) = SpSel::dump() {
@@ -192,6 +204,7 @@ extern "C" fn post_switch_page_tables(
 ) -> ! {
     'wait: {
         check_switched_environment(expected_mair, expected_tcr, expected_ttbr0, expected_sctlr);
+        crate::pcpu::report_prepared();
 
         // After EL2 stage1 is mapped, we recheck the console IRQ
         let Some(gicv2) = global() else { break 'wait };

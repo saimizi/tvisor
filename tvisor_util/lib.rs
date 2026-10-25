@@ -25,6 +25,7 @@ pub mod memory_map;
 pub mod mmio;
 pub mod page;
 pub mod page_allocator;
+pub mod pcpu;
 pub mod platform;
 pub mod system_info;
 pub mod virtual_timer;

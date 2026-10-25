@@ -330,7 +330,9 @@ pub fn run_vcpu_with_mmio(
         // every world switch so its List Register and CPU-interface policy
         // remain owned by this vCPU rather than the host.
         unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
+        crate::pcpu::assert_boot_cpu_idle();
         let vector = unsafe { __vcpu_run(vcpu) };
+        crate::pcpu::assert_boot_cpu_idle();
         unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
         // IRQ
         if vector == 9 {

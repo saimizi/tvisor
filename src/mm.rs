@@ -57,10 +57,6 @@ unsafe extern "C" {
     static __rodata_end: u8;
     static __writable_start: u8;
     static __writable_end: u8;
-    static __boot_stack_guard_start: u8;
-    static __boot_stack_guard_end: u8;
-    static __boot_stack_bottom: u8;
-    static __boot_stack_top: u8;
     static __el2_stage1_tables_start: u8;
     static __el2_stage1_tables_end: u8;
 }
@@ -199,14 +195,8 @@ pub fn setup_el2_stage1_page_table(
         false,
     )?;
 
-    // .stack
-    map_identity(
-        &mut tables,
-        link_addr!(__boot_stack_bottom),
-        link_addr!(__boot_stack_top),
-        true,
-        false,
-    )?;
+    // Each private CPU stack is RW/NX Normal; all four guards stay unmapped.
+    tvisor_util::pcpu::map_stacks(&mut tables, crate::pcpu::stacks_base())?;
 
     // .el2_stage1_tables
     map_identity(
@@ -249,6 +239,11 @@ pub fn setup_el2_stage1_page_table(
 
     validate_el2_stage1_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
+    println!(
+        "Phase 11.1 EL2 stack mapping validation: four guarded stacks; table pages={}/{}",
+        tables.used_pages(),
+        MAX_TABLE_PAGES
+    );
     let root_pa = tables.root_pa();
     *TVISOR_TABLES.lock() = Some(tables);
 
@@ -354,6 +349,12 @@ pub fn map_usable_ram(
             false,
             false,
         )?;
+        tvisor_util::pcpu::validate_stacks(tables, crate::pcpu::stacks_base())?;
+        println!(
+            "Phase 11.1 final EL2 mappings: all four guards unmapped; table pages={}/{}",
+            tables.used_pages(),
+            MAX_TABLE_PAGES
+        );
         Ok(())
     })?;
 
@@ -544,12 +545,6 @@ pub fn validate_el2_stage1_page_table<const N: usize>(
             false,
             MemoryType::Normal,
         ),
-        (
-            link_addr!(__boot_stack_bottom),
-            true,
-            false,
-            MemoryType::Normal,
-        ),
         (arena_start, true, false, MemoryType::Normal),
         (arena_end - 1, true, false, MemoryType::Normal),
         (
@@ -576,13 +571,6 @@ pub fn validate_el2_stage1_page_table<const N: usize>(
             return Err(PrepareError::Validation);
         }
     }
-    for guard in [
-        link_addr!(__boot_stack_guard_start),
-        link_addr!(__boot_stack_guard_end) - 1,
-    ] {
-        if tables.walk(guard)?.is_some() {
-            return Err(PrepareError::Validation);
-        }
-    }
+    tvisor_util::pcpu::validate_stacks(tables, crate::pcpu::stacks_base())?;
     Ok(())
 }

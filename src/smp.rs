@@ -15,6 +15,7 @@ static STARTUP_CONTRACT: Once<StartupMemoryContract> = Once::new();
 #[derive(Debug)]
 pub enum DiscoveryError {
     MissingMpidr,
+    Pcpu(&'static str),
     Topology(CpuDiscoveryError),
     Contract(StartupContractError),
 }
@@ -51,6 +52,7 @@ pub fn discover(fdt: Fdt<'_>) -> Result<(), DiscoveryError> {
     println!("    DT startup interface validated; firmware instructions are not inspected");
     println!("    Secondary EL2/MMU/cache/coherency state must be validated at 11.3 entry");
     println!("    Secondary activation disabled (Phase 11.0 discovery only)");
+    crate::pcpu::prepare(&topology).map_err(DiscoveryError::Pcpu)?;
     STARTUP_CONTRACT.call_once(|| contract);
     Ok(())
 }
@@ -87,6 +89,7 @@ fn read_release_cell(address: PhysAddr) -> Result<u64, StartupContractError> {
 impl core::fmt::Display for DiscoveryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Pcpu(error) => write!(f, "per-CPU preparation failed: {error}"),
             Self::Topology(error) => write!(f, "invalid CPU description: {error:?}"),
             Self::Contract(error) => write!(f, "startup contract rejected: {error:?}"),
             error => write!(f, "{error:?}"),

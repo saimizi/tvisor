@@ -54,7 +54,8 @@ interface and does not claim to measure parked CPUs' registers.
 - Revised tvisor ELF SHA-256:
   `f091aac5c5059f4b15cc4f3d63a57162d687b9c516e2785fbff33cf25d25505e`.
 
-Issue [#29](https://github.com/saimizi/tvisor/issues/29) remains deferred. Next is
-11.1 per-CPU state and guarded stacks on the boot CPU. Actual secondary EL2,
+Issue [#29](https://github.com/saimizi/tvisor/issues/29) remains deferred.
+[11.1 per-CPU state and guarded stacks](phase11_1_status.md) is now implemented
+and has passed the quick regression on the boot CPU. Actual secondary EL2,
 MMU/cache/coherency validation and the release-publication implementation remain
 11.3 gates; DT interface validation alone does not satisfy them.
