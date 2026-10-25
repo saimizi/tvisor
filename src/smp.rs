@@ -5,10 +5,15 @@ use spin::Once;
 use tvisor_util::{
     aarch64_reg::MpidrEl1,
     cpu_startup::{StartupContractError, StartupMemoryContract, discover_startup_memory},
-    cpu_topology::{CpuDiscoveryError, discover_cpu_topology},
+    cpu_topology::{CpuDiscoveryError, CpuTopology, discover_cpu_topology},
     println,
     system_info::PhysAddr,
 };
+
+static TOPOLOGY: Once<CpuTopology> = Once::new();
+pub fn topology() -> Option<&'static CpuTopology> {
+    TOPOLOGY.get()
+}
 
 static STARTUP_CONTRACT: Once<StartupMemoryContract> = Once::new();
 
@@ -52,7 +57,8 @@ pub fn discover(fdt: Fdt<'_>) -> Result<(), DiscoveryError> {
     println!("    DT startup interface validated; firmware instructions are not inspected");
     println!("    Secondary EL2/MMU/cache/coherency state must be validated at 11.3 entry");
     println!("    Secondary activation disabled (Phase 11.0 discovery only)");
-    crate::pcpu::prepare(&topology).map_err(DiscoveryError::Pcpu)?;
+    crate::pcpu::prepare_boot_cpu(&topology).map_err(DiscoveryError::Pcpu)?;
+    TOPOLOGY.call_once(|| topology);
     STARTUP_CONTRACT.call_once(|| contract);
     Ok(())
 }

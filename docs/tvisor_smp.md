@@ -38,7 +38,7 @@ the validation gate for each one.
 | CPU ownership | tvisor owns physical-CPU lifecycle; `VmCtl` continues owning vCPUs |
 | Identity | Dense logical IDs from validated DT MPIDR affinity; boot CPU is logical 0 |
 | Per-CPU access | `TPIDR_EL2` points to a lifetime-stable, aligned `PcpuState` |
-| Stacks | One 64 KiB EL2 stack plus an unmapped 4 KiB guard per supported CPU |
+| Stacks | Static guarded boot stack; dynamically allocated 64 KiB stack plus 4 KiB guard per enabled secondary |
 | EL2 stage 1 | Shared root and attributes; mappings frozen during initial bring-up |
 | Guest stage 2 | Existing VM-owned tables; only boot CPU executes the guest |
 | Startup | DT-selected, verified spin-table or PSCI backend; no guessed release address |
@@ -58,10 +58,14 @@ Proposed dependency order:
 ```mermaid
 flowchart TD
     A[Discover CPUs and verify holding-loop contract] --> B[Reserve live startup memory]
-    B --> C[Prepare private CPU state and guarded stacks]
-    C --> D[Activate shared EL2 stage-1 mappings on boot CPU]
-    D --> E[Initialize allocators and publish shared state]
-    E --> F[Release through verified backend]
+    B --> C[Prepare boot CPU state and static guarded stack]
+    C --> D[Activate initial EL2 stage-1 mappings on boot CPU]
+    D --> E[Initialize physical allocator bitmap metadata]
+    E --> S[Allocate enabled secondary stack ranges]
+    S --> M[Map usable RAM excluding dynamic guards]
+    M --> Z[Validate and zero stacks then publish Prepared]
+    Z --> P[Initialize heap and publish shared state]
+    P --> F[Release through verified backend]
     F --> G[Secondary selects private stack and TPIDR]
     G --> H[Secondary establishes EL2 state and shared mappings]
     H --> I[Acknowledge arrival and park or handle management work]
@@ -74,7 +78,7 @@ flowchart TD
 |---|---|
 | `src/main.rs` assembly `main` | Secondary entry must bypass `.bss` clearing and U-Boot argc/argv parsing |
 | `src/boot.rs` takeover path | Split once-only platform initialization from per-CPU EL2 initialization |
-| `scripts/rpi.ld` | Four guarded stacks and runtime bounds validated in 11.1; secondary entry must select its assigned stack |
+| `scripts/rpi.ld`, `src/pcpu.rs` | One static boot stack; enabled secondary stacks allocated after physical allocator initialization, before release |
 | `src/pcpu.rs`, `src/vcpu.rs` | Per-CPU context and all TPIDR_EL2 world-switch lookups implemented in 11.1; mutable state remains owner-only |
 | `src/mm.rs::GlobalPageAllocator` | Bitmap `UnsafeCell` accesses currently rely on single-core/DAIF policy, not a lock |
 | `src/mm.rs::TVISOR_TABLES` | Its mutex serializes writers but does not by itself make remote translations safe |
@@ -257,13 +261,26 @@ the VM-owned vCPU remains bound to logical CPU 0 throughout Phase 11.
 
 ### Guarded stacks and shared EL2 mappings
 
-Provision four 64 KiB stacks, each preceded by a 4 KiB unmapped guard, inside
-the linker-owned runtime footprint. Preserve 16-byte SP alignment. The 272 KiB
-stack/guard total replaces the old one-stack budget; assert section extents and
-test every guard's software translation. Do not assume the existing sixteen
-table pages remain sufficient after mappings change; calculate and validate the
-arena requirement. Recheck ELF source/runtime, guest staging, DTB and U-Boot
-non-overlap on the board after linker changes.
+Reserve one statically allocated 64 KiB boot stack with a 4 KiB unmapped guard
+inside the linker-owned image. After physical allocator metadata is initialized,
+allocate a contiguous 17-page guarded range only for each enabled secondary.
+The boot CPU prepares those ranges before any secondary release, so this stage
+does not require concurrent allocator access. Disabled CPUs receive no stack.
+The fixed metadata capacity does not determine the linker stack footprint.
+
+Allocate secondary ranges before the first broad usable-RAM mapping, without
+dereferencing them. Exclude their guards when installing that mapping, avoiding
+live block splitting or break-before-make. Complete table publication and local
+TLB maintenance before touching usable stack bytes. Validate every stack page
+and guard, zero only the stack bytes, then publish the secondary context as
+Prepared. Preserve 16-byte SP alignment and keep guard pages InUse too.
+
+Partial allocation failure must roll back before mappings are installed. Mapping
+failure must prevent preparation/release and retain allocated pages rather than
+recycle backing under partial mappings. Later reclamation/hotplug needs its own
+protocol. Calculate/check table capacity and runtime/staging bounds after layout
+changes; do not assume sixteen table pages suffice. Verify the original boot
+stack guard stays unmapped throughout initialization.
 
 ## 11.2: Synchronization and logging
 
@@ -523,7 +540,8 @@ board after tests. Do not combine first secondary release and first guest SMP.
 11.0 provides DT-described CPU/startup discovery, release-cell validation and
 protection of advertised firmware reservations. Firmware binary matching is not
 a runtime dependency. 11.1 adds boot-CPU TPIDR_EL2 context, separate startup
-metadata, four private guarded stacks and explicit guest-entry/return checks.
+metadata, a static boot stack, dynamically allocated guarded secondary stacks, and
+explicit guest-entry/return checks.
 Its complete single-vCPU quick regression passed; see the linked 11.1 report.
 
 Next implement 11.2 synchronization before secondary release in 11.3. Actual

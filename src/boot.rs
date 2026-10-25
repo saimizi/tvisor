@@ -277,11 +277,6 @@ extern "C" fn post_switch_page_tables(
             "Phase 11.0 DT firmware reservations verified before allocation; spin-table cells={}",
             startup.release_cells().len()
         );
-        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb, linux_image_pages) {
-            println!("Failed to map usable RAM: {}", error);
-            break 'wait;
-        }
-
         let initialized = match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
             Ok(initialized) => initialized,
             Err(error) => {
@@ -298,6 +293,15 @@ extern "C" fn post_switch_page_tables(
             initialized.stats.unused_pages,
             initialized.live_dtb,
         );
+
+        // Bitmap metadata lives in the already mapped tvisor image. Dynamic
+        // stack allocation touches only those bitmaps until RAM is mapped.
+        if let Err(error) =
+            crate::pcpu::prepare_secondary_cpus(memory_map, live_dtb, linux_image_pages)
+        {
+            println!("Secondary CPU preparation failed: {}", error);
+            break 'wait;
+        }
 
         // Initialize heap allocator
         let heap = match heap::initialize(None) {

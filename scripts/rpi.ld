@@ -53,13 +53,13 @@ SECTIONS {
         __writable_end = .;
     }
 
-    /* Four physical-CPU slots: each has a 4 KiB guard then a 64 KiB stack.
-     * EL2 stage-1 maps stacks individually and never maps the guard pages.
-     * Rust validates these constants against the shared layout model. */
-    .pcpu_stacks (NOLOAD) : ALIGN(__ALIGN_SIZE) {
-        __pcpu_stacks_start = .;
-        . += 4 * (0x1000 + 0x10000);
-        __pcpu_stacks_end = .;
+    /* Only the boot CPU needs a stack before physical allocation is available. */
+    .boot_stack (NOLOAD) : ALIGN(__ALIGN_SIZE) {
+        __boot_stack_guard_start = .;
+        . += 0x1000;
+        __boot_stack_bottom = .;
+        . += 0x10000;
+        __boot_stack_top = .;
     }
 
     /*
@@ -77,12 +77,12 @@ SECTIONS {
     . = ALIGN(__ALIGN_SIZE);
     __image_end = .;
 
-    ASSERT((__pcpu_stacks_start & 0xfff) == 0,
-           "per-CPU stack arena must be page aligned")
-    ASSERT((__pcpu_stacks_end - __pcpu_stacks_start) == 0x44000,
-           "four guarded stacks must occupy 272 KiB")
-    ASSERT(__pcpu_stacks_end <= __el2_stage1_tables_start,
-           "per-CPU stacks overlap the table arena")
+    ASSERT((__boot_stack_guard_start & 0xfff) == 0,
+           "boot stack guard must be page aligned")
+    ASSERT((__boot_stack_top - __boot_stack_guard_start) == 0x11000,
+           "boot stack and guard must occupy 68 KiB")
+    ASSERT(__boot_stack_top <= __el2_stage1_tables_start,
+           "boot stack overlaps the table arena")
     ASSERT((__el2_stage1_tables_start & 0xfff) == 0,
            "EL2 stage-1 table arena must be 4 KiB aligned")
     ASSERT((__el2_stage1_tables_end & 0xfff) == 0,

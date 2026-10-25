@@ -195,8 +195,8 @@ pub fn setup_el2_stage1_page_table(
         false,
     )?;
 
-    // Each private CPU stack is RW/NX Normal; all four guards stay unmapped.
-    tvisor_util::pcpu::map_stacks(&mut tables, crate::pcpu::stacks_base())?;
+    // Only the guarded static boot stack is needed before physical allocation.
+    tvisor_util::pcpu::map_stack(&mut tables, crate::pcpu::boot_stack())?;
 
     // .el2_stage1_tables
     map_identity(
@@ -240,7 +240,7 @@ pub fn setup_el2_stage1_page_table(
     validate_el2_stage1_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
     println!(
-        "Phase 11.1 EL2 stack mapping validation: four guarded stacks; table pages={}/{}",
+        "Phase 11.1 EL2 stack mapping validation: static boot guard validated; table pages={}/{}",
         tables.used_pages(),
         MAX_TABLE_PAGES
     );
@@ -329,9 +329,24 @@ pub fn map_usable_ram(
     memory_map: &MemoryMap,
     live_dtb: PhysRegion,
     linux_image_pages: PhysRegion,
+    secondary_stacks: &FixedList<
+        tvisor_util::pcpu::SecondaryStack,
+        { tvisor_util::cpu_topology::MAX_CPUS },
+    >,
 ) -> Result<(), PrepareError> {
-    let mut exclusions = FixedList::<PhysRegion, 1>::new();
-
+    // One DTB exclusion plus at most MAX_CPUS-1 dynamic guards.
+    let mut exclusions = FixedList::<PhysRegion, { tvisor_util::cpu_topology::MAX_CPUS }>::new();
+    for stack in secondary_stacks {
+        exclusions
+            .push(
+                PhysRegion::new(
+                    PhysAddr::new(stack.layout.guard_start),
+                    tvisor_util::pcpu::GUARD_SIZE,
+                )
+                .map_err(|_| PrepareError::Validation)?,
+            )
+            .map_err(|_| PrepareError::Validation)?;
+    }
     let live_dtb_aligned =
         PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
             .map_err(|_| PrepareError::AddressOverflow)?;
@@ -349,9 +364,13 @@ pub fn map_usable_ram(
             false,
             false,
         )?;
-        tvisor_util::pcpu::validate_stacks(tables, crate::pcpu::stacks_base())?;
+        tvisor_util::pcpu::validate_stack(tables, crate::pcpu::boot_stack())?;
+        for stack in secondary_stacks {
+            tvisor_util::pcpu::validate_stack(tables, stack.layout)?;
+        }
         println!(
-            "Phase 11.1 final EL2 mappings: all four guards unmapped; table pages={}/{}",
+            "Phase 11.1 final EL2 mappings: {} guards unmapped (one static boot); table pages={}/{}",
+            secondary_stacks.len() + 1,
             tables.used_pages(),
             MAX_TABLE_PAGES
         );
@@ -377,6 +396,17 @@ pub fn map_usable_ram(
 /// addresses, and pages already in use are skipped.
 pub fn allocate_page() -> Result<PhysAddr, AllocatorError> {
     with_allocator(|allocator| allocator.allocate())
+}
+
+/// Allocate secondary stack ranges using bitmap metadata only. The ranges
+/// are not yet accessible until their RAM mappings have been installed.
+pub fn allocate_secondary_stacks(
+    topology: &tvisor_util::cpu_topology::CpuTopology,
+) -> Result<
+    FixedList<tvisor_util::pcpu::SecondaryStack, { tvisor_util::cpu_topology::MAX_CPUS }>,
+    AllocatorError,
+> {
+    with_allocator(|allocator| tvisor_util::pcpu::allocate_secondary_stacks(topology, allocator))
 }
 
 /// Allocate the lowest-addressed run of `pages` contiguous unused managed
@@ -571,6 +601,6 @@ pub fn validate_el2_stage1_page_table<const N: usize>(
             return Err(PrepareError::Validation);
         }
     }
-    tvisor_util::pcpu::validate_stacks(tables, crate::pcpu::stacks_base())?;
+    tvisor_util::pcpu::validate_stack(tables, crate::pcpu::boot_stack())?;
     Ok(())
 }
