@@ -1,68 +1,60 @@
 # Phase 11.0 implementation and board evidence
 
-Status: **complete for the verified lab-rpi4 cold-boot profile**, 2026-10-25.
-Secondary activation remains disabled. The entry contract is established from
-identified firmware bytes; actual secondary entry-register validation remains
-part of 11.3, not an unperformed 11.0 activation test.
+Status: **DT boot-interface and startup-memory validation implemented**,
+2026-10-25. Secondary activation remains disabled. Firmware instruction matching
+and the embedded armstub reference were removed following PR #28 design review.
+Firmware updates preserving the DT-described interface and required reservations
+do not require updating an embedded firmware binary.
 
-See the [verified secondary startup contract](rpi4_secondary_startup.md) for
-firmware provenance, full memory dependencies, entry/coherency requirements,
-release/publication protocol, validation and portability limits.
+See the [secondary startup interface](rpi4_secondary_startup.md) for runtime
+checks, protocol assumptions, diagnostic observations and later entry-state gates.
 
 ## Implemented
 
 - Allocation-free owned CPU descriptions, full MPIDR affinity matching,
-  deterministic logical IDs with the boot CPU zero, disabled-CPU recording,
+  deterministic logical IDs with boot CPU zero, disabled-CPU recording,
   exact cell decoding and malformed/duplicate/capacity rejection.
-- Explicit PSCI binding and SMC/HVC description parsing, plus version-dependent
-  CPU_ON capability planning. This board advertises no PSCI interface, so
-  firmware queries are not applicable. There is no guessed conduit or fallback.
-- A verified BCM2711 Cortex-A72 spin-table profile, checked against the actual
-  low-memory stub at boot before trusting its memory footprint or entry state.
-- A permanent holding-page reservation invariant checked against the live DTB
-  and finalized memory map before allocator initialization. Unknown firmware or
-  missing protection halts boot.
-- No CPU_ON, release-cell writes, secondary trampoline, allocator reclamation
-  policy change, SD-card writes or saved-environment changes.
+- Explicit PSCI binding/conduit descriptions and version-dependent CPU_ON
+  capability planning. This board advertises no PSCI interface; no speculative
+  firmware calls or backend fallback are performed.
+- DT-selected spin-table cells: validate alignment, RAM/reservation coverage,
+  inherited read mapping and initial zero values. Shared cells and relocated
+  addresses are supported; no exact CPU-affinity or firmware-byte pattern is
+  required by startup-memory validation.
+- Before allocation, verify that every DT reservation-block range remains
+  reserved and outside usable RAM, including holding-code reservations separate
+  from the release cells. Preserve existing `/reserved-memory` handling.
+- No CPU_ON, release-cell writes, secondary trampoline, firmware instruction
+  reads, Cortex-specific SMPEN gate, or allocator reclamation policy change.
 
-## Board findings
+## Board observations
 
-| Item | Verified result |
-|---|---|
-| Boot CPU | MPIDR `0x80000000`, affinity zero, logical CPU0 |
-| Physical topology | Four enabled CPUs, affinities 0..3 |
-| Backend | Per-CPU `spin-table` |
-| Release cells | `0xd8`, `0xe0`, `0xe8`, `0xf0`, initially zero |
-| Holding dependencies | First 4 KiB, already reserved by the live DTB |
-| Secondary entry contract | Non-secure AArch64 EL2h; DAIF masked; MMU/D-cache/I-cache off; x0-x3 zero |
-| Maintenance coherency | Firmware sets Cortex-A72 SMPEN before park; boot CPU readback `0x40` |
-| PSCI | Not advertised; no probes called |
-
-The installed firmware was compared byte-for-byte with the official pinned
-`start4.elf`; the entire embedded armstub was reproduced from pinned source and
-all immutable live bytes match. U-Boot's exact downstream `.config` was not
-recovered; its assumed defaults are not used to justify the secondary path.
-See the contract for why the observed firmware holding loop has no relocated
-U-Boot stack/table dependencies.
+lab-rpi4 advertised four enabled affinities 0..3, boot MPIDR `0x80000000`,
+spin-table cells `0xd8`/`0xe0`/`0xe8`/`0xf0`, and a reserved first 4 KiB.
+Firmware identification/disassembly from the earlier investigation remains
+optional diagnostic evidence. The runtime trusts the documented DT boot
+interface and does not claim to measure parked CPUs' registers.
 
 ## Validation
 
-- **102 native ARM64 library tests passed**.
-- Bare-metal build, `cargo fmt --check`, and `git diff --check` passed.
-- Positive hardware validation: profile recognition, holding-page reservation
-  before allocation, Linux 6.18.2 guest boot and UART command completion.
-- Negative hardware validation: remove the reservation from a RAM DTB copy;
-  tvisor reports `MissingHoldingReservation` before allocator initialization.
+- **103 native ARM64 library tests passed**, including DT-selected/shared cells,
+  missing/partial/overflowing reservations, RAM boundaries, nonzero/unreadable
+  cells, separate holding-code protection, allocator exclusion and PSCI with no
+  invented release-cell reads.
+- Bare-metal build, formatting and whitespace checks passed.
+- lab-rpi4 positive test passed: DT cell checks, pre-allocation reservation
+  checks, Linux 6.18.2 guest boot, and UART command completion with status zero.
+- Negative hardware test passed: removing the reservation from a RAM-only DTB
+  copy produced `MissingHoldingReservation` before allocator initialization.
+- Evidence is in `docs/evidence/pr28_spin_table_interface/`; no quick/overnight
+  regression claim is made. No SD files or saved environment were changed.
 - Normal guest Image reused unchanged, SHA-256:
   `3a72c904e211f56e5f05d601b41495dfa4ec9029b3d7b1ee3556a72f9bb33b15`.
-- Tested final tvisor ELF SHA-256:
-  `6bf1a64e3d646b27079bfdb347a2a8e44d9ebc323e87b56b16e4684c78b7cf12`.
-- Targeted validation only; no new quick/overnight regression claim.
 - lab-rpi4 powered off after validation; relay state read back as off.
+- Revised tvisor ELF SHA-256:
+  `f091aac5c5059f4b15cc4f3d63a57162d687b9c516e2785fbff33cf25d25505e`.
 
-Issue [#29](https://github.com/saimizi/tvisor/issues/29), general guest stage-2
-protection for the firmware low page, remains deferred by agreement. It is
-separate from the verified allocator reservation and present guest mappings.
-
-Next: 11.1 per-CPU state and guarded stacks on the boot CPU, with no secondary
-release until the 11.3 assembly entry and readiness boundary are implemented.
+Issue [#29](https://github.com/saimizi/tvisor/issues/29) remains deferred. Next is
+11.1 per-CPU state and guarded stacks on the boot CPU. Actual secondary EL2,
+MMU/cache/coherency validation and the release-publication implementation remain
+11.3 gates; DT interface validation alone does not satisfy them.

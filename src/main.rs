@@ -127,7 +127,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         halt();
     }
 
-    // Verify the firmware holding-memory contract before allocator takeover.
+    // Validate DT startup memory ownership before allocator takeover.
     if let Err(error) = smp::discover(*fdt) {
         println!("Physical CPU startup discovery failed: {}", error);
         halt();

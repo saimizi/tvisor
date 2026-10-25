@@ -253,16 +253,16 @@ extern "C" fn post_switch_page_tables(
 
         let memory_map: &MemoryMap = &memory_map_guard;
         let Some(startup) = crate::smp::startup_contract() else {
-            println!("No verified secondary holding-memory contract");
+            println!("No validated CPU startup-memory description");
             break 'wait;
         };
-        if let Err(error) = startup.verify_memory_map(memory_map) {
+        if let Err(error) = startup.verify_memory_map(*fdt, memory_map) {
             println!("Secondary holding-memory reservation failed: {:?}", error);
             break 'wait;
         }
         println!(
-            "Phase 11.0 holding-memory reservation verified before allocation: {}",
-            startup.holding_memory()
+            "Phase 11.0 DT firmware reservations verified before allocation; spin-table cells={}",
+            startup.release_cells().len()
         );
         if let Err(error) = mm::map_usable_ram(memory_map, live_dtb, linux_image_pages) {
             println!("Failed to map usable RAM: {}", error);

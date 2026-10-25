@@ -1,12 +1,12 @@
 # Phase 11: tvisor physical SMP design
 
-Status: approved design, 2026-10-25. Phase 11.0 discovery is complete for the
-verified lab-rpi4 cold-boot profile. No secondary CPU has been released by tvisor;
+Status: approved design, 2026-10-25. Phase 11.0 validates the DT boot
+interface and startup-memory ownership. No secondary CPU has been released by tvisor;
 later milestones remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in
 [Phase 11.0 status](phase11_0_status.md) and the
-[verified board startup contract](rpi4_secondary_startup.md).
+[board startup interface](rpi4_secondary_startup.md).
 
 ## Scope and starting checkpoint
 
@@ -92,15 +92,17 @@ Similarly, masking interrupts on one CPU does not exclude another CPU.
 ## 11.0: CPU discovery and startup contract
 
 Before changing the release path, capture the live U-Boot DTB and board/build
-evidence. This is **complete for the checked lab-rpi4 profile**; see the verified
-board contract above. A successful normal Linux boot alone does not prove that
-tvisor's `bootelf` handoff has the same secondary-CPU contract.
+evidence. Phase 11.0 validates the DT-described interface and reservations;
+firmware identification and disassembly are optional diagnostic evidence, not
+mandatory runtime dependencies. Actual secondary entry state is checked by the
+11.3 trampoline. A normal Linux boot alone does not validate tvisor's entry path.
 
 Record `/cpus` address-cell width, each enabled node's `reg`, `status`,
 `enable-method`, and `cpu-release-addr` where applicable; record `/psci`
 compatible/method if present. Correlate the boot MPIDR. Check U-Boot's exact
-configuration/source, firmware startup path, actual release-cell contents,
-secondary exception level, MMU/cache state, and coherency-domain requirements.
+handoff and actual release-cell contents. Document the required secondary
+exception level, MMU/cache state and coherency conditions for validation in 11.3.
+Do not require a particular firmware image or instruction sequence at runtime.
 Do not infer a backend from the Pi model or from CONFIG_ARM_PSCI in Linux.
 
 The standard spin-table convention uses a naturally aligned 64-bit
@@ -153,20 +155,22 @@ provide the interface and discovery references.
 
 ### Parking-memory ownership is a prerequisite
 
-The present takeover policy permits reclaiming U-Boot RAM. A secondary may
-still execute a U-Boot/firmware holding loop, use its translation tables, or
-poll a release cell in that memory. On the verified lab-rpi4 profile, the
-matched firmware loop and all its live dependencies fit in the DT-reserved
-first page and do not depend on relocated U-Boot stacks or translation tables.
-The implementation verifies that profile and reservation before allocation;
-other firmware/backend footprints require new evidence.
+The present takeover policy permits reclaiming U-Boot RAM. Under the spin-table
+boot protocol, firmware must advertise its complete live holding area and
+release-cell storage through DT reservations. Phase 11.0 checks cell alignment,
+RAM/reservation coverage and initial values, and verifies that **all** DT
+reservation-block ranges stay reserved and outside usable RAM before allocation.
+This includes holding code in regions separate from the cells. Existing
+`/reserved-memory` exclusions remain in force too.
 
-Discover and reserve the complete live startup dependency footprint **before
-allocator initialization**, guest allocation, or any release-cell write. Include
-holding-loop code/data, stacks/tables if used, and release-cell pages. A DT cell
-address alone does not describe that complete footprint. If its extent cannot
-be established, defer reclamation of a conservatively established U-Boot runtime
-reservation or reject SMP startup; never invent bounds from an old `bdinfo`.
+A release-cell address alone does not describe the holding-code footprint.
+Tvisor relies on the documented firmware interface to describe it correctly;
+it does not derive that footprint by inspecting firmware instructions or
+assuming a fixed first page. Diagnostic disassembly may help investigate a
+broken interface but is not required for a compatible firmware update to boot.
+Unsupported methods or missing cell reservations fail explicitly. A future
+backend requiring additional memory must establish and reserve that dependency
+before activation; never invent bounds from an old `bdinfo`.
 
 For the initial implementation, keep these extra reservations permanent for the
 run. Later reclamation requires acknowledgement that every affected CPU has
@@ -483,7 +487,7 @@ Guest stage-2 cross-CPU execution and its associated shootdowns remain Phase 12.
 
 | Step | Deliverable | Gate before proceeding |
 |---|---|---|
-| 11.0 | Owned topology and verified startup/memory contract | Host malformed-DT tests; explicit PSCI conduit/version/CPU_ON/entry-contract report; captured U-Boot/DT/firmware evidence; parking dependencies reserved before allocation |
+| 11.0 | Owned topology, DT startup interface and memory ownership | Host malformed-DT tests; explicit PSCI conduit/version/CPU_ON/entry-contract report; DT interface and zero-cell checks; all advertised firmware reservations excluded from allocation; firmware diagnostics optional |
 | 11.1 | Boot CPU uses per-CPU storage and guarded stack layout | Assembly offsets/disassembly checked; single-core quick regression passes, no secondary release |
 | 11.2 | Allocator/UART locking and interrupt-safe boundaries | Host contention/ownership tests; no unsynchronized mutable statics or allocating IRQ paths used by SMP |
 | 11.3 | Secondary trampoline and tvisor-owned holding pens | One requested secondary reaches validated private EL2/park; shared-cell behavior accounted for; bounded failure test |
@@ -514,15 +518,15 @@ board after tests. Do not combine first secondary release and first guest SMP.
 
 ## Implementation checkpoint after 11.0
 
-11.0 is complete for the verified lab-rpi4 cold-boot profile. CPU discovery,
-firmware identity/holding-memory evidence, entry/coherency contract and release
-publication requirements are recorded in the linked implementation report.
-The runtime rejects unknown profiles or missing holding-page reservations before
-allocator takeover. PSCI queries are not applicable to this spin-table-only DTB;
-a future PSCI platform still requires its own reviewed EL2 conduit adapter.
+11.0 provides DT-described CPU/startup discovery, release-cell validation and
+pre-allocation protection of advertised firmware reservations. Firmware binary
+matching is not a runtime dependency; identification and disassembly remain
+optional diagnostic evidence. PSCI queries are not applicable to this board's
+spin-table DTB. A future PSCI path requires its own reviewed EL2-callable adapter.
 
 Next implement 11.1 on the boot CPU, then validate 11.2 synchronization before
-secondary release in 11.3. Live secondary entry registers, guarded-stack access,
-management-SGI ownership/target masks, table-arena capacity after the new layout,
-and cross-core cache/TLB behavior remain later milestone gates. Do not count
-11.0's firmware contract evidence as execution of those later hardware tests.
+secondary release in 11.3. Actual secondary EL2/MMU/cache/coherency state,
+guarded-stack access, release maintenance/publication, management-SGI ownership,
+table-arena capacity after the new layout, and cross-core cache/TLB behavior
+remain later milestone gates. DT startup descriptions do not replace those
+checks or turn firmware implementation details into boot-time requirements.
