@@ -25,6 +25,7 @@ pub mod mmio;
 pub mod page;
 pub mod page_allocator;
 pub mod platform;
+pub mod rpi4_startup;
 pub mod system_info;
 pub mod virtual_timer;
 

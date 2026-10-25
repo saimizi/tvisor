@@ -1,11 +1,12 @@
 # Phase 11: tvisor physical SMP design
 
-Status: initial design, 2026-10-25. No secondary CPU has been released by this
-change. Architectural decisions below are proposed implementation contracts;
-board startup details remain an explicit discovery milestone.
+Status: approved design, 2026-10-25. Phase 11.0 discovery is complete for the
+verified lab-rpi4 cold-boot profile. No secondary CPU has been released by tvisor;
+later milestones remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in
-[Phase 11.0 status](phase11_0_status.md). The startup-contract gate remains open.
+[Phase 11.0 status](phase11_0_status.md) and the
+[verified board startup contract](rpi4_secondary_startup.md).
 
 ## Scope and starting checkpoint
 
@@ -91,8 +92,9 @@ Similarly, masking interrupts on one CPU does not exclude another CPU.
 ## 11.0: CPU discovery and startup contract
 
 Before changing the release path, capture the live U-Boot DTB and board/build
-evidence. This remains **pending**; successful normal Linux boot does not prove
-that tvisor's `bootelf` handoff has the same secondary-CPU contract.
+evidence. This is **complete for the checked lab-rpi4 profile**; see the verified
+board contract above. A successful normal Linux boot alone does not prove that
+tvisor's `bootelf` handoff has the same secondary-CPU contract.
 
 Record `/cpus` address-cell width, each enabled node's `reg`, `status`,
 `enable-method`, and `cpu-release-addr` where applicable; record `/psci`
@@ -153,9 +155,11 @@ provide the interface and discovery references.
 
 The present takeover policy permits reclaiming U-Boot RAM. A secondary may
 still execute a U-Boot/firmware holding loop, use its translation tables, or
-poll a release cell in that memory. Whether this happens on lab-rpi4 is not yet
-established. Treat it as an ownership hazard requiring evidence, not as proof
-that the existing single-core baseline is corrupt.
+poll a release cell in that memory. On the verified lab-rpi4 profile, the
+matched firmware loop and all its live dependencies fit in the DT-reserved
+first page and do not depend on relocated U-Boot stacks or translation tables.
+The implementation verifies that profile and reservation before allocation;
+other firmware/backend footprints require new evidence.
 
 Discover and reserve the complete live startup dependency footprint **before
 allocator initialization**, guest allocation, or any release-cell write. Include
@@ -508,15 +512,17 @@ allocation/IPI bursts during a separate guest run to test actual concurrency.
 Keep guest DT CPU count one throughout. Preserve artifacts and power off the
 board after tests. Do not combine first secondary release and first guest SMP.
 
-## First implementation change: 11.0
+## Implementation checkpoint after 11.0
 
-Begin with 11.0: add allocation-free CPU discovery and a report of the startup
-contract, plus host tests. Capture the lab board's working DTB and U-Boot startup
-configuration without releasing a core. Resolve the holding-memory reservations
-before changing allocator policy. This makes the first SMP-specific PR reviewable
-and leaves today's tested boot behavior intact.
+11.0 is complete for the verified lab-rpi4 cold-boot profile. CPU discovery,
+firmware identity/holding-memory evidence, entry/coherency contract and release
+publication requirements are recorded in the linked implementation report.
+The runtime rejects unknown profiles or missing holding-page reservations before
+allocator takeover. PSCI queries are not applicable to this spin-table-only DTB;
+a future PSCI platform still requires its own reviewed EL2 conduit adapter.
 
-Open evidence items: actual enabled-CPU topology, per-CPU/common release cells,
-holding-loop physical footprint, EL/MMU/cache entry state, usable firmware
-conduit, GIC target masks/management-SGI group, and shared-table arena capacity.
-None is assumed resolved merely by this design document.
+Next implement 11.1 on the boot CPU, then validate 11.2 synchronization before
+secondary release in 11.3. Live secondary entry registers, guarded-stack access,
+management-SGI ownership/target masks, table-arena capacity after the new layout,
+and cross-core cache/TLB behavior remain later milestone gates. Do not count
+11.0's firmware contract evidence as execution of those later hardware tests.
