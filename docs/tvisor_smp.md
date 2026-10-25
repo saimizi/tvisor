@@ -106,6 +106,46 @@ U-Boot also documents that spin-table implementations may use a common or
 per-CPU release location; its generic documentation is not evidence of this
 board's built behavior. See [U-Boot ARM64 notes](https://docs.u-boot.org/en/latest/arch/arm64.html).
 
+### Explicit PSCI discovery and eligibility checks
+
+Complete these checks in 11.0 without issuing `CPU_ON` or releasing a core:
+
+1. Parse the PSCI node (normally `/psci`), its `compatible` and `method`, and
+   each CPU's `enable-method`. Select the backend from the CPU description;
+   the presence of a PSCI node alone does not select PSCI for every CPU.
+2. Identify the advertised conduit, `smc` or `hvc`, and record the binding
+   version. Reject missing, malformed or unsupported descriptions explicitly.
+3. Establish that the conduit reaches the intended firmware service from
+   tvisor's actual EL2 environment before executing a probe. Check firmware
+   implementation/configuration and applicable trap controls. An EL1 HVC
+   service is not automatically callable by its EL2 host; do not try arbitrary
+   SMC/HVC instructions as a discovery strategy.
+4. For a verified callable PSCI 0.2-or-later interface, query `PSCI_VERSION`,
+   validate the returned version and retain the raw result. Legacy PSCI 0.1
+   has no standard version query: report it separately and require an explicit
+   implementation decision rather than using modern function IDs blindly.
+5. Determine whether the AArch64 `CPU_ON` operation is available. For PSCI
+   1.0 or later, query `PSCI_FEATURES` for `CPU_ON` using the intended SMC64
+   function ID and validate the result. For PSCI 0.2, where `PSCI_FEATURES`
+   is unavailable, use the mandatory `CPU_ON` contract of that version and
+   verified firmware evidence. Legacy bindings require their advertised
+   function IDs and a separately reviewed adapter. Never probe availability
+   by actually calling `CPU_ON` in 11.0.
+6. Verify the secondary entry contract from the applicable PSCI specification
+   and firmware implementation: Non-secure AArch64 EL2 entry, MMU/cache state,
+   coherency, entry-address constraints and context argument. Neither
+   `PSCI_VERSION` nor `PSCI_FEATURES` reports the complete entry contract.
+   Observe and validate the actual entry state during 11.3 bring-up before
+   admitting the secondary to normal execution.
+
+Report DT advertisement, EL2 conduit eligibility, version, `CPU_ON` capability
+and entry-contract evidence as separate results, including unknown/unsupported
+states. A failed PSCI check does not authorize automatic spin-table fallback;
+that backend needs its own DT description and verified startup contract.
+The [Arm PSCI specification](https://documentation-service.arm.com/static/640f584656ea36189d4e94a4)
+and [Linux PSCI binding](https://android.googlesource.com/kernel/common/+/4427259cc7f7571a157fbc9b5011e1ef6fe0a4a8/Documentation/devicetree/bindings/arm/psci.yaml)
+provide the interface and discovery references.
+
 ### Parking-memory ownership is a prerequisite
 
 The present takeover policy permits reclaiming U-Boot RAM. A secondary may
@@ -261,8 +301,64 @@ The secondary assembly entry must:
    descriptor/code publication, local invalidation and instruction barriers.
    The early trampoline, records and stack must be accessible on both sides
    of the MMU transition. Guard protection begins after tvisor's mappings apply.
-5. Validate registers/stack/identity; publish the bounded arrival acknowledgement
-   and enter a tvisor-owned management/parking loop. Enable no guest execution.
+5. Complete the startup synchronization described below and cross the explicit
+   Rust entry boundary. Only then call `secondary_main()` to validate local
+   state, initialize remaining per-CPU services and publish the bounded arrival
+   acknowledgement. Enter a tvisor-owned management/parking loop; enable no
+   guest execution. Keep IRQs masked until 11.4's handler-readiness gate.
+
+### Boundary for ordinary shared Rust data access
+
+`secondary_main()` is the first Rust entry point on a secondary. Before calling
+it, the assembly/backend path must establish all of these conditions:
+
+- The CPU has a validated identity, an exclusively owned ABI-aligned stack and
+  initialized TPIDR/vector state. The required EL2 controls and compiler execution
+  environment, including FP/SIMD policy, are ready.
+- The shared EL2 stage-1 mappings are active locally with compatible memory
+  types, cacheability and shareability. Required code/table publication, local
+  TLB maintenance and architectural completion/instruction barriers are complete.
+- Firmware/backend evidence establishes membership in the required coherency
+  domain before shared synchronization is used. Enabling translations, executing
+  an ISB or performing an acquire load does not establish that membership.
+- The boot CPU has completed once-only initialization of every shared object
+  exposed to this entry point, then release-published a startup-ready token.
+  The secondary has acquire-observed the matching generation/token through the
+  verified coherent startup mailbox. Assembly implements this handoff with
+  semantics compatible with the Rust atomic protocol; volatile reads do not
+  substitute for acquire/release synchronization.
+
+```text
+Validated backend entry and coherency contract
+    -> Read CurrentEL / MPIDR_EL1
+    -> Select private stack, TPIDR and vectors
+    -> Configure required EL2 execution state
+    -> Enable shared EL2 stage-1 mappings and complete maintenance/barriers
+    -> Acquire-observe the boot CPU's published startup-ready token
+    -> [ordinary shared Rust access is now permitted under ownership/lock rules]
+    -> Rust secondary_main()
+```
+
+Before this boundary, access only the explicitly described startup memory:
+entry code, bounded immutable CPU records, the selected private stack/context,
+translation tables and the dedicated startup mailbox. Each must have a documented
+addressing, ownership and publication/cache-maintenance contract for the entry
+regime, including the MMU transition. Early record reads are not permission to
+access arbitrary Rust objects. Do not call Rust helpers, allocators, formatting,
+logging, locks or general shared globals on this path. Failures use a bounded
+assembly park path without those services.
+
+Crossing the boundary permits access; it does not grant unrestricted mutable
+access. Immutable objects must be fully published, CPU-local objects remain
+owner-only, and shared mutable objects still require their specified locks or
+atomics. Any service not initialized by this point remains unavailable until
+its own readiness gate. In particular, entering Rust is distinct from `Online`:
+local GIC/management readiness and the arrival protocol must still be completed.
+
+Review the entry disassembly to verify that no Rust call precedes the boundary.
+Test the startup-ready protocol's matching-generation and acquire/release rules
+on the host, and record a checkpoint immediately after entry on hardware using
+only services whose readiness has been established.
 
 For initial backend bring-up, require an established EL2, MMU-off physical entry
 contract, or an explicitly reviewed adapter that reaches it safely. Do not
@@ -302,6 +398,42 @@ Handle current-EL IRQs on worker EL2 stacks and lower-EL IRQ exits on the boot
 CPU. Both dispatch host management requests without injecting them into Linux.
 Do not enable IRQs on a worker until its per-CPU vectors/state and handler are
 ready. Prove IPI completion/acknowledgement before attempting TLB work.
+
+### Management SGIs while CPU0 executes Linux
+
+Treat guest execution on CPU0 as an explicit management-interrupt case, not
+just worker-to-worker delivery. Verify the complete physical path: SGI group
+ownership, target mask, distributor/CPU-interface enables, priority threshold
+and preemption configuration, plus the firmware's EL3 routing contract.
+
+For the intended Non-secure physical IRQ delivery, verify effective
+`HCR_EL2.IMO = 1` during guest execution so physical IRQs target EL2, subject to
+higher-level routing. Audit `FMO` and `AMO` against the separate FIQ/SError
+policy, and verify the intended non-VHE `TGE = 0` configuration; do not set TGE
+as a shortcut for management delivery. Check every guest-entry, exit and
+stage-2 activation/deactivation path so rewriting HCR does not drop required
+routing controls. Record/read back relevant controls at validation checkpoints.
+Review effective routing and masking rules against the
+[Arm virtualization guide](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Armv8-A%20virtualization.pdf).
+
+A management SGI received while Linux executes must enter the lower-EL IRQ
+vector, preserve the interrupted vCPU context, and dispatch to a host-owned
+handler before any generic guest-injection logic. Process the request and
+complete the full physical acknowledgement token using the configured EOI/DIR
+policy. Resume the interrupted guest with its architectural and virtual GIC
+state preserved. Never create a GICH list-register entry, set `HCR_EL2.VI/VF`,
+or mark a guest interrupt pending because of a management SGI. Existing guest
+interrupt delivery remains a separate path.
+
+The 11.4 hardware gate must include worker-to-CPU0 requests while Linux is
+actively running and while it is idle/WFI, alongside guest timer and UART
+traffic. Require bounded acknowledgements, host-only SGI counters, no management
+SGI injection events, correct physical completion, and continued guest progress.
+Also test CPU0 handling while it executes at EL2: pending requests during
+bounded masked regions must be serviced once the established handler/masking
+policy permits. Include guest IRQ-masked execution to verify routing does not
+depend on Linux unmasking its virtual IRQs. Use host instrumentation to prove
+non-injection; absence from Linux's interrupt listing alone is insufficient.
 
 ## 11.5: All-core bring-up and concurrent resource tests
 
@@ -344,11 +476,11 @@ Guest stage-2 cross-CPU execution and its associated shootdowns remain Phase 12.
 
 | Step | Deliverable | Gate before proceeding |
 |---|---|---|
-| 11.0 | Owned topology and verified startup/memory contract | Host malformed-DT tests; captured U-Boot/DT/firmware evidence; parking dependencies reserved before allocation |
+| 11.0 | Owned topology and verified startup/memory contract | Host malformed-DT tests; explicit PSCI conduit/version/CPU_ON/entry-contract report; captured U-Boot/DT/firmware evidence; parking dependencies reserved before allocation |
 | 11.1 | Boot CPU uses per-CPU storage and guarded stack layout | Assembly offsets/disassembly checked; single-core quick regression passes, no secondary release |
 | 11.2 | Allocator/UART locking and interrupt-safe boundaries | Host contention/ownership tests; no unsynchronized mutable statics or allocating IRQ paths used by SMP |
 | 11.3 | Secondary trampoline and tvisor-owned holding pens | One requested secondary reaches validated private EL2/park; shared-cell behavior accounted for; bounded failure test |
-| 11.4 | Host SGI request/ack dispatch | Per-CPU IRQ routing and raw-token completion demonstrated; no lost requests/deadlocks |
+| 11.4 | Host SGI request/ack dispatch | Per-CPU IRQ routing and raw-token completion demonstrated, including CPU0 guest execution/WFI; no management injection or lost requests/deadlocks |
 | 11.5 | All eligible CPUs and concurrency tests | Unique affinities/stacks/TPIDR/GIC targets; concurrent allocation/free has no duplicate live pages; heap/logging remain consistent |
 | 11.6 | TLB/update protocol and final physical SMP gate | Reserved scratch remapping and barrier/shootdown tests pass; parked workers coexist with the one-vCPU overnight regression |
 
