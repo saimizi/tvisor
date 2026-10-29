@@ -14,6 +14,7 @@ pub mod debug_util;
 
 pub mod aarch64_reg;
 pub mod el2_stage1_translation;
+pub mod failure;
 pub mod fdt;
 pub mod gicv2;
 pub mod guest_fdt;
@@ -27,6 +28,7 @@ pub mod page;
 pub mod page_allocator;
 pub mod pcpu;
 pub mod platform;
+pub mod sync;
 pub mod system_info;
 pub mod virtual_timer;
 

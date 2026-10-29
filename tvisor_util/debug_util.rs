@@ -1,8 +1,10 @@
-use crate::halt;
+use crate::{halt, sync::IrqSpinLock};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const UART_TX_POLL_COUNT: usize = 1_000_000;
+
+static UART_TX: IrqSpinLock<()> = IrqSpinLock::new(());
 
 static MINI_UART_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,7 +25,7 @@ impl MiniUart {
     const CNTL_TX_ENABLE: u32 = 1 << 1;
 
     fn configured() -> Option<Self> {
-        let register_base = MINI_UART_BASE.load(Ordering::Relaxed);
+        let register_base = MINI_UART_BASE.load(Ordering::Acquire);
         (register_base != 0).then_some(Self { register_base })
     }
 
@@ -106,8 +108,12 @@ unsafe fn mmio_write32(address: usize, value: u32) {
 }
 
 pub fn print(args: fmt::Arguments<'_>) -> fmt::Result {
-    let mut uart = MiniUart::configured().ok_or(fmt::Error)?;
-    uart.write_fmt(args)
+    write_message(MiniUart::configured().ok_or(fmt::Error)?, args)
+}
+
+fn write_message(mut writer: impl Write, args: fmt::Arguments<'_>) -> fmt::Result {
+    let _guard = UART_TX.lock();
+    writer.write_fmt(args)
 }
 
 /// Sends one byte through tvisor's host-owned Mini UART.
@@ -115,6 +121,7 @@ pub fn print(args: fmt::Arguments<'_>) -> fmt::Result {
 /// This is used by virtual devices after their guest access has been fully
 /// emulated; it never makes the physical UART visible to a guest.
 pub fn write_byte(byte: u8) -> Result<(), ()> {
+    let _guard = UART_TX.lock();
     MiniUart::configured().ok_or(())?.write_byte(byte)
 }
 
@@ -127,6 +134,7 @@ pub fn read_byte() -> Option<u8> {
 /// Enables the host-owned Mini UART receive interrupt. The EL2 IRQ path
 /// drains received bytes and routes them to the selected virtual UART.
 pub fn enable_rx_interrupt() -> Result<(), ()> {
+    let _guard = UART_TX.lock();
     let uart = MiniUart::configured().ok_or(())?;
     uart.enable_rx_interrupt();
     Ok(())
@@ -153,17 +161,89 @@ macro_rules! println {
 /// Enables diagnostic output through a DTB-discovered Mini UART register
 /// window. No MMIO is accessed before this function is called.
 pub fn debug_init(mini_uart_register_base: usize) {
-    MINI_UART_BASE.store(mini_uart_register_base, Ordering::Relaxed);
+    MINI_UART_BASE.store(mini_uart_register_base, Ordering::Release);
 }
 
 pub fn debug_fini() {
-    println!("Wait IO completed...");
-    if let Some(uart) = MiniUart::configured() {
-        let _ = uart.wait_io_completed();
+    let _ = emergency_print(format_args!("Wait IO completed...\n"));
+    if let Some(_guard) = UART_TX.try_lock() {
+        if let Some(uart) = MiniUart::configured() {
+            let _ = uart.wait_io_completed();
+        }
     }
 }
 
 pub fn stop() -> ! {
     debug_fini();
     halt()
+}
+
+/// Fatal output never waits for the console lock. If a fault interrupted its
+/// owner, the persistent atomic failure record remains available instead.
+/// Byte and MMIO polling budgets bound output, including a stuck UART.
+pub fn emergency_print(args: fmt::Arguments<'_>) -> fmt::Result {
+    let _guard = UART_TX.try_lock().ok_or(fmt::Error)?;
+    let uart = MiniUart::configured().ok_or(fmt::Error)?;
+    struct BoundedWriter {
+        uart: MiniUart,
+        remaining: usize,
+    }
+    impl Write for BoundedWriter {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            for byte in text.bytes() {
+                if self.remaining == 0 {
+                    return Err(fmt::Error);
+                }
+                self.remaining -= 1;
+                self.uart.write_byte(byte).map_err(|_| fmt::Error)?;
+            }
+            Ok(())
+        }
+    }
+    BoundedWriter {
+        uart,
+        remaining: 512,
+    }
+    .write_fmt(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrent_formatted_messages_do_not_interleave() {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<std::string::String>>);
+        impl Write for Sink {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                self.0.lock().unwrap().push_str(text);
+                std::thread::yield_now();
+                Ok(())
+            }
+        }
+        let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(
+            std::string::String::new(),
+        )));
+        std::thread::scope(|scope| {
+            for cpu in 0..4 {
+                let sink = sink.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        write_message(sink.clone(), format_args!("CPU[{}]:{}:end\n", cpu, cpu))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let output = sink.0.lock().unwrap();
+        assert_eq!(output.lines().count(), 400);
+        for line in output.lines() {
+            assert!((0..4).any(|cpu| line == std::format!("CPU[{cpu}]:{cpu}:end")));
+        }
+    }
+    #[test]
+    fn fatal_output_does_not_wait_for_held_console() {
+        let _guard = UART_TX.lock();
+        assert!(emergency_print(format_args!("fatal")).is_err());
+    }
 }

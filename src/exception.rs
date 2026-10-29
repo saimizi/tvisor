@@ -166,25 +166,34 @@ const PHASE6_BRK_COMMENT: u64 = 0x600;
 
 #[unsafe(no_mangle)]
 extern "C" fn phase6_exception_handler(frame: &mut ExceptionFrame) -> u64 {
-    println!("Phase 6 EL2 exception");
-    println!(" vector={}", frame.vector);
-    println!(" ESR_EL2={:#018x}", frame.esr_el2);
-    println!(" ELR_EL2={:#018x}", frame.elr_el2);
-    println!("SPSR_EL2={:#018x}", frame.spsr_el2);
-    println!(" FAR_EL2={:#018x}", frame.far_el2);
-
     let exception_class = (frame.esr_el2 >> ESR_EC_SHIFT) & ESR_EC_MASK;
     let brk_comment = frame.esr_el2 & ESR_BRK_COMMENT_MASK;
     if frame.vector == CURRENT_EL_SPX_SYNC_VECTOR
         && exception_class == ESR_EC_BRK_AARCH64
         && brk_comment == PHASE6_BRK_COMMENT
     {
+        println!("Phase 6 EL2 exception");
+        println!(" vector={}", frame.vector);
+        println!(" ESR_EL2={:#018x}", frame.esr_el2);
+        println!(" ELR_EL2={:#018x}", frame.elr_el2);
+        println!("SPSR_EL2={:#018x}", frame.spsr_el2);
+        println!(" FAR_EL2={:#018x}", frame.far_el2);
+
         frame.elr_el2 = frame.elr_el2.wrapping_add(4);
         println!("Returning after deliberate synchronous exception");
         return 1;
     }
 
-    println!("Unexpected exception; halting");
+    crate::pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 2,
+        syndrome: frame.esr_el2,
+        pc: frame.elr_el2,
+        address: frame.far_el2,
+    });
+    let _ = tvisor_util::debug_util::emergency_print(format_args!(
+        "Unexpected exception; halting vector={} ESR_EL2={:#x} ELR_EL2={:#x} FAR_EL2={:#x}\n",
+        frame.vector, frame.esr_el2, frame.elr_el2, frame.far_el2,
+    ));
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }

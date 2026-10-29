@@ -4,7 +4,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use spin::Mutex;
 use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_stage1_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
@@ -14,29 +13,32 @@ use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap,
 };
+use tvisor_util::sync::IrqSpinLock;
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 use tvisor_util::*;
 
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = (MAX_TABLE_PAGES * PAGE_SIZE) as u64;
 
-static TVISOR_TABLES: Mutex<Option<TableSet<'static, MAX_TABLE_PAGES>>> = Mutex::new(None);
+static TVISOR_TABLES: IrqSpinLock<Option<TableSet<'static, MAX_TABLE_PAGES>>> =
+    IrqSpinLock::new(None);
 
 struct GlobalPageAllocator {
+    lock: IrqSpinLock<()>,
     managed: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
     in_use: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
     ram_pages: AtomicUsize,
     initialized: AtomicBool,
 }
 
-// Phase 8 remains single-core with DAIF masked. This Sync implementation
-// permits static storage; every mutable bitmap access is serialized by that
-// execution policy and wrapped by the functions below.
+// SAFETY: the IRQ-save lock serializes every bitmap view, initialization and
+// statistics access. Mutable bitmap references never escape its guard.
 unsafe impl Sync for GlobalPageAllocator {}
 
 impl GlobalPageAllocator {
     const fn new() -> Self {
         Self {
+            lock: IrqSpinLock::new(()),
             managed: UnsafeCell::new(PageBitmap::zeroed()),
             in_use: UnsafeCell::new(PageBitmap::zeroed()),
             ram_pages: AtomicUsize::new(0),
@@ -285,6 +287,7 @@ pub fn initialize_allocator_after_takeover(
     memory_map: &MemoryMap,
     live_dtb: PhysRegion,
 ) -> Result<AllocatorInitResult, AllocatorInitError> {
+    let _guard = PAGE_ALLOCATOR.lock.lock();
     if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
         return Err(AllocatorError::DoubleFree.into());
     }
@@ -294,8 +297,7 @@ pub fn initialize_allocator_after_takeover(
         PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
             .map_err(|_| AllocatorInitError::InvalidDtb)?;
 
-    // SAFETY: initialization runs once after takeover on the boot CPU before
-    // any allocator client or asynchronous exception can access this state.
+    // SAFETY: the allocator lock exclusively protects both bitmap views.
     let allocator = unsafe {
         PageAllocator::new(
             memory_map.ram(),
@@ -355,7 +357,7 @@ pub fn map_usable_ram(
         .push(live_dtb_aligned)
         .map_err(|_| PrepareError::Validation)?;
 
-    with_tables(|tables| {
+    let used_pages = with_tables(|tables| {
         map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
         map_identity(
             tables,
@@ -368,14 +370,15 @@ pub fn map_usable_ram(
         for stack in secondary_stacks {
             tvisor_util::pcpu::validate_stack(tables, stack.layout)?;
         }
-        println!(
-            "Phase 11.1 final EL2 mappings: {} guards unmapped (one static boot); table pages={}/{}",
-            secondary_stacks.len() + 1,
-            tables.used_pages(),
-            MAX_TABLE_PAGES
-        );
-        Ok(())
+        Ok(tables.used_pages())
     })?;
+
+    println!(
+        "Phase 11.1 final EL2 mappings: {} guards unmapped (one static boot); table pages={}/{}",
+        secondary_stacks.len() + 1,
+        used_pages,
+        MAX_TABLE_PAGES
+    );
 
     unsafe {
         core::arch::asm!(
@@ -429,12 +432,12 @@ pub fn allocator_stats() -> Result<AllocatorStats, AllocatorError> {
 fn with_allocator<T>(
     operation: impl FnOnce(&mut PageAllocator<'_, PAGE_BITMAP_BYTES>) -> Result<T, AllocatorError>,
 ) -> Result<T, AllocatorError> {
+    let _guard = PAGE_ALLOCATOR.lock.lock();
     if !PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
         return Err(AllocatorError::NotInitialized);
     }
     let ram_pages = PAGE_ALLOCATOR.ram_pages.load(Ordering::Relaxed);
-    // SAFETY: Phase 8 is single-core with asynchronous exceptions masked, so
-    // allocator operations cannot overlap.
+    // SAFETY: the IRQ-save guard exclusively owns both bitmap views.
     let mut allocator = unsafe {
         PageAllocator::from_existing(
             &mut *PAGE_ALLOCATOR.managed.get(),

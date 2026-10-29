@@ -1,10 +1,10 @@
 use alloc::format;
 use core::{
     arch::{asm, global_asm},
-    sync::atomic::{AtomicU64, Ordering},
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use spin::Mutex;
 use tvisor_util::debug_util::stop;
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
@@ -21,9 +21,29 @@ use crate::{
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
-// Boot-time memory discovery writes directly into this tvisor-owned `.bss`
-// object so the private EL2 stack holds only a mutex guard and references.
-static MEMORY_MAP: Mutex<MemoryMap> = Mutex::new(MemoryMap::empty());
+// Boot-only scratch storage is claimed once; it is never shared with workers.
+// Keep the large map out of the private stack without nesting a boot-map mutex
+// around allocator, mapping, heap and console operations.
+struct BootMemoryMap {
+    claimed: AtomicBool,
+    map: UnsafeCell<MemoryMap>,
+}
+// SAFETY: only the successful one-time claimant can obtain the mutable view.
+// No other accessor exposes this storage to workers or interrupt handlers.
+unsafe impl Sync for BootMemoryMap {}
+impl BootMemoryMap {
+    fn claim(&'static self) -> Option<&'static mut MemoryMap> {
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // SAFETY: the successful claim exclusively owns this storage forever.
+        Some(unsafe { &mut *self.map.get() })
+    }
+}
+static MEMORY_MAP: BootMemoryMap = BootMemoryMap {
+    claimed: AtomicBool::new(false),
+    map: UnsafeCell::new(MemoryMap::empty()),
+};
 
 unsafe extern "C" {
     fn __enter_private_el2(
@@ -245,26 +265,29 @@ extern "C" fn post_switch_page_tables(
             }
         };
 
-        let mut memory_map_guard = MEMORY_MAP.lock();
+        let Some(memory_map) = MEMORY_MAP.claim() else {
+            println!("Boot memory map already claimed");
+            break 'wait;
+        };
         if let Err(error) = discover_memory_map(
             *fdt,
             PhysAddr::new(fdt.data().as_ptr() as usize as u64),
             tvisor_image,
-            &mut memory_map_guard,
+            memory_map,
         ) {
             println!("Platform discovery failed: {}", error);
             break 'wait;
         }
-        if let Err(error) = memory_map_guard.insert_reserved(linux_image_pages) {
+        if let Err(error) = memory_map.insert_reserved(linux_image_pages) {
             println!("Cannot reserve Linux Image source: {}", error);
             break 'wait;
         }
-        if let Err(error) = memory_map_guard.finalize() {
+        if let Err(error) = memory_map.finalize() {
             println!("Cannot finalize Linux Image source reservation: {}", error);
             break 'wait;
         }
 
-        let memory_map: &MemoryMap = &memory_map_guard;
+        let memory_map: &MemoryMap = memory_map;
         let Some(startup) = crate::smp::startup_contract() else {
             println!("No validated CPU startup-memory description");
             break 'wait;

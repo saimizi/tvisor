@@ -250,4 +250,44 @@ mod tests {
         }
         assert_eq!(heap.stats().unwrap().live_allocations, 0);
     }
+    #[test]
+    fn concurrent_heap_clients_keep_live_allocations_disjoint() {
+        let heap = TvisorHeap::empty();
+        let memory = arena();
+        // SAFETY: exclusive leaked arena, retained for all scoped threads.
+        unsafe {
+            heap.initialize(memory.0.as_mut_ptr() as usize, memory.0.len())
+                .unwrap();
+        }
+        let initial = heap.stats().unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let heap = &heap;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let layout = Layout::from_size_align(1024, 64).unwrap();
+                    for _ in 0..100 {
+                        // SAFETY: obey the allocation's size and lifetime, free exactly once.
+                        unsafe {
+                            let pointer = heap.alloc(layout);
+                            assert!(!pointer.is_null());
+                            core::ptr::write_bytes(pointer, worker + 1, layout.size());
+                            barrier.wait();
+                            let intact = core::slice::from_raw_parts(pointer, layout.size())
+                                .iter()
+                                .all(|byte| *byte == worker + 1);
+                            barrier.wait();
+                            heap.dealloc(pointer, layout);
+                            assert!(intact);
+                        }
+                    }
+                });
+            }
+        });
+        let final_stats = heap.stats().unwrap();
+        assert_eq!(final_stats.live_allocations, 0);
+        assert_eq!(final_stats.used_bytes, initial.used_bytes);
+        assert_eq!(final_stats.free_bytes, initial.free_bytes);
+    }
 }

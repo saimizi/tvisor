@@ -231,6 +231,12 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
 
 #[panic_handler]
 pub fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
+    pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 1,
+        syndrome: 0,
+        pc: 0,
+        address: 0,
+    });
+    let _ = tvisor_util::debug_util::emergency_print(format_args!("PANIC: {}\n", info));
     halt()
 }

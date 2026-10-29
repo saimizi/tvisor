@@ -231,3 +231,20 @@ pub fn report_prepared() {
         }
     }
 }
+
+// One record per logical CPU plus one for faults before TPIDR installation.
+static FATAL: tvisor_util::failure::FatalState<{ MAX_CPUS + 1 }> =
+    tvisor_util::failure::FatalState::new();
+
+pub fn record_fatal(failure: tvisor_util::failure::Failure) {
+    let pointer: usize;
+    unsafe {
+        asm!("mrs {}, tpidr_el2", out(reg) pointer, options(nomem, nostack, preserves_flags));
+    }
+    // Compare addresses only: inherited TPIDR may be unset or arbitrary.
+    let cpu = CPUS
+        .iter()
+        .position(|slot| slot.context.get() as usize == pointer)
+        .unwrap_or(MAX_CPUS);
+    FATAL.record(cpu, failure);
+}

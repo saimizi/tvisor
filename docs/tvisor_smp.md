@@ -535,7 +535,7 @@ allocation/IPI bursts during a separate guest run to test actual concurrency.
 Keep guest DT CPU count one throughout. Preserve artifacts and power off the
 board after tests. Do not combine first secondary release and first guest SMP.
 
-## Implementation checkpoint after 11.1
+## Implementation checkpoint after 11.2
 
 11.0 provides DT-described CPU/startup discovery, release-cell validation and
 protection of advertised firmware reservations. Firmware binary matching is not
@@ -544,7 +544,11 @@ metadata, a static boot stack, dynamically allocated guarded secondary stacks, a
 explicit guest-entry/return checks.
 Its complete single-vCPU quick regression passed; see the linked 11.1 report.
 
-Next implement 11.2 synchronization before secondary release in 11.3. Actual
+11.2 adds IRQ-save physical allocator/table locks, serialized console TX, typed
+nonallocating guest-exit errors and bounded fatal diagnostics with atomic
+failure records. See [the 11.2 status report](phase11_2_status.md) for validation
+and ownership rules. Its 120 host tests and complete single-vCPU quick
+regression passed. Secondary release remains 11.3. Actual
 secondary EL2/MMU/cache/coherency state, release maintenance/publication,
 management-SGI ownership and cross-core cache/TLB behavior remain later gates.
 Workers still wait in firmware; their prepared metadata is not evidence of
