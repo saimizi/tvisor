@@ -19,12 +19,13 @@ client callbacks, allocation, logging or hardware polling is allowed inside.
 Mapping diagnostics are emitted after releasing the table lock. Initial mapping
 publication remains boot-only; this lock does not implement TLB shootdowns.
 
-Boot memory-map scratch storage is claimed exactly once using an atomic flag.
-Only the successful claimant receives a mutable reference; it is never exposed
-to workers or interrupt handlers. This avoids keeping a boot-map mutex held
-while using other resources. Topology and startup contracts remain `Once`
-publications, per-CPU context remains owner-only, and VM/vCPU/device-emulation
-objects remain exclusively boot-CPU-owned.
+The boot CPU initializes the memory map in static storage and publishes it
+only after finalization and reservation validation. Readers acquire an immutable
+reference without locking; failed initialization is not published. The boot-only
+initializer must be called once, and secondaries must establish coherent shared
+memory before accessing the published map. Topology and startup contracts remain
+`Once` publications, per-CPU context remains owner-only, and VM/vCPU/device
+emulation objects remain exclusively boot-CPU-owned.
 
 The existing heap mutex is retained for thread-side allocation, initialization
 and statistics. Heap initialization precedes any future worker release. EL2 IRQ

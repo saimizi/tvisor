@@ -28,6 +28,7 @@ pub mod page;
 pub mod page_allocator;
 pub mod pcpu;
 pub mod platform;
+pub mod publish;
 pub mod sync;
 pub mod system_info;
 pub mod virtual_timer;
