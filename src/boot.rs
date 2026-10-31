@@ -50,7 +50,7 @@ unsafe extern "C" {
 }
 
 global_asm!(
-    r#"
+    concat!(r#"
     .section .text.takeover, "ax"
     .global __enter_private_el2
     .type __enter_private_el2, %function
@@ -70,12 +70,20 @@ __enter_private_el2:
     add  x9, x9, :lo12:__el2_vectors
     msr  vbar_el2, x9
     isb
+"#, include_str!("host_el2_controls.S"), r#"
     bl   private_el2_main
 1:
     wfe
     b    1b
     .size __enter_private_el2, . - __enter_private_el2
-"#,
+"#),
+    host_hcr = const tvisor_util::el2_policy::HOST_HCR,
+    host_cptr = const tvisor_util::el2_policy::HOST_CPTR,
+    host_hstr = const tvisor_util::el2_policy::HOST_HSTR,
+    host_vttbr = const tvisor_util::el2_policy::HOST_VTTBR,
+    host_cntvoff = const tvisor_util::el2_policy::HOST_CNTVOFF,
+    host_cnthctl = const tvisor_util::el2_policy::HOST_CNTHCTL,
+    host_timer = const tvisor_util::el2_policy::DISABLED_TIMER_CTL,
 );
 
 pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -> ! {
@@ -84,25 +92,19 @@ pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -
         stop()
     }
 
-    let tcr_el2 = TCR_EL2_RES1
-        | TCR_EL2_T0SZ_FOR_VA_39_BIT
-        | TCR_EL2_IRGN0_MEM_WB_RA_WA
-        | TCR_EL2_ORGN0_MEM_WB_RA_WA
-        | TCR_EL2_SH0_INNER_SHAREABLE
-        | ((el2_stage1_page_table.pa_range as u64) << 16);
-
-    const SCTLR_EL2_RES1: u64 =
-        (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
-    const SCTLR_EL2_VALUE: u64 =
-        SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
+    let policy = tvisor_util::el2_policy::HostTranslation::new(
+        el2_stage1_page_table.root_pa,
+        el2_stage1_page_table.pa_range,
+    )
+    .expect("validated host EL2 translation policy");
 
     let (pcpu, stack_top) = crate::pcpu::boot_entry();
     unsafe {
         __enter_private_el2(
-            MAIR_EL2_VALUE,
-            tcr_el2,
-            el2_stage1_page_table.root_pa,
-            SCTLR_EL2_VALUE,
+            policy.mair(),
+            policy.tcr(),
+            policy.root(),
+            policy.sctlr(),
             pcpu,
             stack_top,
         )
@@ -345,7 +347,35 @@ extern "C" fn post_switch_page_tables(
         );
         println!("{}", current_heap_state);
 
-        match crate::guest::run_guest() {
+        let policy = match tvisor_util::el2_policy::HostTranslation::new(
+            expected_ttbr0,
+            ((expected_tcr >> 16) & 7) as u8,
+        ) {
+            Ok(policy)
+                if policy.mair() == expected_mair
+                    && policy.tcr() == expected_tcr
+                    && policy.sctlr() == expected_sctlr =>
+            {
+                policy
+            }
+            _ => {
+                println!("Phase 11.3 host policy mismatch; stopping boot");
+                break 'wait;
+            }
+        };
+        let permit = match crate::secondary::start_one(*fdt, policy) {
+            Ok(permit) => permit,
+            Err(error) => {
+                println!(
+                    "Phase 11.3 startup failed: {}; terminal={:?}; resources retained until reset",
+                    error,
+                    crate::secondary::boot_status()
+                );
+                break 'wait;
+            }
+        };
+        println!("Phase 11.3 validated secondary parked; entering one-vCPU Linux guest");
+        match permit.run(crate::guest::run_guest) {
             Ok(()) => println!("Linux guest exited cleanly; halting"),
             Err(error) => println!("Linux guest execution failed: {}", error),
         }

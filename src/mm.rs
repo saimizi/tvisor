@@ -20,8 +20,9 @@ use tvisor_util::*;
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = (MAX_TABLE_PAGES * PAGE_SIZE) as u64;
 
-static TVISOR_TABLES: IrqSpinLock<Option<TableSet<'static, MAX_TABLE_PAGES>>> =
-    IrqSpinLock::new(None);
+static TVISOR_TABLES: IrqSpinLock<
+    Option<tvisor_util::startup_resources::BootTables<TableSet<'static, MAX_TABLE_PAGES>>>,
+> = IrqSpinLock::new(None);
 
 struct GlobalPageAllocator {
     lock: IrqSpinLock<()>,
@@ -247,7 +248,7 @@ pub fn setup_el2_stage1_page_table(
         MAX_TABLE_PAGES
     );
     let root_pa = tables.root_pa();
-    *TVISOR_TABLES.lock() = Some(tables);
+    *TVISOR_TABLES.lock() = Some(tvisor_util::startup_resources::BootTables::new(tables));
 
     Ok(El2Stage1PageTable { root_pa, pa_range })
 }
@@ -393,6 +394,59 @@ pub fn map_usable_ram(
     Ok(())
 }
 
+/// Map a validated firmware release cell while the boot CPU is the only
+/// tvisor CPU. The reserved page remains unavailable to the page allocator.
+/// This must not be called after a secondary is released: cross-CPU TLB
+/// shootdown belongs to a later milestone.
+pub fn map_firmware_release_cell(address: PhysAddr) -> Result<(), PrepareError> {
+    let contract = crate::smp::startup_contract().ok_or(PrepareError::Validation)?;
+    if !contract
+        .release_cells()
+        .iter()
+        .any(|cell| cell.start() == address)
+    {
+        return Err(PrepareError::Validation);
+    }
+    let memory_map = crate::boot::memory_map().ok_or(PrepareError::Validation)?;
+    let page = tvisor_util::startup_resources::release_page(memory_map, address.value())
+        .map_err(|_| PrepareError::Validation)?;
+    let start = page.start().value();
+    let end = page.end().value();
+    with_tables(|tables| {
+        match tables.walk(start)? {
+            None => map_identity(tables, start, end, true, false)?,
+            Some(mapping)
+                if mapping.pa == start
+                    && mapping.memory_type == MemoryType::Normal
+                    && mapping.writable
+                    && !mapping.executable => {}
+            Some(_) => return Err(PrepareError::Validation),
+        }
+        let mapping = tables
+            .walk(address.value())?
+            .ok_or(PrepareError::Validation)?;
+        if mapping.pa != address.value()
+            || mapping.memory_type != MemoryType::Normal
+            || !mapping.writable
+            || mapping.executable
+        {
+            return Err(PrepareError::Validation);
+        }
+        Ok(())
+    })?;
+    // Publish the newly installed descriptor before using it on the boot CPU.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi alle2",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(())
+}
+
 /// Allocate the lowest-addressed unused managed 4 KiB physical page.
 ///
 /// The returned page is changed to `InUse`. Reserved RAM, MMIO, unpopulated
@@ -453,7 +507,19 @@ fn with_tables<T>(
 ) -> Result<T, PrepareError> {
     let mut guard = TVISOR_TABLES.lock();
     let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
-    operation(tables)
+    operation(tables.edit().map_err(|_| PrepareError::Validation)?)
+}
+
+/// Validate and seal under the same lock; later writer requests are rejected.
+pub fn validate_and_freeze_startup(
+    resources: &tvisor_util::startup_resources::StartupResources,
+    stacks: &FixedList<tvisor_util::pcpu::StackLayout, { tvisor_util::cpu_topology::MAX_CPUS }>,
+) -> Result<tvisor_util::startup_resources::FrozenStartup, PrepareError> {
+    let mut guard = TVISOR_TABLES.lock();
+    let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
+    tables
+        .freeze_startup(*resources, stacks.into_iter().copied())
+        .map_err(|_| PrepareError::Validation)
 }
 
 fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {

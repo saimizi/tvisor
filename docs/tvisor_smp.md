@@ -1,8 +1,10 @@
 # Phase 11: tvisor physical SMP design
 
-Status: approved design, 2026-10-25. Phases 11.0 and 11.1 are implemented;
-11.1 passed the single-vCPU quick regression. No secondary CPU has been released by tvisor;
-later milestones remain implementation contracts.
+Status: approved design, 2026-10-25; implementation checkpoint updated 2026-10-31.
+Phases 11.0–11.3 are implemented. Phase 11.3 has passed one-secondary arrival,
+bounded failure and the full quick regression; its implementation is ready for
+user review. See the [11.3 completion handoff](phase11_3_status.md).
+Phases 11.4–11.6 remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in
 [Phase 11.0 status](phase11_0_status.md) and the
@@ -316,6 +318,11 @@ safe in an interrupt context.
 
 ## 11.3: Secondary entry and tvisor-owned holding loops
 
+See [the detailed Phase 11.3 design](phase11_3_design.md) for the startup
+contract, ownership, release sequence, failure handling and acceptance gates.
+The [completion report](phase11_3_status.md) records the implemented state,
+physical acceptance and review bundle.
+
 The secondary assembly entry must:
 
 1. Mask DAIF, read CurrentEL and MPIDR, and locate a bounded immutable record
@@ -535,7 +542,10 @@ allocation/IPI bursts during a separate guest run to test actual concurrency.
 Keep guest DT CPU count one throughout. Preserve artifacts and power off the
 board after tests. Do not combine first secondary release and first guest SMP.
 
-## Implementation checkpoint after 11.2
+## Historical implementation checkpoint after 11.2
+
+This section preserves the pre-release checkpoint. Current Phase 11.3 results
+are in the [completion report](phase11_3_status.md).
 
 11.0 provides DT-described CPU/startup discovery, release-cell validation and
 protection of advertised firmware reservations. Firmware binary matching is not

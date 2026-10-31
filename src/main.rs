@@ -21,6 +21,7 @@ mod guest;
 mod heap;
 mod mm;
 mod pcpu;
+mod secondary;
 mod smp;
 mod vcpu;
 mod vmctl;

@@ -6,7 +6,7 @@ use crate::{
     page_allocator::{AllocatorError, PageAllocator},
     system_info::{FixedList, PhysAddr},
 };
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const STACK_SIZE: u64 = 64 * 1024;
 pub const GUARD_SIZE: u64 = PAGE_SIZE as u64;
@@ -135,6 +135,18 @@ pub struct PcpuContext<V> {
     pub present: u64,
 }
 impl<V> PcpuContext<V> {
+    /// Owner-CPU validation only: never borrow another CPU's mutable context.
+    pub fn matches_secondary(&self, id: u64, affinity: u64, bottom: u64, top: u64) -> bool {
+        id > 0
+            && id < MAX_CPUS as u64
+            && self.present == 1
+            && self.logical_id == id
+            && self.affinity == affinity
+            && self.stack_bottom == bottom
+            && self.stack_top == top
+            && self.host_sp == 0
+            && self.active_vcpu.is_null()
+    }
     pub const fn empty() -> Self {
         Self {
             host_sp: 0,
@@ -152,54 +164,24 @@ const _: () = assert!(core::mem::align_of::<PcpuContext<()>>() == 64);
 const _: () = assert!(core::mem::offset_of!(PcpuContext<()>, host_sp) == 0);
 const _: () = assert!(core::mem::offset_of!(PcpuContext<()>, active_vcpu) == 8);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CpuLifecycle {
-    Discovered,
-    Prepared,
-    ReleaseRequested,
-    Entered,
-    Online,
-    Parked,
-    Failed,
+/// One-time resource preparation publication, not a CPU release protocol.
+/// All release generations and acknowledgements live in SecondaryRecord.
+pub struct CpuPreparation {
+    prepared: AtomicBool,
 }
-
-/// Cross-CPU protocol storage, separate from owner-only mutable CPU context.
-/// 11.1 publishes Prepared only; requests/releases/acknowledgements are not yet
-/// implemented. A later protocol must validate generation before accepting ack.
-pub struct CpuStartupState {
-    lifecycle: AtomicU8,
-    pub generation: AtomicU64,
-    pub request: AtomicU64,
-    pub acknowledgement: AtomicU64,
-}
-impl CpuStartupState {
+impl CpuPreparation {
     pub const fn new() -> Self {
         Self {
-            lifecycle: AtomicU8::new(CpuLifecycle::Discovered as u8),
-            generation: AtomicU64::new(1),
-            request: AtomicU64::new(0),
-            acknowledgement: AtomicU64::new(0),
+            prepared: AtomicBool::new(false),
         }
     }
-    /// The boot CPU must finish initializing immutable metadata before this.
-    pub fn publish_prepared(&self) -> Result<(), u8> {
-        self.lifecycle
-            .compare_exchange(
-                CpuLifecycle::Discovered as u8,
-                CpuLifecycle::Prepared as u8,
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
+    pub fn publish_prepared(&self) -> Result<(), bool> {
+        self.prepared
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
             .map(|_| ())
     }
     pub fn is_prepared(&self) -> bool {
-        self.lifecycle.load(Ordering::Acquire) == CpuLifecycle::Prepared as u8
-    }
-    pub fn mailbox_idle(&self) -> bool {
-        self.generation.load(Ordering::Acquire) == 1
-            && self.request.load(Ordering::Acquire) == 0
-            && self.acknowledgement.load(Ordering::Acquire) == 0
+        self.prepared.load(Ordering::Acquire)
     }
 }
 
@@ -207,6 +189,32 @@ impl CpuStartupState {
 mod tests {
     use super::*;
     use crate::el2_stage1_translation::TableStorage;
+    #[test]
+    fn secondary_context_validation_rejects_identity_and_guest_ownership_mismatches() {
+        for fault in 0..9 {
+            let mut c = PcpuContext::<()>::empty();
+            c.present = 1;
+            c.logical_id = 1;
+            c.affinity = 0x100;
+            c.stack_bottom = 0x800000;
+            c.stack_top = 0x810000;
+            match fault {
+                1 => c.present = 0,
+                2 => c.logical_id = 0,
+                3 => c.affinity = 1,
+                4 => c.stack_bottom += 4096,
+                5 => c.stack_top += 4096,
+                6 => c.host_sp = 0x80ff00,
+                7 => c.active_vcpu = core::ptr::dangling_mut(),
+                8 => c.logical_id = MAX_CPUS as u64,
+                _ => {}
+            }
+            assert_eq!(
+                c.matches_secondary(1, 0x100, 0x800000, 0x810000),
+                fault == 0
+            );
+        }
+    }
     #[test]
     fn guarded_stack_layout_checks_alignment_and_overflow() {
         for base in [0, 0x4100000, 0x8000000] {
@@ -255,16 +263,11 @@ mod tests {
         let context = PcpuContext::<()>::empty();
         assert!(context.active_vcpu.is_null());
         assert_eq!(context.host_sp, 0);
-        let state = CpuStartupState::new();
+        let state = CpuPreparation::new();
         assert!(!state.is_prepared());
-        assert!(state.mailbox_idle());
         state.publish_prepared().unwrap();
         assert!(state.is_prepared());
         assert!(state.publish_prepared().is_err());
-        assert_eq!(
-            state.lifecycle.load(Ordering::Acquire),
-            CpuLifecycle::Prepared as u8
-        );
     }
     fn topology(enabled: &[bool]) -> CpuTopology {
         use dtoolkit::{

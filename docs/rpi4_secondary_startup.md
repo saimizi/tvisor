@@ -40,7 +40,11 @@ node does not trigger speculative SMC/HVC instructions, `PSCI_VERSION` probes,
 or an automatic backend fallback. An EL2-callable PSCI adapter and entry-state
 contract must be established before a future PSCI activation path is enabled.
 
-## Secondary entry and release remain later milestones
+## Phase 11.0 boundary and Phase 11.3 release
+
+Phase 11.3 now implements and validates one-secondary release on lab-rpi4; see
+the [completion handoff](phase11_3_status.md). The Phase 11.0 boundary and
+normative entry/publication requirements below remain applicable.
 
 Phase 11.0 does not release a CPU or infer its live registers from firmware code.
 In 11.3 the assembly entry must validate CurrentEL, MPIDR and the documented
@@ -81,3 +85,9 @@ validation evidence is in `docs/evidence/pr28_spin_table_interface/`.
 Issue [#29](https://github.com/saimizi/tvisor/issues/29) remains deferred. Allocator
 reservation checks do not replace a general protection policy for explicit
 guest stage-2 mappings; current guest mappings exclude the firmware low page.
+
+## Phase 11.3 entry contract
+
+The [lab-rpi4 backend contract](phase11_3_backend_contract.md) records the
+supported firmware/CPU profile, source evidence, coherency reasoning, permitted
+implementation-defined read, runtime prerequisites and pending hardware checks.

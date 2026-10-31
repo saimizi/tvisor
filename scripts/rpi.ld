@@ -11,6 +11,8 @@ SECTIONS {
 
     .text : ALIGN(__ALIGN_SIZE) {
         __text_start = .;
+        KEEP(*(.text.secondary))
+        KEEP(*(.text.secondary_publication))
         *(.text .text.*)
         . = ALIGN(__ALIGN_SIZE);
         __text_end = .;

@@ -2,3 +2,4 @@
 .aider*
 /.codex/config.toml
 /docs/evidence/
+__pycache__/

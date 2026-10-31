@@ -155,6 +155,7 @@ test; there is no return path to the U-Boot prompt.
 
 - [Development plan](docs/development_plan.md)
 - [Phase 11 physical SMP design](docs/tvisor_smp.md)
+- [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)
