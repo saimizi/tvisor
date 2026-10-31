@@ -285,38 +285,6 @@ impl Vcpu {
     }
 }
 
-/// EL2 world-switch state owned by one physical CPU.
-///
-/// `active_vcpu` is non-null only while this pCPU is executing a guest.  The
-/// vCPU itself remains owned by its `VmCtl`; this is merely the pCPU's active
-/// association.  It is represented as a raw pointer because exception-entry
-/// assembly must access it without Rust references.
-#[repr(C, align(16))]
-pub struct PcpuState {
-    host_sp: u64,
-    active_vcpu: *mut Vcpu,
-}
-
-const _: () = assert!(core::mem::size_of::<PcpuState>() == 16);
-const _: () = assert!(core::mem::offset_of!(PcpuState, host_sp) == 0);
-const _: () = assert!(core::mem::offset_of!(PcpuState, active_vcpu) == 8);
-
-impl PcpuState {
-    pub const fn new() -> Self {
-        Self {
-            host_sp: 0,
-            active_vcpu: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// The sole pCPU state until SMP support is introduced.
-///
-/// Assembly accesses this symbol directly.  Only the world-switch path
-/// mutates it, while interrupts are disabled for guest execution.
-#[unsafe(no_mangle)]
-static mut __pcpu_state: PcpuState = PcpuState::new();
-
 global_asm!(
     r#"
     .section .text.vcpu, "ax"
@@ -357,14 +325,12 @@ __vcpu_run:
     str  x9, [sp, #520]
 
     // Save host stack pointer
-    adrp x9, __pcpu_state
-    add  x9, x9, :lo12:__pcpu_state
+    mrs  x9, tpidr_el2
     mov  x10, sp
     str  x10, [x9]
 
     // Associate this pCPU with the VM-owned vCPU.
-    adrp x9, __pcpu_state
-    add  x9, x9, :lo12:__pcpu_state
+    mrs  x9, tpidr_el2
     str  x0, [x9, #8]
 
     // Load guest EL1 system registers
@@ -475,8 +441,7 @@ __vcpu_irq_handler:
 __vcpu_exit_common:
 
     // Load the active VM-owned vCPU. Its VcpuContext is at offset zero.
-    adrp x0, __pcpu_state
-    add  x0, x0, :lo12:__pcpu_state
+    mrs  x0, tpidr_el2
     ldr  x0, [x0, #8]
     cbz  x0, .Lfatal_no_context
 
@@ -576,8 +541,7 @@ __vcpu_exit_common:
     str  x2, [x1, #24]
 
     // Restore host stack pointer
-    adrp x9, __pcpu_state
-    add  x9, x9, :lo12:__pcpu_state
+    mrs  x9, tpidr_el2
     ldr  x10, [x9]
     str  xzr, [x9, #8]          // no vCPU is active after this exit
     mov  sp, x10

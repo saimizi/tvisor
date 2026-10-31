@@ -1,4 +1,4 @@
-//! Phase 6 EL2 exception entry and reporting.
+//! EL2 exception entry and reporting.
 //!
 //! AArch64 defines an exception vector table as sixteen fixed 128-byte slots.
 //! The CPU selects one slot from the exception type (synchronous, IRQ, FIQ, or
@@ -10,7 +10,7 @@
 //! temporary, records the slot number, and branches to one shared assembly
 //! handler.  The shared handler saves the remaining general-purpose and EL2
 //! exception registers and passes the completed frame to the Rust reporter.
-//! Phase 6 resumes only from its deliberate `BRK #0x600` test.  The reporter
+//! The handler resumes only from the deliberate `BRK #0x600` test. The reporter
 //! advances `ELR_EL2` past that instruction, after which assembly restores the
 //! saved state and executes `eret`; every unexpected exception remains fatal.
 
@@ -19,7 +19,7 @@ use core::arch::{asm, global_asm};
 use tvisor_util::println;
 
 #[repr(C, align(16))]
-/// Complete processor state captured by the Phase 6 EL2 exception entry.
+/// Complete processor state captured by the EL2 exception entry.
 ///
 /// The field order and offsets are an ABI shared with the assembly handler
 /// below, so changes must be reflected in its load/store offsets.
@@ -123,7 +123,7 @@ __el2_exception_common:
     mrs x9, far_el2
     str x9, [sp, #280]
     mov x0, sp
-    bl phase6_exception_handler
+    bl el2_exception_handler
     cbz x0, 1f
 
     // Restore the possibly updated exception-return state before restoring
@@ -162,29 +162,38 @@ const ESR_EC_SHIFT: u32 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
 const ESR_EC_BRK_AARCH64: u64 = 0x3c;
 const ESR_BRK_COMMENT_MASK: u64 = 0xffff;
-const PHASE6_BRK_COMMENT: u64 = 0x600;
+const TEST_BREAKPOINT_IMMEDIATE: u64 = 0x600;
 
 #[unsafe(no_mangle)]
-extern "C" fn phase6_exception_handler(frame: &mut ExceptionFrame) -> u64 {
-    println!("Phase 6 EL2 exception");
-    println!(" vector={}", frame.vector);
-    println!(" ESR_EL2={:#018x}", frame.esr_el2);
-    println!(" ELR_EL2={:#018x}", frame.elr_el2);
-    println!("SPSR_EL2={:#018x}", frame.spsr_el2);
-    println!(" FAR_EL2={:#018x}", frame.far_el2);
-
+extern "C" fn el2_exception_handler(frame: &mut ExceptionFrame) -> u64 {
     let exception_class = (frame.esr_el2 >> ESR_EC_SHIFT) & ESR_EC_MASK;
     let brk_comment = frame.esr_el2 & ESR_BRK_COMMENT_MASK;
     if frame.vector == CURRENT_EL_SPX_SYNC_VECTOR
         && exception_class == ESR_EC_BRK_AARCH64
-        && brk_comment == PHASE6_BRK_COMMENT
+        && brk_comment == TEST_BREAKPOINT_IMMEDIATE
     {
+        println!("EL2 test breakpoint exception");
+        println!(" vector={}", frame.vector);
+        println!(" ESR_EL2={:#018x}", frame.esr_el2);
+        println!(" ELR_EL2={:#018x}", frame.elr_el2);
+        println!("SPSR_EL2={:#018x}", frame.spsr_el2);
+        println!(" FAR_EL2={:#018x}", frame.far_el2);
+
         frame.elr_el2 = frame.elr_el2.wrapping_add(4);
         println!("Returning after deliberate synchronous exception");
         return 1;
     }
 
-    println!("Unexpected exception; halting");
+    crate::pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 2,
+        syndrome: frame.esr_el2,
+        pc: frame.elr_el2,
+        address: frame.far_el2,
+    });
+    let _ = tvisor_util::debug_util::emergency_print(format_args!(
+        "Unexpected exception; halting vector={} ESR_EL2={:#x} ELR_EL2={:#x} FAR_EL2={:#x}\n",
+        frame.vector, frame.esr_el2, frame.elr_el2, frame.far_el2,
+    ));
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }

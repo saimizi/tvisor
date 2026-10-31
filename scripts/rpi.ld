@@ -11,6 +11,8 @@ SECTIONS {
 
     .text : ALIGN(__ALIGN_SIZE) {
         __text_start = .;
+        KEEP(*(.text.secondary))
+        KEEP(*(.text.secondary_publication))
         *(.text .text.*)
         . = ALIGN(__ALIGN_SIZE);
         __text_end = .;
@@ -53,18 +55,10 @@ SECTIONS {
         __writable_end = .;
     }
 
-    /*
-     * Reserve one page below the downward-growing boot stack for stack-
-     * overflow detection.  It becomes an effective guard page when Phase 7
-     * installs tvisor's page tables and leaves this region unmapped.
-     */
-    .boot_stack_guard (NOLOAD) : ALIGN(__ALIGN_SIZE) {
+    /* Only the boot CPU needs a stack before physical allocation is available. */
+    .boot_stack (NOLOAD) : ALIGN(__ALIGN_SIZE) {
         __boot_stack_guard_start = .;
         . += 0x1000;
-        __boot_stack_guard_end = .;
-    }
-
-    .boot_stack (NOLOAD) : ALIGN(__ALIGN_SIZE) {
         __boot_stack_bottom = .;
         . += 0x10000;
         __boot_stack_top = .;
@@ -85,6 +79,12 @@ SECTIONS {
     . = ALIGN(__ALIGN_SIZE);
     __image_end = .;
 
+    ASSERT((__boot_stack_guard_start & 0xfff) == 0,
+           "boot stack guard must be page aligned")
+    ASSERT((__boot_stack_top - __boot_stack_guard_start) == 0x11000,
+           "boot stack and guard must occupy 68 KiB")
+    ASSERT(__boot_stack_top <= __el2_stage1_tables_start,
+           "boot stack overlaps the table arena")
     ASSERT((__el2_stage1_tables_start & 0xfff) == 0,
            "EL2 stage-1 table arena must be 4 KiB aligned")
     ASSERT((__el2_stage1_tables_end & 0xfff) == 0,

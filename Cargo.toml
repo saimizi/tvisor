@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["baremetal"]
 baremetal = []
+# Hardware acceptance only: force a late secondary acknowledgement after timeout.
+# Deliberately prevents guest boot; never enable in normal/regression images.
+secondary-startup-timeout-test = ["baremetal"]
 
 [lib]
 name = "tvisor_util"

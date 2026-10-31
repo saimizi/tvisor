@@ -20,6 +20,9 @@ mod exception;
 mod guest;
 mod heap;
 mod mm;
+mod pcpu;
+mod secondary;
+mod smp;
 mod vcpu;
 mod vmctl;
 
@@ -29,6 +32,8 @@ global_asm!(
     .global main
     .type main, %function
 main:
+    msr daifset, #0xf
+    isb
     // U-Boot's `go` command jumps into the bytes loaded by TFTP and does not
     // process the ELF NOBITS segment. Initialize Rust's zero-initialized
     // statics before entering any Rust code.
@@ -123,6 +128,12 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
     };
 
     if status_check().is_err() {
+        halt();
+    }
+
+    // Validate DT startup memory ownership before allocator takeover.
+    if let Err(error) = smp::discover(*fdt) {
+        println!("Physical CPU startup discovery failed: {}", error);
         halt();
     }
 
@@ -221,6 +232,12 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
 
 #[panic_handler]
 pub fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
+    pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 1,
+        syndrome: 0,
+        pc: 0,
+        address: 0,
+    });
+    let _ = tvisor_util::debug_util::emergency_print(format_args!("PANIC: {}\n", info));
     halt()
 }

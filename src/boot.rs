@@ -4,7 +4,6 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use spin::Mutex;
 use tvisor_util::debug_util::stop;
 use tvisor_util::fdt::fdt;
 use tvisor_util::memory_map::MemoryMap;
@@ -21,12 +20,25 @@ use crate::{
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
-// Boot-time memory discovery writes directly into this tvisor-owned `.bss`
-// object so the private EL2 stack holds only a mutex guard and references.
-static MEMORY_MAP: Mutex<MemoryMap> = Mutex::new(MemoryMap::empty());
+// The boot CPU initializes the large map in static storage, then publishes it
+// as immutable before any secondary CPU can enter tvisor.
+static MEMORY_MAP: tvisor_util::publish::BootPublished<MemoryMap> =
+    tvisor_util::publish::BootPublished::new(MemoryMap::empty());
+
+/// The finalized map, available after boot publication and coherent startup.
+pub fn memory_map() -> Option<&'static MemoryMap> {
+    MEMORY_MAP.get()
+}
 
 unsafe extern "C" {
-    fn __enter_private_el2(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> !;
+    fn __enter_private_el2(
+        mair_el2: u64,
+        tcr_el2: u64,
+        ttbr0_el2: u64,
+        sctlr_el2: u64,
+        pcpu: *mut tvisor_util::pcpu::PcpuContext<crate::vcpu::Vcpu>,
+        stack_top: u64,
+    ) -> !;
     fn __switch_el2_stage1_page_tables(
         mair_el2: u64,
         tcr_el2: u64,
@@ -38,7 +50,7 @@ unsafe extern "C" {
 }
 
 global_asm!(
-    r#"
+    concat!(r#"
     .section .text.takeover, "ax"
     .global __enter_private_el2
     .type __enter_private_el2, %function
@@ -50,19 +62,28 @@ __enter_private_el2:
     isb
     msr  spsel, #1
     isb
-    adrp x9, __boot_stack_top
-    add  x9, x9, :lo12:__boot_stack_top
-    mov  sp, x9
+    // x4 = prepared boot CPU context, x5 = private stack top.
+    mov  sp, x5
+    msr  tpidr_el2, x4
+    isb
     adrp x9, __el2_vectors
     add  x9, x9, :lo12:__el2_vectors
     msr  vbar_el2, x9
     isb
+"#, include_str!("host_el2_controls.S"), r#"
     bl   private_el2_main
 1:
     wfe
     b    1b
     .size __enter_private_el2, . - __enter_private_el2
-"#,
+"#),
+    host_hcr = const tvisor_util::el2_policy::HOST_HCR,
+    host_cptr = const tvisor_util::el2_policy::HOST_CPTR,
+    host_hstr = const tvisor_util::el2_policy::HOST_HSTR,
+    host_vttbr = const tvisor_util::el2_policy::HOST_VTTBR,
+    host_cntvoff = const tvisor_util::el2_policy::HOST_CNTVOFF,
+    host_cnthctl = const tvisor_util::el2_policy::HOST_CNTHCTL,
+    host_timer = const tvisor_util::el2_policy::DISABLED_TIMER_CTL,
 );
 
 pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -> ! {
@@ -71,30 +92,28 @@ pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -
         stop()
     }
 
-    let tcr_el2 = TCR_EL2_RES1
-        | TCR_EL2_T0SZ_FOR_VA_39_BIT
-        | TCR_EL2_IRGN0_MEM_WB_RA_WA
-        | TCR_EL2_ORGN0_MEM_WB_RA_WA
-        | TCR_EL2_SH0_INNER_SHAREABLE
-        | ((el2_stage1_page_table.pa_range as u64) << 16);
+    let policy = tvisor_util::el2_policy::HostTranslation::new(
+        el2_stage1_page_table.root_pa,
+        el2_stage1_page_table.pa_range,
+    )
+    .expect("validated host EL2 translation policy");
 
-    const SCTLR_EL2_RES1: u64 =
-        (0b11 << 28) | (0b11 << 22) | (1 << 18) | (1 << 16) | (1 << 11) | (0b11 << 4);
-    const SCTLR_EL2_VALUE: u64 =
-        SCTLR_EL2_RES1 | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 19);
-
+    let (pcpu, stack_top) = crate::pcpu::boot_entry();
     unsafe {
         __enter_private_el2(
-            MAIR_EL2_VALUE,
-            tcr_el2,
-            el2_stage1_page_table.root_pa,
-            SCTLR_EL2_VALUE,
+            policy.mair(),
+            policy.tcr(),
+            policy.root(),
+            policy.sctlr(),
+            pcpu,
+            stack_top,
         )
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn private_el2_main(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> ! {
+    crate::pcpu::assert_boot_cpu_idle();
     println!("Phase 6 private EL2 foundations active");
     println!("    SP: {:#018x}", Sp::dump().value);
     if let Some(spsel) = SpSel::dump() {
@@ -192,6 +211,7 @@ extern "C" fn post_switch_page_tables(
 ) -> ! {
     'wait: {
         check_switched_environment(expected_mair, expected_tcr, expected_ttbr0, expected_sctlr);
+        crate::pcpu::report_prepared();
 
         // After EL2 stage1 is mapped, we recheck the console IRQ
         let Some(gicv2) = global() else { break 'wait };
@@ -232,31 +252,46 @@ extern "C" fn post_switch_page_tables(
             }
         };
 
-        let mut memory_map_guard = MEMORY_MAP.lock();
-        if let Err(error) = discover_memory_map(
-            *fdt,
-            PhysAddr::new(fdt.data().as_ptr() as usize as u64),
-            tvisor_image,
-            &mut memory_map_guard,
-        ) {
-            println!("Platform discovery failed: {}", error);
+        let Some(startup) = crate::smp::startup_contract() else {
+            println!("No validated CPU startup-memory description");
+            break 'wait;
+        };
+        // SAFETY: only the boot CPU reaches this path, once. Secondary CPUs
+        // remain in firmware until after coherent shared-memory startup.
+        let initialized = unsafe {
+            MEMORY_MAP.initialize(|memory_map| {
+                if let Err(error) = discover_memory_map(
+                    *fdt,
+                    PhysAddr::new(fdt.data().as_ptr() as usize as u64),
+                    tvisor_image,
+                    memory_map,
+                ) {
+                    println!("Platform discovery failed: {}", error);
+                    return Err(());
+                }
+                if let Err(error) = memory_map.insert_reserved(linux_image_pages) {
+                    println!("Cannot reserve Linux Image source: {}", error);
+                    return Err(());
+                }
+                if let Err(error) = memory_map.finalize() {
+                    println!("Cannot finalize Linux Image source reservation: {}", error);
+                    return Err(());
+                }
+                if let Err(error) = startup.verify_memory_map(*fdt, memory_map) {
+                    println!("Secondary holding-memory reservation failed: {:?}", error);
+                    return Err(());
+                }
+                Ok(())
+            })
+        };
+        if initialized.is_err() {
             break 'wait;
         }
-        if let Err(error) = memory_map_guard.insert_reserved(linux_image_pages) {
-            println!("Cannot reserve Linux Image source: {}", error);
-            break 'wait;
-        }
-        if let Err(error) = memory_map_guard.finalize() {
-            println!("Cannot finalize Linux Image source reservation: {}", error);
-            break 'wait;
-        }
-
-        let memory_map: &MemoryMap = &memory_map_guard;
-        if let Err(error) = mm::map_usable_ram(memory_map, live_dtb, linux_image_pages) {
-            println!("Failed to map usable RAM: {}", error);
-            break 'wait;
-        }
-
+        let memory_map = memory_map().expect("published boot memory map");
+        println!(
+            "Phase 11.0 DT firmware reservations verified before allocation; spin-table cells={}",
+            startup.release_cells().len()
+        );
         let initialized = match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
             Ok(initialized) => initialized,
             Err(error) => {
@@ -273,6 +308,15 @@ extern "C" fn post_switch_page_tables(
             initialized.stats.unused_pages,
             initialized.live_dtb,
         );
+
+        // Bitmap metadata lives in the already mapped tvisor image. Dynamic
+        // stack allocation touches only those bitmaps until RAM is mapped.
+        if let Err(error) =
+            crate::pcpu::prepare_secondary_cpus(memory_map, live_dtb, linux_image_pages)
+        {
+            println!("Secondary CPU preparation failed: {}", error);
+            break 'wait;
+        }
 
         // Initialize heap allocator
         let heap = match heap::initialize(None) {
@@ -303,7 +347,35 @@ extern "C" fn post_switch_page_tables(
         );
         println!("{}", current_heap_state);
 
-        match crate::guest::run_guest() {
+        let policy = match tvisor_util::el2_policy::HostTranslation::new(
+            expected_ttbr0,
+            ((expected_tcr >> 16) & 7) as u8,
+        ) {
+            Ok(policy)
+                if policy.mair() == expected_mair
+                    && policy.tcr() == expected_tcr
+                    && policy.sctlr() == expected_sctlr =>
+            {
+                policy
+            }
+            _ => {
+                println!("Phase 11.3 host policy mismatch; stopping boot");
+                break 'wait;
+            }
+        };
+        let permit = match crate::secondary::start_one(*fdt, policy) {
+            Ok(permit) => permit,
+            Err(error) => {
+                println!(
+                    "Phase 11.3 startup failed: {}; terminal={:?}; resources retained until reset",
+                    error,
+                    crate::secondary::boot_status()
+                );
+                break 'wait;
+            }
+        };
+        println!("Phase 11.3 validated secondary parked; entering one-vCPU Linux guest");
+        match permit.run(crate::guest::run_guest) {
             Ok(()) => println!("Linux guest exited cleanly; halting"),
             Err(error) => println!("Linux guest execution failed: {}", error),
         }

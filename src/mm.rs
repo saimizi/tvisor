@@ -4,7 +4,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use spin::Mutex;
 use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
 use tvisor_util::el2_stage1_translation::{
     Mapping, MemoryType, TableSet, TableStorage, TranslationError, pa_bits_from_pa_range,
@@ -14,29 +13,33 @@ use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
     AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap,
 };
+use tvisor_util::sync::IrqSpinLock;
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
 use tvisor_util::*;
 
 const MAX_TABLE_PAGES: usize = 16;
 const TABLE_ARENA_SIZE: u64 = (MAX_TABLE_PAGES * PAGE_SIZE) as u64;
 
-static TVISOR_TABLES: Mutex<Option<TableSet<'static, MAX_TABLE_PAGES>>> = Mutex::new(None);
+static TVISOR_TABLES: IrqSpinLock<
+    Option<tvisor_util::startup_resources::BootTables<TableSet<'static, MAX_TABLE_PAGES>>>,
+> = IrqSpinLock::new(None);
 
 struct GlobalPageAllocator {
+    lock: IrqSpinLock<()>,
     managed: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
     in_use: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
     ram_pages: AtomicUsize,
     initialized: AtomicBool,
 }
 
-// Phase 8 remains single-core with DAIF masked. This Sync implementation
-// permits static storage; every mutable bitmap access is serialized by that
-// execution policy and wrapped by the functions below.
+// SAFETY: the IRQ-save lock serializes every bitmap view, initialization and
+// statistics access. Mutable bitmap references never escape its guard.
 unsafe impl Sync for GlobalPageAllocator {}
 
 impl GlobalPageAllocator {
     const fn new() -> Self {
         Self {
+            lock: IrqSpinLock::new(()),
             managed: UnsafeCell::new(PageBitmap::zeroed()),
             in_use: UnsafeCell::new(PageBitmap::zeroed()),
             ram_pages: AtomicUsize::new(0),
@@ -57,10 +60,6 @@ unsafe extern "C" {
     static __rodata_end: u8;
     static __writable_start: u8;
     static __writable_end: u8;
-    static __boot_stack_guard_start: u8;
-    static __boot_stack_guard_end: u8;
-    static __boot_stack_bottom: u8;
-    static __boot_stack_top: u8;
     static __el2_stage1_tables_start: u8;
     static __el2_stage1_tables_end: u8;
 }
@@ -199,14 +198,8 @@ pub fn setup_el2_stage1_page_table(
         false,
     )?;
 
-    // .stack
-    map_identity(
-        &mut tables,
-        link_addr!(__boot_stack_bottom),
-        link_addr!(__boot_stack_top),
-        true,
-        false,
-    )?;
+    // Only the guarded static boot stack is needed before physical allocation.
+    tvisor_util::pcpu::map_stack(&mut tables, crate::pcpu::boot_stack())?;
 
     // .el2_stage1_tables
     map_identity(
@@ -249,8 +242,13 @@ pub fn setup_el2_stage1_page_table(
 
     validate_el2_stage1_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
+    println!(
+        "Phase 11.1 EL2 stack mapping validation: static boot guard validated; table pages={}/{}",
+        tables.used_pages(),
+        MAX_TABLE_PAGES
+    );
     let root_pa = tables.root_pa();
-    *TVISOR_TABLES.lock() = Some(tables);
+    *TVISOR_TABLES.lock() = Some(tvisor_util::startup_resources::BootTables::new(tables));
 
     Ok(El2Stage1PageTable { root_pa, pa_range })
 }
@@ -290,6 +288,7 @@ pub fn initialize_allocator_after_takeover(
     memory_map: &MemoryMap,
     live_dtb: PhysRegion,
 ) -> Result<AllocatorInitResult, AllocatorInitError> {
+    let _guard = PAGE_ALLOCATOR.lock.lock();
     if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
         return Err(AllocatorError::DoubleFree.into());
     }
@@ -299,8 +298,7 @@ pub fn initialize_allocator_after_takeover(
         PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
             .map_err(|_| AllocatorInitError::InvalidDtb)?;
 
-    // SAFETY: initialization runs once after takeover on the boot CPU before
-    // any allocator client or asynchronous exception can access this state.
+    // SAFETY: the allocator lock exclusively protects both bitmap views.
     let allocator = unsafe {
         PageAllocator::new(
             memory_map.ram(),
@@ -334,9 +332,24 @@ pub fn map_usable_ram(
     memory_map: &MemoryMap,
     live_dtb: PhysRegion,
     linux_image_pages: PhysRegion,
+    secondary_stacks: &FixedList<
+        tvisor_util::pcpu::SecondaryStack,
+        { tvisor_util::cpu_topology::MAX_CPUS },
+    >,
 ) -> Result<(), PrepareError> {
-    let mut exclusions = FixedList::<PhysRegion, 1>::new();
-
+    // One DTB exclusion plus at most MAX_CPUS-1 dynamic guards.
+    let mut exclusions = FixedList::<PhysRegion, { tvisor_util::cpu_topology::MAX_CPUS }>::new();
+    for stack in secondary_stacks {
+        exclusions
+            .push(
+                PhysRegion::new(
+                    PhysAddr::new(stack.layout.guard_start),
+                    tvisor_util::pcpu::GUARD_SIZE,
+                )
+                .map_err(|_| PrepareError::Validation)?,
+            )
+            .map_err(|_| PrepareError::Validation)?;
+    }
     let live_dtb_aligned =
         PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
             .map_err(|_| PrepareError::AddressOverflow)?;
@@ -345,7 +358,7 @@ pub fn map_usable_ram(
         .push(live_dtb_aligned)
         .map_err(|_| PrepareError::Validation)?;
 
-    with_tables(|tables| {
+    let used_pages = with_tables(|tables| {
         map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
         map_identity(
             tables,
@@ -354,8 +367,19 @@ pub fn map_usable_ram(
             false,
             false,
         )?;
-        Ok(())
+        tvisor_util::pcpu::validate_stack(tables, crate::pcpu::boot_stack())?;
+        for stack in secondary_stacks {
+            tvisor_util::pcpu::validate_stack(tables, stack.layout)?;
+        }
+        Ok(tables.used_pages())
     })?;
+
+    println!(
+        "Phase 11.1 final EL2 mappings: {} guards unmapped (one static boot); table pages={}/{}",
+        secondary_stacks.len() + 1,
+        used_pages,
+        MAX_TABLE_PAGES
+    );
 
     unsafe {
         core::arch::asm!(
@@ -370,12 +394,76 @@ pub fn map_usable_ram(
     Ok(())
 }
 
+/// Map a validated firmware release cell while the boot CPU is the only
+/// tvisor CPU. The reserved page remains unavailable to the page allocator.
+/// This must not be called after a secondary is released: cross-CPU TLB
+/// shootdown belongs to a later milestone.
+pub fn map_firmware_release_cell(address: PhysAddr) -> Result<(), PrepareError> {
+    let contract = crate::smp::startup_contract().ok_or(PrepareError::Validation)?;
+    if !contract
+        .release_cells()
+        .iter()
+        .any(|cell| cell.start() == address)
+    {
+        return Err(PrepareError::Validation);
+    }
+    let memory_map = crate::boot::memory_map().ok_or(PrepareError::Validation)?;
+    let page = tvisor_util::startup_resources::release_page(memory_map, address.value())
+        .map_err(|_| PrepareError::Validation)?;
+    let start = page.start().value();
+    let end = page.end().value();
+    with_tables(|tables| {
+        match tables.walk(start)? {
+            None => map_identity(tables, start, end, true, false)?,
+            Some(mapping)
+                if mapping.pa == start
+                    && mapping.memory_type == MemoryType::Normal
+                    && mapping.writable
+                    && !mapping.executable => {}
+            Some(_) => return Err(PrepareError::Validation),
+        }
+        let mapping = tables
+            .walk(address.value())?
+            .ok_or(PrepareError::Validation)?;
+        if mapping.pa != address.value()
+            || mapping.memory_type != MemoryType::Normal
+            || !mapping.writable
+            || mapping.executable
+        {
+            return Err(PrepareError::Validation);
+        }
+        Ok(())
+    })?;
+    // Publish the newly installed descriptor before using it on the boot CPU.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi alle2",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(())
+}
+
 /// Allocate the lowest-addressed unused managed 4 KiB physical page.
 ///
 /// The returned page is changed to `InUse`. Reserved RAM, MMIO, unpopulated
 /// addresses, and pages already in use are skipped.
 pub fn allocate_page() -> Result<PhysAddr, AllocatorError> {
     with_allocator(|allocator| allocator.allocate())
+}
+
+/// Allocate secondary stack ranges using bitmap metadata only. The ranges
+/// are not yet accessible until their RAM mappings have been installed.
+pub fn allocate_secondary_stacks(
+    topology: &tvisor_util::cpu_topology::CpuTopology,
+) -> Result<
+    FixedList<tvisor_util::pcpu::SecondaryStack, { tvisor_util::cpu_topology::MAX_CPUS }>,
+    AllocatorError,
+> {
+    with_allocator(|allocator| tvisor_util::pcpu::allocate_secondary_stacks(topology, allocator))
 }
 
 /// Allocate the lowest-addressed run of `pages` contiguous unused managed
@@ -398,12 +486,12 @@ pub fn allocator_stats() -> Result<AllocatorStats, AllocatorError> {
 fn with_allocator<T>(
     operation: impl FnOnce(&mut PageAllocator<'_, PAGE_BITMAP_BYTES>) -> Result<T, AllocatorError>,
 ) -> Result<T, AllocatorError> {
+    let _guard = PAGE_ALLOCATOR.lock.lock();
     if !PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
         return Err(AllocatorError::NotInitialized);
     }
     let ram_pages = PAGE_ALLOCATOR.ram_pages.load(Ordering::Relaxed);
-    // SAFETY: Phase 8 is single-core with asynchronous exceptions masked, so
-    // allocator operations cannot overlap.
+    // SAFETY: the IRQ-save guard exclusively owns both bitmap views.
     let mut allocator = unsafe {
         PageAllocator::from_existing(
             &mut *PAGE_ALLOCATOR.managed.get(),
@@ -419,7 +507,19 @@ fn with_tables<T>(
 ) -> Result<T, PrepareError> {
     let mut guard = TVISOR_TABLES.lock();
     let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
-    operation(tables)
+    operation(tables.edit().map_err(|_| PrepareError::Validation)?)
+}
+
+/// Validate and seal under the same lock; later writer requests are rejected.
+pub fn validate_and_freeze_startup(
+    resources: &tvisor_util::startup_resources::StartupResources,
+    stacks: &FixedList<tvisor_util::pcpu::StackLayout, { tvisor_util::cpu_topology::MAX_CPUS }>,
+) -> Result<tvisor_util::startup_resources::FrozenStartup, PrepareError> {
+    let mut guard = TVISOR_TABLES.lock();
+    let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
+    tables
+        .freeze_startup(*resources, stacks.into_iter().copied())
+        .map_err(|_| PrepareError::Validation)
 }
 
 fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {
@@ -544,12 +644,6 @@ pub fn validate_el2_stage1_page_table<const N: usize>(
             false,
             MemoryType::Normal,
         ),
-        (
-            link_addr!(__boot_stack_bottom),
-            true,
-            false,
-            MemoryType::Normal,
-        ),
         (arena_start, true, false, MemoryType::Normal),
         (arena_end - 1, true, false, MemoryType::Normal),
         (
@@ -576,13 +670,6 @@ pub fn validate_el2_stage1_page_table<const N: usize>(
             return Err(PrepareError::Validation);
         }
     }
-    for guard in [
-        link_addr!(__boot_stack_guard_start),
-        link_addr!(__boot_stack_guard_end) - 1,
-    ] {
-        if tables.walk(guard)?.is_some() {
-            return Err(PrepareError::Validation);
-        }
-    }
+    tvisor_util::pcpu::validate_stack(tables, crate::pcpu::boot_stack())?;
     Ok(())
 }
