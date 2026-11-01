@@ -1,6 +1,7 @@
 # Tvisor single-vCPU hardware regression tests
 
-Use these tests on `lab-rpi4` after tvisor changes, keeping the established
+Use these tests on a Raspberry Pi 4 Model B after tvisor changes, keeping the
+established
 single-vCPU Linux platform as the comparison point. A pass supplies evidence for
 the Phase 10 completion gate; it does not validate physical or guest SMP.
 
@@ -35,6 +36,7 @@ Example setup, from the repository root:
 ```sh
 repo="$PWD"
 mode=quick  # or overnight
+board_id=your-rpictl-board-id  # replace with your configured board identifier
 run="$repo/guest/build/regression-$(date -u +%Y%m%dT%H%M%SZ)-$mode"
 ```
 
@@ -56,8 +58,8 @@ commands; quote paths, and do not interpolate untrusted strings into commands.
 - Existing sources `guest/linux-6.18.2/`, normal guest build configuration and
   `guest/build/arm64/arch/arm64/boot/Image`, static BusyBox under
   `guest/build/busybox-arm64/`, and its generated `.config`.
-- Existing verified rpictl daemon at `/tmp/rpictl-mcp.sock`, configured board
-  `lab-rpi4` and UART `/dev/ttyUSB0`. Use rpictl tools to inspect power/ownership;
+- Existing verified rpictl daemon at `/tmp/rpictl-mcp.sock`, a configured Raspberry
+  Pi 4 Model B board and UART `/dev/ttyUSB0`. Use rpictl tools to inspect power/ownership;
   never open the UART in a second process or rewrite the global board config.
 - LAN `eth0=192.168.28.1/24`, working read-only TFTP at `/srv/tftp`. This setup
   uses dnsmasq in `eth0-gateway-dhcp.service`. Inspect rather than recreating the
@@ -66,9 +68,15 @@ commands; quote paths, and do not interpolate untrusted strings into commands.
 Prepare as the normal development user, not root:
 
 ```sh
-python3 "$repo/scripts/stability/prepare.py" --repo "$repo" --mode "$mode" --output "$run" --dry-run
-python3 "$repo/scripts/stability/prepare.py" --repo "$repo" --mode "$mode" --output "$run"
+python3 "$repo/scripts/stability/prepare.py" --repo "$repo" --mode "$mode" \
+  --board-id "$board_id" --output "$run" --dry-run
+python3 "$repo/scripts/stability/prepare.py" --repo "$repo" --mode "$mode" \
+  --board-id "$board_id" --output "$run"
 ```
+
+`--board-id` is required and names your existing rpictl board configuration; no
+local device name is embedded in the source. It selects the test device, not a
+different hardware layout: the Raspberry Pi 4 profile below must still match.
 
 `--baseline-image /absolute/path/Image` can select an explicitly chosen frozen
 fixture. The helper defaults to `LLVM=-22`, at most four build jobs, and fails

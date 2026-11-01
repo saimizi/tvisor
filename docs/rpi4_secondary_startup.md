@@ -42,7 +42,8 @@ contract must be established before a future PSCI activation path is enabled.
 
 ## Phase 11.0 boundary and Phase 11.3 release
 
-Phase 11.3 now implements and validates one-secondary release on lab-rpi4; see
+Phase 11.3 now implements and validates one-secondary release on Raspberry Pi 4
+Model B; see
 the [completion handoff](phase11_3_status.md). The Phase 11.0 boundary and
 normative entry/publication requirements below remain applicable.
 
@@ -64,7 +65,7 @@ startup deadlines; a timeout never permits reusing a possibly live CPU's memory.
 Exact maintenance instructions are reviewed with the 11.3 trampoline and its
 actual entry regime. See the [SMP design](tvisor_smp.md).
 
-## Diagnostic observations from lab-rpi4
+## Diagnostic observations from Raspberry Pi 4 Model B
 
 The inspected board advertised four enabled affinities 0..3, per-CPU spin-table
 cells at `0xd8`, `0xe0`, `0xe8`, `0xf0`, and a DT reservation `[0x0, 0x1000)`.
@@ -88,6 +89,6 @@ guest stage-2 mappings; current guest mappings exclude the firmware low page.
 
 ## Phase 11.3 entry contract
 
-The [lab-rpi4 backend contract](phase11_3_backend_contract.md) records the
+The [Raspberry Pi 4 Model B backend contract](phase11_3_backend_contract.md) records the
 supported firmware/CPU profile, source evidence, coherency reasoning, permitted
 implementation-defined read, runtime prerequisites and pending hardware checks.

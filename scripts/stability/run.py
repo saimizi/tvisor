@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded quick/overnight lab-rpi4 regression test through the existing rpictl daemon IPC.
+"""Bounded quick/overnight Raspberry Pi 4 regression test through the existing rpictl daemon IPC.
 
 The IPC framing is the same as rpictl-mcp's SocketClient (RPC JSON + newline).
 Never opens the UART directly. No daemon/configuration changes are made.

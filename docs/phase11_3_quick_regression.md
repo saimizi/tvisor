@@ -1,6 +1,7 @@
 # Phase 11.3 quick regression with one parked secondary
 
-Task 14, 2026-10-31: **PASS on lab-rpi4.** The complete quick profile ran with
+Task 14, 2026-10-31: **PASS on Raspberry Pi 4 Model B.** The complete quick
+profile ran with
 CPU1 parked and a one-vCPU Linux guest. Four boots, the smoke probe, the full
 600-second soak and the final short probe all passed. Final relay power was
 independently verified off. Task 15's final consolidated review remains pending.

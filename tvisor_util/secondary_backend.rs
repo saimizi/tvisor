@@ -15,10 +15,10 @@ pub enum BackendError {
     Cluster,
     FirmwareInterface,
 }
-pub struct LabRpi4Backend {
+pub struct Bcm2711SpinTableBackend {
     _private: (),
 }
-impl LabRpi4Backend {
+impl Bcm2711SpinTableBackend {
     pub fn select(
         fdt: Fdt<'_>,
         topology: &CpuTopology,
@@ -183,7 +183,7 @@ mod tests {
             let bytes = fixture(compat, affinity, cpu, psci);
             let fdt = Fdt::new(&bytes).unwrap();
             let topology = discover_cpu_topology(fdt, 0x80000000).unwrap();
-            let result = LabRpi4Backend::select(fdt, &topology, midr, 0x80000000);
+            let result = Bcm2711SpinTableBackend::select(fdt, &topology, midr, 0x80000000);
             assert_eq!(result.as_ref().err().copied(), expected);
             if let Ok(backend) = result {
                 assert!(backend.contract().coherent);

@@ -42,6 +42,34 @@ rustup target add aarch64-unknown-none
 The Raspberry Pi must boot through a U-Boot configuration that enters tvisor
 at EL2 and provides a working DTB through the `fdt_addr` environment variable.
 
+## Secondary firmware handoff
+
+The supported Raspberry Pi 4 Model B spin-table backend requires the following entry contract
+between firmware and tvisor's `__secondary_entry`:
+
+| Property | Required state at entry |
+|---|---|
+| Exception level | AArch64 EL2 |
+| MMU | Disabled (`SCTLR_EL2.M = 0`) |
+| Data cache | Disabled (`SCTLR_EL2.C = 0`) |
+| Data endianness | Little-endian (`SCTLR_EL2.EE = 0`) |
+| CPU coherency | Established according to the supported platform/firmware contract |
+| Entry address | Physical address published in the DT-described spin-table release cell |
+
+The trampoline checks EL2 and the MMU/data-cache/endianness bits before reading
+the startup record or installing a stack. Unsupported state enters a holding
+loop. It also identifies Cortex-A72 before checking `CPUECTLR_EL1.SMPEN`.
+Coherency is a platform precondition: SMPEN is a defensive maintenance check,
+not proof of coherency, and the trampoline does not establish coherency itself.
+The boot CPU validates and publishes the physical entry and startup resources
+before releasing the secondary.
+
+Disabled data cache alone does not prove a clean cache history. Firmware must
+also ensure safe instruction fetch and no conflicting dirty cache state; the
+trampoline does not require the instruction cache to be disabled. See the
+[backend contract](docs/phase11_3_backend_contract.md) and
+[entry review](docs/phase11_3_entry_review.md) for these obligations.
+
 ## Build and host tests
 
 Run the host unit tests:

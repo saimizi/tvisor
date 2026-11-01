@@ -1,6 +1,7 @@
 # Phase 11.3 physical arrival and park acceptance
 
-Task 12, 2026-10-31. **PASS for the one-secondary cold-boot gate on lab-rpi4.**
+Task 12, 2026-10-31. **PASS for the one-secondary cold-boot gate on Raspberry Pi
+4 Model B.**
 CPU1 completed generation 1 with `outcome=Success worker=Ok(Parked)` and zero
 local validation failures. CPU2 and CPU3 release cells remained zero. The
 one-vCPU Linux guest booted and answered a fresh console command. Final relay

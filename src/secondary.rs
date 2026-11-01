@@ -127,6 +127,21 @@ global_asm!(
     .balign 64
     .global __secondary_entry
     .type __secondary_entry, %function
+// Firmware-to-tvisor entry contract for the supported Raspberry Pi 4 Model B backend:
+//   Exception level: AArch64 EL2.
+//   MMU: disabled (SCTLR_EL2.M = 0).
+//   Data cache: disabled (SCTLR_EL2.C = 0).
+//   Data endianness: little-endian (SCTLR_EL2.EE = 0).
+//   CPU coherency: established by the platform/firmware contract before entry.
+//   Entry address: physical address published in the spin-table release cell.
+// EL2 and M/C/EE are checked below before record reads or stack installation.
+// Cortex-A72 identity precedes the SMPEN check; SMPEN alone does not prove or
+// establish coherency. Firmware must provide a clean data-cache history and
+// safe instruction fetch; an enabled I-cache must not contain stale entry code.
+// CPU0 validates/publishes the physical entry and all startup resources before
+// release. No firmware stack or argument-register contents are relied upon.
+// Unsupported state enters the holding loop without ordinary shared Rust access.
+// See docs/phase11_3_backend_contract.md and docs/phase11_3_entry_review.md.
 __secondary_entry:
     msr daifset, #0xf
     mrs x9, CurrentEL
@@ -150,8 +165,10 @@ __secondary_entry:
     mov x11, #0xd08
     cmp x10, x11
     b.ne .Lsecondary_reject
+    // S3_1_C15_C2_1 is the encoded system-register name used for Cortex-A72 CPUECTLR_EL1
     mrs x9, S3_1_C15_C2_1
     mov x23, x9
+    // Bit 6 is SMPEN
     tbz x9, #6, .Lsecondary_reject
     // Only the explicitly published startup record may be read before Rust.
     adrp x19, SECONDARY_RECORD
@@ -347,7 +364,7 @@ extern "C" fn secondary_main(
     }
 }
 
-/// One boot attempt under the documented lab-rpi4 firmware trust profile.
+/// One boot attempt under the documented Raspberry Pi 4 Model B firmware trust profile.
 pub fn start_one(
     fdt: dtoolkit::fdt::Fdt<'_>,
     policy: tvisor_util::el2_policy::HostTranslation,
@@ -379,10 +396,10 @@ fn start_attempt(
         core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
     }
     let backend =
-        tvisor_util::secondary_backend::LabRpi4Backend::select(fdt, topology, midr, mpidr)
+        tvisor_util::secondary_backend::Bcm2711SpinTableBackend::select(fdt, topology, midr, mpidr)
             .map_err(|error| {
                 tvisor_util::println!("Phase 11.3 backend rejected: {:?}", error);
-                "unsupported lab-rpi4 backend profile"
+                "unsupported Raspberry Pi 4 Model B backend profile"
             })?;
     let entry_contract = backend.contract();
     #[cfg(feature = "secondary-startup-timeout-test")]
@@ -390,7 +407,7 @@ fn start_attempt(
         "Phase 11.3 TEST ONLY: secondary-startup-timeout-test; acknowledgement delayed 4 seconds"
     );
     tvisor_util::println!(
-        "Phase 11.3 backend=lab-rpi4-armstub MIDR={:#x} MPIDR={:#x}",
+        "Phase 11.3 backend=bcm2711-armstub MIDR={:#x} MPIDR={:#x}",
         midr,
         mpidr
     );

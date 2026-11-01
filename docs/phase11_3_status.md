@@ -5,7 +5,7 @@ review.** Tasks 1–15 are complete. This records the implemented state and evid
 not user approval or a merge. Validation captured an uncommitted working tree at base
 `de73e049e604cf310fe44fabb625042560dfa19b`.
 
-On the supported lab-rpi4 profile, CPU0 now publishes one startup record,
+On the supported Raspberry Pi 4 Model B profile, CPU0 now publishes one startup record,
 releases the lowest enabled non-boot logical CPU, and requires its validated,
 generation-matched Parked checkpoint before entering the one-vCPU Linux guest.
 Other CPUs remain in firmware. A failed attempt is terminal and retains its

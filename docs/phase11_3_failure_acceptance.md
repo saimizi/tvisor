@@ -45,7 +45,8 @@ terminal report before reset. Record all images, source provenance and logs.
 
 ## Task 13 result
 
-2026-10-31: **PASS on lab-rpi4 for deliberate bounded timeout and late arrival.**
+2026-10-31: **PASS on Raspberry Pi 4 Model B for deliberate bounded timeout and
+late arrival.**
 One injected image was executed once; no failed test was retried. This is not a
 full quick regression or a completed Phase 11.3 acceptance gate.
 

@@ -1,4 +1,4 @@
-# Phase 11.3 lab-rpi4 backend contract
+# Phase 11.3 Raspberry Pi 4 Model B backend contract
 
 Task 2 deliverable, 2026-10-31. This specifies the supported entry profile and
 its evidence. It does not activate release or certify the unfinished startup
@@ -12,7 +12,7 @@ continues to apply.
 
 ## Supported profile and trust boundary
 
-The backend targets lab-rpi4: Raspberry Pi 4 Model B / BCM2711, its single
+The backend targets Raspberry Pi 4 Model B / BCM2711, its single
 Cortex-A72 cluster, and the firmware's AArch64 armstub spin-table handoff.
 It supports one enabled secondary with a unique DT-described release cell.
 It does not support PSCI, other CPU implementations, a monitor that changes the
@@ -144,7 +144,8 @@ firmware guarantees. Explicit backend selection remains part of Task 10.
 Before declaring hardware acceptance, retain fresh board/DT inspection, full
 primary and secondary identity, entry SCTLR/SMPEN observations, the acquired
 checkpoint, image hashes and source provenance. Confirm actual secondary state,
-publication visibility and parking on lab-rpi4. Unsupported observations must
+publication visibility and parking on Raspberry Pi 4 Model B. Unsupported
+observations must
 produce rejection/timeout; revising the accepted regime requires an adapter
 review. Tasks 6/9/11 still owe instruction-order/cache/errata review. Tasks
 12–14 owe success, bounded failure and guest regression evidence.

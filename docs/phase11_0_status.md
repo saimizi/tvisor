@@ -29,7 +29,7 @@ checks, protocol assumptions, diagnostic observations and later entry-state gate
 
 ## Board observations
 
-lab-rpi4 advertised four enabled affinities 0..3, boot MPIDR `0x80000000`,
+Raspberry Pi 4 Model B advertised four enabled affinities 0..3, boot MPIDR `0x80000000`,
 spin-table cells `0xd8`/`0xe0`/`0xe8`/`0xf0`, and a reserved first 4 KiB.
 Firmware identification/disassembly from the earlier investigation remains
 optional diagnostic evidence. The runtime trusts the documented DT boot
@@ -42,7 +42,8 @@ interface and does not claim to measure parked CPUs' registers.
   cells, separate holding-code protection, allocator exclusion and PSCI with no
   invented release-cell reads.
 - Bare-metal build, formatting and whitespace checks passed.
-- lab-rpi4 positive test passed: DT cell checks, pre-allocation reservation
+- Raspberry Pi 4 Model B positive test passed: DT cell checks, pre-allocation
+  reservation
   checks, Linux 6.18.2 guest boot, and UART command completion with status zero.
 - Negative hardware test passed: removing the reservation from a RAM-only DTB
   copy produced `MissingHoldingReservation` before allocator initialization.
@@ -50,7 +51,7 @@ interface and does not claim to measure parked CPUs' registers.
   regression claim is made. No SD files or saved environment were changed.
 - Normal guest Image reused unchanged, SHA-256:
   `3a72c904e211f56e5f05d601b41495dfa4ec9029b3d7b1ee3556a72f9bb33b15`.
-- lab-rpi4 powered off after validation; relay state read back as off.
+- Raspberry Pi 4 Model B powered off after validation; relay state read back as off.
 - Revised tvisor ELF SHA-256:
   `f091aac5c5059f4b15cc4f3d63a57162d687b9c516e2785fbff33cf25d25505e`.
 

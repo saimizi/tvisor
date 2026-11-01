@@ -8,7 +8,8 @@ It specifies the implemented milestone contract and its completion boundary.
 
 Task 10 now [connects the startup path to boot](phase11_3_boot_integration.md).
 Supported-board builds attempt one secondary release before Linux. Physical
-arrival, deliberate failure and the full quick regression have passed on lab-rpi4.
+arrival, deliberate failure and the full quick regression have passed on
+Raspberry Pi 4 Model B.
 
 ## 1. Goal and completion boundary
 
@@ -17,7 +18,8 @@ EL2 execution environment. The secondary validates its identity and local state,
 acknowledges the requested startup generation, and parks in a tvisor-owned loop
 with interrupts masked. CPU 0 then boots the existing one-vCPU Linux guest.
 
-Completion requires a real lab-rpi4 arrival and parking checkpoint, a bounded
+Completion requires a real Raspberry Pi 4 Model B arrival and parking
+checkpoint, a bounded
 failure test, and guest regression with that secondary parked. Host tests and a
 linked trampoline alone do not satisfy this milestone.
 
@@ -29,9 +31,10 @@ There is no scheduler, guest SMP, or vCPU migration in this milestone.
 ## 2. Backend and entry contract
 
 See the [Task 2 backend contract](phase11_3_backend_contract.md) for the
-supported lab-rpi4 profile, evidence and firmware trust boundary.
+supported Raspberry Pi 4 Model B profile, evidence and firmware trust boundary.
 
-The initial backend targets the DT-described spin-table interface on lab-rpi4.
+The initial backend targets the DT-described spin-table interface on Raspberry
+Pi 4 Model B.
 Select an enabled logical CPU other than CPU 0 by its full MPIDR affinity; do
 not derive logical IDs from the low MPIDR bits. For deterministic testing, choose
 the lowest eligible nonzero logical ID. If none exists, report unavailable; this
@@ -58,7 +61,8 @@ evidence. Existing firmware disassembly may inform that investigation without
 becoming a runtime binary allowlist.
 
 The trampoline rejects non-EL2, MMU-on, data-cache-on and big-endian entry. Unsupported
-entry must park before stack use or ordinary Rust access. If lab-rpi4 requires
+entry must park before stack use or ordinary Rust access. If Raspberry Pi 4
+Model B requires
 another entry regime, specify and review an adapter rather than relaxing the
 checks without a maintenance argument. Reads of implementation-defined registers
 must be permitted by the backend contract and preceded by CPU identification.
@@ -245,7 +249,7 @@ policy, ABI-aligned private stack and the intended cache/TLB/barrier/acquire
 instructions. Account for literal pools and all mappings on both sides of MMU
 enablement. Build warnings about unused startup paths indicate incomplete wiring.
 
-On lab-rpi4:
+On Raspberry Pi 4 Model B:
 
 1. Preserve baseline image hashes and inspect current U-Boot layout/DT topology.
 2. Cold-boot one target into tvisor; collect its local checkpoint and matching

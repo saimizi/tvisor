@@ -36,12 +36,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--repo', type=Path, required=True)
     p.add_argument('--mode', choices=['quick', 'overnight'], required=True)
+    p.add_argument('--board-id', required=True, help='Configured rpictl board identifier for your Raspberry Pi 4')
     p.add_argument('--output', type=Path)
     p.add_argument('--baseline-image', type=Path)
     p.add_argument('--llvm', default='-22')
     p.add_argument('--jobs', type=int, default=min(4, os.cpu_count() or 1))
     p.add_argument('--dry-run', action='store_true', help='Show prerequisites and intended operations without writing or building')
     args = p.parse_args()
+    if not args.board_id.strip():
+        p.error('--board-id must not be empty')
     repo = args.repo.resolve()
     skill = Path(__file__).resolve().parent
     guest = repo / 'guest'
@@ -66,7 +69,7 @@ def main():
     if args.jobs < 1:
         p.error('--jobs must be positive')
     if args.dry_run:
-        print(json.dumps(dict(repo=str(repo), output=str(output), mode=args.mode,
+        print(json.dumps(dict(repo=str(repo), output=str(output), mode=args.mode, board_id=args.board_id,
               operations=['build current tvisor', 'format check and native library tests',
                           'compile static ARM64 probe', 'build isolated diagnostic kernel',
                           'verify embedded probe', 'freeze artifacts and hashes'],
@@ -138,7 +141,7 @@ dir /sys 0755 0 0
         shutil.copy2(source, output / name)
     with open(output / 'kernel-config.diff', 'w') as stream:
         subprocess.run([kernel / 'scripts/diffconfig', output / 'baseline-kernel.config', output / 'diagnostic-kernel.config'], stdout=stream, check=True)
-    manifest = dict(names, mode=args.mode, board_id='lab-rpi4', rpictl_socket='/tmp/rpictl-mcp.sock',
+    manifest = dict(names, mode=args.mode, board_id=args.board_id, rpictl_socket='/tmp/rpictl-mcp.sock',
                     expected_mac='dc:a6:32:91:38:be', expected_fdt='2eff1f00', files=files,
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(),
                     created=dt.datetime.now(dt.timezone.utc).isoformat(), probe_sha256=sha(probe),

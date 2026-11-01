@@ -67,7 +67,7 @@ does not claim to stop other CPUs automatically.
   unique ownership of live physical pages and final allocator statistics;
   concurrent heap integrity/coalescing; complete-message console serialization;
   nonblocking fatal output with the console lock held; first-failure evidence.
-- Complete lab-rpi4 quick regression passed on 2026-10-29, finished at
+- Complete Raspberry Pi 4 Model B quick regression passed on 2026-10-29, finished at
   09:57:30 UTC: four boots, 18 console commands and ten timer/console checks.
   The 600.458-second soak completed 2,136 timed wakeups and 8,137 full 32 MiB
   memory verification passes. Maximum wakeup lateness was 7.582 ms; no wakeups
@@ -94,4 +94,5 @@ run. The final run completed without intervention or harness changes.
 
 Host contention tests exercise the production lock and allocators with hosted
 threads, not physical secondary CPUs. Hardware cross-core coherency, management
-interrupts and concurrent allocation on lab-rpi4 remain milestones 11.3–11.5.
+interrupts and concurrent allocation on Raspberry Pi 4 Model B remain milestones
+11.3–11.5.

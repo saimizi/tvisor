@@ -13,7 +13,7 @@ and complete RAM mappings, then heap initialization. Only after those steps does
 it reconstruct the shared translation policy from the expected takeover values
 and call `secondary::start_one`.
 
-The new production `LabRpi4Backend::select` requires both root compatibility
+The new production `Bcm2711SpinTableBackend::select` requires both root compatibility
 strings `raspberrypi,4-model-b` and `brcm,bcm2711`, a primary MIDR identifying Arm
 Cortex-A72, the matching logical boot affinity, and enabled CPU affinities inside
 one cluster with Aff0 below four. Enabled DT CPU nodes must identify Cortex-A72

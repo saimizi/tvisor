@@ -227,7 +227,8 @@ require physical acceptance and final run provenance. No board was operated.
 ## Task 12 follow-up (2026-10-31)
 
 The [hardware arrival review](phase11_3_hardware_arrival.md) records one passing
-cold boot on lab-rpi4: CPU1 generation 1 reached Parked with zero validation
+cold boot on Raspberry Pi 4 Model B: CPU1 generation 1 reached Parked with zero
+validation
 failures, exact host policy/context/stack evidence and entry-state observations.
 Added read-only CPU0 post-arrival cell verification before the guest permit;
 only CPU1's cell contained the linked entry, while CPU2/CPU3 cells stayed zero.
