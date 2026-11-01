@@ -1,5 +1,9 @@
 # Phase 11.3 completion and review handoff
 
+Phase 11.3 was accepted on 2026-11-01. Subsequent GIC/management work is recorded
+in [Phase 11.4 status](phase11_4_status.md); the reports below retain the accepted
+Phase 11.3 checkpoint and its original validation evidence.
+
 Latest update: [lifecycle and waiting-policy separation](phase11_3_lifecycle_refactor.md)
 is complete with 170 host tests per profile, passing physical timeout/late-parking
 acceptance and the repeated full quick regression (four boots, 600.477-second soak,

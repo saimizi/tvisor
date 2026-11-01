@@ -244,7 +244,26 @@ fn handle_irq(
     gic: &gicv2::GicV2,
     dispatcher: &mut MmioDispatcher,
 ) -> Result<(), ExitError> {
-    let irq = unsafe { gic.acknowledge() };
+    let Some(ack) = (unsafe { gic.acknowledge() }) else {
+        return Ok(());
+    };
+    let irq = ack.intid();
+    if irq == gicv2::MANAGEMENT_SGI {
+        let before = *vcpu.gic();
+        let handled =
+            crate::management::dispatch(gic, ack, true, vcpu.context().spsr_el2 & (1 << 7) != 0);
+        assert_eq!(
+            *vcpu.gic(),
+            before,
+            "management SGI changed guest GIC state"
+        );
+        crate::management::stop_if_requested();
+        return if handled {
+            Ok(())
+        } else {
+            Err(ExitError::UnexpectedIrq(irq))
+        };
+    }
     let mut result = Ok(());
     'end: {
         if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
@@ -261,7 +280,7 @@ fn handle_irq(
                 DUPLICATE_TIMER_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
 
-            unsafe { gic.end_interrupt(irq) };
+            unsafe { gic.end_interrupt(&ack) };
             break 'end;
         }
 
@@ -271,15 +290,12 @@ fn handle_irq(
             while let Some(byte) = tvisor_util::debug_util::read_byte() {
                 let _ = dispatcher.enqueue_pl011_rx(byte);
             }
-            unsafe { gic.end_interrupt(irq) };
-            unsafe { gic.deactivate_interrupt(irq) };
+            unsafe { gic.complete_host_interrupt(ack) };
             break 'end;
         }
 
         result = Err(ExitError::UnexpectedIrq(irq));
-        if irq != gicv2::SPURIOUS_IRQ {
-            unsafe { gic.end_interrupt(irq) };
-        }
+        unsafe { gic.complete_host_interrupt(ack) };
     }
 
     result
@@ -349,6 +365,7 @@ pub fn run_vcpu_with_mmio(
         // The guest accesses GICV directly; save/restore GICH state around
         // every world switch so its List Register and CPU-interface policy
         // remain owned by this vCPU rather than the host.
+        crate::management::guest_entry();
         unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
         crate::pcpu::assert_boot_cpu_idle();
         let vector = unsafe { __vcpu_run(vcpu) };

@@ -10,6 +10,8 @@ baremetal = []
 # Hardware acceptance only: force a late secondary acknowledgement after timeout.
 # Deliberately prevents guest boot; never enable in normal/regression images.
 secondary-startup-timeout-test = ["baremetal"]
+# Hardware acceptance: masked EL1 probes and worker-to-guest SGI traffic.
+management-irq-test = ["baremetal"]
 
 [lib]
 name = "tvisor_util"

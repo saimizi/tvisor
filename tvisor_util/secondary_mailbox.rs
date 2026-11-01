@@ -17,7 +17,7 @@ pub enum CpuState {
     /// Startup has been requested, not proof of a completed firmware release.
     Starting = 2,
     Parked = 3,
-    /// Reserved for management/IRQ readiness in a later milestone; no setter yet.
+    /// Management handler and per-CPU interrupt interface are ready.
     Online = 4,
     Failed = 5,
 }
@@ -135,6 +135,28 @@ impl SecondaryMailbox {
     /// Failure after this transition does not prove that a CPU failed to initialize.
     pub fn begin_start(&self, generation: u64) -> Result<(), ProtocolError> {
         self.transition(generation, CpuState::Prepared, CpuState::Starting)
+    }
+    /// # Safety
+    /// Only the owning CPU may call this, after preparing vectors, management
+    /// state and its banked interrupt interface, immediately before IRQ unmask.
+    pub unsafe fn management_online(&self, generation: u64) -> Result<(), ProtocolError> {
+        self.transition(generation, CpuState::Parked, CpuState::Online)
+    }
+    /// # Safety
+    /// Only the owning CPU may publish this management parking checkpoint.
+    /// This is a responsive holding pen, not CPU_OFF or permission to recycle.
+    pub unsafe fn management_park(&self, generation: u64) -> Result<(), ProtocolError> {
+        self.transition(generation, CpuState::Online, CpuState::Parked)
+    }
+    /// # Safety
+    /// Only the owner may report an actual management initialization failure.
+    /// Resources remain retained; this does not permit release or boot retry.
+    pub unsafe fn management_failed(&self, generation: u64) -> Result<(), ProtocolError> {
+        match self.state(generation)? {
+            CpuState::Parked => self.transition(generation, CpuState::Parked, CpuState::Failed),
+            CpuState::Online => self.transition(generation, CpuState::Online, CpuState::Failed),
+            _ => Err(ProtocolError::InvalidTransition),
+        }
     }
     pub fn claim_entry(&self, generation: u64) -> Result<EntryClaim<'_>, ProtocolError> {
         if self.state(generation)? != CpuState::Starting {
@@ -394,6 +416,45 @@ mod tests {
             assert_eq!(b.join().unwrap(), Err(WaitError::Timeout));
         });
         assert_eq!(m.lifecycle(), CpuState::Parked);
+    }
+    #[test]
+    fn actual_management_failure_is_terminal_and_does_not_enable_retry() {
+        let m = starting();
+        park(&m);
+        unsafe { m.management_failed(7) }.unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Failed);
+        assert!(unsafe { m.management_online(7) }.is_err());
+        assert!(m.begin_start(7).is_err());
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 0),
+            Err(WaitError::CpuFailed)
+        );
+    }
+    #[test]
+    fn management_readiness_and_responsive_park_are_owner_transitions() {
+        let m = starting();
+        assert_eq!(
+            unsafe { m.management_online(7) },
+            Err(ProtocolError::InvalidTransition)
+        );
+        park(&m);
+        assert_eq!(
+            unsafe { m.management_online(8) },
+            Err(ProtocolError::InvalidGeneration)
+        );
+        unsafe { m.management_online(7) }.unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Online);
+        assert_eq!(
+            unsafe { m.management_online(7) },
+            Err(ProtocolError::InvalidTransition)
+        );
+        unsafe { m.management_park(7) }.unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Parked);
+        assert!(m.begin_start(7).is_err());
+        assert_eq!(
+            unsafe { m.management_park(7) },
+            Err(ProtocolError::InvalidTransition)
+        );
     }
     #[test]
     fn park_racing_timeout_is_observable_by_a_fresh_wait() {

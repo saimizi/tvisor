@@ -293,7 +293,8 @@ __secondary_rejected:
     b .Lsecondary_reject
     .size __secondary_entry, . - __secondary_entry
 "#),
-    host_hcr = const tvisor_util::el2_policy::HOST_HCR,
+    host_hcr_lo = const (tvisor_util::el2_policy::HOST_HCR & 0xffff),
+    host_hcr_hi = const (tvisor_util::el2_policy::HOST_HCR >> 16),
     host_cptr = const tvisor_util::el2_policy::HOST_CPTR,
     host_hstr = const tvisor_util::el2_policy::HOST_HSTR,
     host_vttbr = const tvisor_util::el2_policy::HOST_VTTBR,
@@ -404,11 +405,10 @@ extern "C" fn secondary_main(
     } else {
         let _ = entry_claim.fail();
     }
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack));
-        }
+    if failures.0 == 0 {
+        crate::management::worker(record.identity.logical_id as usize, generation);
     }
+    tvisor_util::halt();
 }
 
 /// One boot attempt under the documented Raspberry Pi 4 Model B firmware trust profile.

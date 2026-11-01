@@ -67,7 +67,9 @@ const _: () = {
 };
 
 pub const HCR_RW: u64 = 1 << 31;
-pub const HOST_HCR: u64 = HCR_RW; // RW=1; VM, routing and trap controls clear; E2H=0.
+pub const HCR_IMO: u64 = 1 << 4;
+// Route host physical IRQs to EL2; FIQ/SError policy and all traps stay clear.
+pub const HOST_HCR: u64 = HCR_RW | HCR_IMO; // VM=TGE=E2H=VI=VF=0.
 pub const CPTR_RES1: u64 = (3 << 12) | 0x3ff;
 pub const HOST_CPTR: u64 = CPTR_RES1; // TFP/TTA/TCPAC clear; allow host FP/SIMD.
 pub const HOST_HSTR: u64 = 0;

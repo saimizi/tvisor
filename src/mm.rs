@@ -510,6 +510,36 @@ fn with_tables<T>(
     operation(tables.edit().map_err(|_| PrepareError::Validation)?)
 }
 
+/// Check retained immutable stage-1 Device mappings on the calling CPU before
+/// any local GIC MMIO. Reads remain valid after the table mutation gate closes.
+pub fn validate_device_identity(region: PhysRegion) -> Result<(), PrepareError> {
+    let guard = TVISOR_TABLES.lock();
+    let tables = guard.as_ref().ok_or(PrepareError::Validation)?.view();
+    let mut address = region.start().value();
+    while address < region.end().value() {
+        let mapping = tables.walk(address)?.ok_or(PrepareError::Validation)?;
+        if mapping.pa != address
+            || !mapping.writable
+            || mapping.executable
+            || mapping.memory_type != MemoryType::Device
+        {
+            return Err(PrepareError::Validation);
+        }
+        // Check the active CPU's translation too, including write permission.
+        let par: u64;
+        unsafe {
+            core::arch::asm!("mrs {saved}, par_el1", "at s1e2w, {address}", "isb", "mrs {result}, par_el1", "msr par_el1, {saved}",saved=out(reg) _,result=out(reg) par,address=in(reg) address,options(nostack,preserves_flags));
+        }
+        if par & 1 != 0 || par & 0x000f_ffff_ffff_f000 != address & !4095 {
+            return Err(PrepareError::Validation);
+        }
+        address = (address & !4095)
+            .checked_add(4096)
+            .ok_or(PrepareError::Validation)?;
+    }
+    Ok(())
+}
+
 /// Validate and seal under the same lock; later writer requests are rejected.
 pub fn validate_and_freeze_startup(
     resources: &tvisor_util::startup_resources::StartupResources,

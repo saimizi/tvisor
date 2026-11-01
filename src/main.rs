@@ -19,6 +19,7 @@ mod boot;
 mod exception;
 mod guest;
 mod heap;
+mod management;
 mod mm;
 mod pcpu;
 mod secondary;
@@ -238,6 +239,7 @@ pub fn panic(info: &core::panic::PanicInfo) -> ! {
         pc: 0,
         address: 0,
     });
+    management::notify_fatal();
     let _ = tvisor_util::debug_util::emergency_print(format_args!("PANIC: {}\n", info));
     halt()
 }

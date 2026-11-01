@@ -23,6 +23,7 @@ pub mod guest_platform;
 pub mod guest_stage2_translation;
 pub mod heap_allocator;
 pub mod linux_boot;
+pub mod management;
 pub mod memory_map;
 pub mod mmio;
 pub mod page;

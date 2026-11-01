@@ -69,6 +69,9 @@ diagnostics live in that slot, with EL2 configuration shared separately. See the
 CPU lifecycle and optional readiness waits are separate: a timeout does not
 change the CPU state. Phase 11.3 still treats a failed startup wait as a terminal
 guest-boot policy decision; see the [lifecycle design](docs/phase11_3_lifecycle_refactor.md).
+Phase 11.4 adds per-CPU GIC setup and host management SGIs after that checkpoint,
+allowing CPU1 to handle requests while CPU0 runs Linux. See the
+[implementation and validation status](docs/phase11_4_status.md).
 
 Disabled data cache alone does not prove a clean cache history. Firmware must
 also ensure safe instruction fetch and no conflicting dirty cache state; the
@@ -190,6 +193,7 @@ test; there is no return path to the U-Boot prompt.
 - [Development plan](docs/development_plan.md)
 - [Phase 11 physical SMP design](docs/tvisor_smp.md)
 - [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
+- [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)

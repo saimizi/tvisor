@@ -133,7 +133,7 @@ def check(elf):
     for line in primary.splitlines():
         m = re.match(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*$', line)
         if m: primary_ops.append((m[2], m[3]))
-    common = [('mov','x9, #2147483648'),('msr','HCR_EL2, x9'),
+    common = [('mov','x9, #16'),('movk','x9, #32768, lsl #16'),('msr','HCR_EL2, x9'),
               ('mov','x9, #13311'),('msr','CPTR_EL2, x9'),
               ('mov','x9, #0'),('msr','HSTR_EL2, x9'),
               ('mov','x9, #0'),('msr','VTTBR_EL2, x9'),

@@ -797,7 +797,7 @@ impl VmCtl {
         let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
         unsafe {
             gic.enable_virtual_timer_ppi()?;
-            gic.enable_spi(guest::get_host_console_irq())?;
+            gic.gicd_enable_irq(guest::get_host_console_irq())?;
         }
 
         tvisor_util::debug_util::enable_rx_interrupt()

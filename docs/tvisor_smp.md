@@ -2,13 +2,14 @@
 
 Status: approved design, 2026-10-25; implementation checkpoint updated 2026-10-31.
 Phases 11.0–11.3 are implemented. Phase 11.3 has passed one-secondary arrival,
-bounded failure and the full quick regression; its implementation is ready for
-user review. See the [11.3 completion handoff](phase11_3_status.md).
+bounded failure and the full quick regression and has been accepted. See the [11.3 completion handoff](phase11_3_status.md).
 The [2026-11-01 per-slot refactor](phase11_3_slot_refactor.md) removes duplicated
 bootstrap identity/stack storage and has repeated all Phase 11.3 acceptance gates.
 The subsequent [lifecycle/waiting refactor](phase11_3_lifecycle_refactor.md) separates
 CPU state from wait results and terminal boot policy; all scoped acceptance gates
-have passed again. Phases 11.4–11.6 remain implementation contracts.
+have passed again. [Phase 11.4 implementation and acceptance](phase11_4_status.md)
+is complete with passing scoped hardware acceptance and the full quick regression,
+and is ready for user review. Phases 11.5–11.6 remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in
 [Phase 11.0 status](phase11_0_status.md) and the

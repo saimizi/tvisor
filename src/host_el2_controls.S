@@ -1,5 +1,6 @@
 // Shared primary/secondary host baseline; clobbers x9 only. DAIF must be masked.
-    mov x9, #{host_hcr}
+    movz x9, #{host_hcr_lo}
+    movk x9, #{host_hcr_hi}, lsl #16
     msr hcr_el2, x9
     mov x9, #{host_cptr}
     msr cptr_el2, x9
