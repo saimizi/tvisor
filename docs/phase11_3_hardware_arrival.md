@@ -1,5 +1,9 @@
 # Phase 11.3 physical arrival and park acceptance
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 12, 2026-10-31. **PASS for the one-secondary cold-boot gate on Raspberry Pi
 4 Model B.**
 CPU1 completed generation 1 with `outcome=Success worker=Ok(Parked)` and zero

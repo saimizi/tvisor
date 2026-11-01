@@ -57,7 +57,8 @@ pub struct StartupResources {
     pub rodata: PhysRegion,
     pub writable: PhysRegion,
     pub tables: PhysRegion,
-    pub record: PhysRegion,
+    pub slots: PhysRegion,
+    pub config: PhysRegion,
     pub context: PhysRegion,
     pub release_page: PhysRegion,
     pub stack: StackLayout,
@@ -154,13 +155,19 @@ pub fn validate_resources<const N: usize>(
     if r.entry & 3 != 0
         || !r.code.contains_address(PhysAddr::new(r.entry))
         || r.vectors.size() < 2048
-        || !r.writable.contains_region(r.record)
+        || !r.writable.contains_region(r.slots)
         || !r.writable.contains_region(r.context)
-        || r.record.start().value() & 63 != 0
+        || r.slots.start().value() & 63 != 0
         || r.context.start().value() & 63 != 0
-        || r.record.size() != core::mem::size_of::<crate::secondary_record::RecordStorage>() as u64
+        || r.slots.size()
+            != core::mem::size_of::<[crate::pcpu::PcpuSlot<()>; crate::cpu_topology::MAX_CPUS]>()
+                as u64
         || r.context.size() != core::mem::size_of::<crate::pcpu::PcpuContext<()>>() as u64
-        || r.record.overlaps(r.context)
+        || !r.slots.contains_region(r.context)
+        || !r.writable.contains_region(r.config)
+        || r.config.start().value() & 63 != 0
+        || r.config.size() != core::mem::size_of::<crate::el2_policy::HostEl2ConfigStorage>() as u64
+        || r.config.overlaps(r.slots)
         || crate::pcpu::stack_layout(r.stack.guard_start).map_err(|_| ResourceError::Layout)?
             != r.stack
     {
@@ -187,7 +194,8 @@ pub fn validate_resources<const N: usize>(
         (r.rodata, false, false),
         (r.writable, true, false),
         (r.tables, true, false),
-        (r.record, true, false),
+        (r.slots, true, false),
+        (r.config, true, false),
         (r.context, true, false),
         (r.release_page, true, false),
     ] {
@@ -210,11 +218,13 @@ mod tests {
             rodata: region(0x102000, 4096),
             writable: region(0x103000, 8192),
             tables: region(0x800000, 16 * 4096),
-            record: region(
+            slots: region(
                 0x103fc0,
-                core::mem::size_of::<crate::secondary_record::RecordStorage>() as u64,
+                core::mem::size_of::<[crate::pcpu::PcpuSlot<()>; crate::cpu_topology::MAX_CPUS]>()
+                    as u64,
             ),
-            context: region(0x104200, 64),
+            config: region(0x103000, 128),
+            context: region(0x104140, 64),
             release_page: region(0, 4096),
             stack: crate::pcpu::stack_layout(0x200000).unwrap(),
             entry: 0x100000,
@@ -306,11 +316,23 @@ mod tests {
                 ..r
             },
             StartupResources {
-                record: region(0x104fc0, r.record.size()),
+                slots: region(0x104fc0, r.slots.size()),
                 ..r
             },
             StartupResources {
-                context: r.record,
+                context: r.slots,
+                ..r
+            },
+            StartupResources {
+                config: region(r.config.start().value(), 64),
+                ..r
+            },
+            StartupResources {
+                config: region(r.slots.start().value(), 128),
+                ..r
+            },
+            StartupResources {
+                slots: region(r.slots.start().value(), 384),
                 ..r
             },
             StartupResources {
@@ -344,7 +366,7 @@ mod tests {
         );
     }
     #[test]
-    fn record_crossing_a_missing_page_is_rejected() {
+    fn slots_crossing_a_missing_page_is_rejected() {
         let mut storage = TableStorage::<16>::zeroed();
         let mut t = TableSet::new(&mut storage, 0x800000, 44).unwrap();
         t.map(Mapping {
@@ -357,7 +379,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            validate_range(&t, resources().record, true, false),
+            validate_range(&t, resources().slots, true, false),
             Err(ResourceError::Mapping)
         );
     }

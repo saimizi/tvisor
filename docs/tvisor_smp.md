@@ -4,6 +4,8 @@ Status: approved design, 2026-10-25; implementation checkpoint updated 2026-10-3
 Phases 11.0–11.3 are implemented. Phase 11.3 has passed one-secondary arrival,
 bounded failure and the full quick regression; its implementation is ready for
 user review. See the [11.3 completion handoff](phase11_3_status.md).
+The [2026-11-01 per-slot refactor](phase11_3_slot_refactor.md) removes duplicated
+bootstrap identity/stack storage and has repeated all Phase 11.3 acceptance gates.
 Phases 11.4–11.6 remain implementation contracts.
 
 Implementation progress and board observations for 11.0 are recorded in

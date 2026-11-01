@@ -1,5 +1,9 @@
 # Phase 11.3 quick regression with one parked secondary
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 14, 2026-10-31: **PASS on Raspberry Pi 4 Model B.** The complete quick
 profile ran with
 CPU1 parked and a one-vCPU Linux guest. Four boots, the smoke probe, the full

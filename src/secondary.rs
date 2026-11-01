@@ -2,19 +2,20 @@
 //! publishes a validated record and completes the spin-table release protocol.
 use core::{arch::global_asm, sync::atomic::Ordering};
 use tvisor_util::secondary_mailbox::Outcome;
-use tvisor_util::secondary_record::{RecordStorage, SecondaryRecord, StartupRecord};
+use tvisor_util::{
+    el2_policy::{HostEl2Config, HostEl2ConfigStorage},
+    pcpu::{PcpuContext, PcpuSlot},
+    secondary_startup::StartupView,
+};
 
 #[cfg(feature = "secondary-startup-timeout-test")]
 #[path = "secondary_timeout_test.rs"]
 mod timeout_test;
 
 #[unsafe(no_mangle)]
-static SECONDARY_RECORD: RecordStorage = RecordStorage::new();
-
-pub fn publish_record(data: StartupRecord) -> Result<(), &'static str> {
-    SECONDARY_RECORD
-        .publish(data)
-        .map_err(|_| "secondary record publication failed")
+static HOST_EL2_CONFIG: HostEl2ConfigStorage = HostEl2ConfigStorage::new();
+fn startup(id: usize, generation: u64) -> Option<StartupView<'static>> {
+    crate::pcpu::slot(id)?.startup_view(generation, HOST_EL2_CONFIG.get()?)
 }
 
 static BOOT_ATTEMPT: tvisor_util::secondary_boot::SecondaryBoot =
@@ -26,13 +27,12 @@ pub fn boot_status() -> tvisor_util::secondary_boot::BootStatus {
 /// Boot CPU waits without holding a resource lock. The physical counter is
 /// additionally bounded by polls so a broken counter cannot hang startup.
 fn wait_for_secondary(
+    id: usize,
     generation: u64,
     deadline: tvisor_util::secondary_boot::StartupDeadline,
     start: u64,
 ) -> Result<(), &'static str> {
-    let record = SECONDARY_RECORD
-        .get(generation)
-        .ok_or("secondary record is not published")?;
+    let record = startup(id, generation).ok_or("secondary slot startup is not published")?;
     let outcome = record.mailbox.wait_and_finish(generation, 0, deadline.ticks(), 100_000_000, || {
         let now: u64;
         unsafe { core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags)); }
@@ -69,11 +69,11 @@ fn wait_for_secondary(
     Ok(())
 }
 
-fn report_checkpoint(record: &SecondaryRecord) {
+fn report_checkpoint(record: StartupView<'_>) {
     let c = &record.checkpoint;
     tvisor_util::println!(
         "Phase 11.3 CPU{} checkpoint generation={} EL={:#x} MPIDR={:#x} SP={:#x} TPIDR={:#x} VBAR={:#x}",
-        record.logical_id,
+        record.identity.logical_id,
         record.generation,
         c.current_el.load(Ordering::Relaxed),
         c.affinity.load(Ordering::Relaxed),
@@ -170,21 +170,43 @@ __secondary_entry:
     mov x23, x9
     // Bit 6 is SMPEN
     tbz x9, #6, .Lsecondary_reject
-    // Only the explicitly published startup record may be read before Rust.
-    adrp x19, SECONDARY_RECORD
-    add x19, x19, :lo12:SECONDARY_RECORD
-    ldr x20, [x19, #{generation}]
-    cbz x20, .Lsecondary_reject
     mrs x9, mpidr_el1
     mov x24, x9
     // Construct the full affinity mask without a literal-pool read.
     movz x10, #0xffff
     movk x10, #0x00ff, lsl #16
     movk x10, #0x00ff, lsl #32
-    and x9, x9, x10
-    ldr x10, [x19, #{affinity}]
-    cmp x9, x10
+    and x14, x9, x10
+    // Scan the fixed slot array; never use MPIDR as an array index.
+    adrp x15, PCPU_SLOTS
+    add x15, x15, :lo12:PCPU_SLOTS
+    mov x16, #0
+    mov x19, xzr
+    .global __secondary_lookup
+__secondary_lookup:
+    ldr x10, [x15, #{present}]
+    cmp x10, #1
+    b.ne .Lsecondary_next_slot
+    ldr x10, [x15, #{affinity}]
+    cmp x10, x14
+    b.ne .Lsecondary_next_slot
+    cbnz x19, .Lsecondary_reject
+    mov x19, x15
+    mov x18, x16
+.Lsecondary_next_slot:
+    add x15, x15, #{slot_size}
+    add x16, x16, #1
+    cmp x16, #{max_cpus}
+    b.lo __secondary_lookup
+    cbz x19, .Lsecondary_reject
+    // Context begins at slot offset zero. The matched slot index must agree
+    // with its published logical ID; a secondary can never use the boot slot.
+    ldr x9, [x19, #{logical_id}]
+    cbz x9, .Lsecondary_reject
+    cmp x9, x18
     b.ne .Lsecondary_reject
+    ldr x20, [x19, #{mailbox}]
+    cbz x20, .Lsecondary_reject
     // Validate all stack/context inputs before installing either pointer.
     ldr x9, [x19, #{logical_id}]
     cbz x9, .Lsecondary_reject
@@ -202,11 +224,13 @@ __secondary_entry:
     b.ls .Lsecondary_reject
     cmp x11, #{stack_size}
     b.ne .Lsecondary_reject
-    ldr x12, [x19, #{context}]
+    mov x12, x19
     cbz x12, .Lsecondary_reject
     tst x12, #63
     b.ne .Lsecondary_reject
-    ldr x10, [x19, #{root}]
+    adrp x17, HOST_EL2_CONFIG
+    add x17, x17, :lo12:HOST_EL2_CONFIG
+    ldr x10, [x17, #{root}]
     cbz x10, .Lsecondary_reject
     tst x10, #4095
     b.ne .Lsecondary_reject
@@ -220,11 +244,11 @@ __secondary_stack_ready:
     add x9, x9, :lo12:__el2_vectors
     msr vbar_el2, x9
 "#, include_str!("host_el2_controls.S"), r#"
-    ldr x9, [x19, #{mair}]
+    ldr x9, [x17, #{mair}]
     msr mair_el2, x9
-    ldr x9, [x19, #{tcr}]
+    ldr x9, [x17, #{tcr}]
     msr tcr_el2, x9
-    ldr x9, [x19, #{root}]
+    ldr x9, [x17, #{root}]
     msr ttbr0_el2, x9
     isb
     dsb sy
@@ -232,7 +256,7 @@ __secondary_stack_ready:
     ic iallu
     dsb sy
     isb
-    ldr x9, [x19, #{sctlr}]
+    ldr x9, [x17, #{sctlr}]
     msr sctlr_el2, x9
     isb
     // Coherency and mappings must be valid before an acquire atomic access.
@@ -248,6 +272,7 @@ __secondary_rust_boundary:
     mov x2, x22
     mov x3, x23
     mov x4, x24
+    mov x5, x20
     bl secondary_main
 .Lsecondary_reject:
     .global __secondary_rejected
@@ -263,29 +288,44 @@ __secondary_rejected:
     host_cntvoff = const tvisor_util::el2_policy::HOST_CNTVOFF,
     host_cnthctl = const tvisor_util::el2_policy::HOST_CNTHCTL,
     host_timer = const tvisor_util::el2_policy::DISABLED_TIMER_CTL,
-    logical_id = const core::mem::offset_of!(SecondaryRecord, logical_id),
-    stack_bottom = const core::mem::offset_of!(SecondaryRecord, stack_bottom),
+    logical_id = const core::mem::offset_of!(PcpuContext<()>, logical_id),
+    stack_bottom = const core::mem::offset_of!(PcpuContext<()>, stack_bottom),
+    stack_top = const core::mem::offset_of!(PcpuContext<()>, stack_top),
+    affinity = const core::mem::offset_of!(PcpuContext<()>, affinity),
+    present = const core::mem::offset_of!(PcpuContext<()>, present),
     max_cpus = const tvisor_util::cpu_topology::MAX_CPUS,
+    slot_size = const core::mem::size_of::<PcpuSlot<()>>(),
     stack_size = const tvisor_util::pcpu::STACK_SIZE,
-    affinity = const core::mem::offset_of!(SecondaryRecord, affinity),
-    generation = const core::mem::offset_of!(SecondaryRecord, generation),
-    stack_top = const core::mem::offset_of!(SecondaryRecord, stack_top),
-    context = const core::mem::offset_of!(SecondaryRecord, context),
-    mair = const core::mem::offset_of!(SecondaryRecord, mair),
-    tcr = const core::mem::offset_of!(SecondaryRecord, tcr),
-    root = const core::mem::offset_of!(SecondaryRecord, root),
-    sctlr = const core::mem::offset_of!(SecondaryRecord, sctlr),
-    mailbox = const core::mem::offset_of!(SecondaryRecord, mailbox),
+    mair = const core::mem::offset_of!(HostEl2Config, mair),
+    tcr = const core::mem::offset_of!(HostEl2Config, tcr),
+    root = const core::mem::offset_of!(HostEl2Config, root),
+    sctlr = const core::mem::offset_of!(HostEl2Config, sctlr),
+    mailbox = const core::mem::offset_of!(PcpuSlot<()>, startup),
 );
 
 #[unsafe(no_mangle)]
 extern "C" fn secondary_main(
-    record: &SecondaryRecord,
+    slot_pointer: *const PcpuSlot<crate::vcpu::Vcpu>,
     entry_sctlr: u64,
     midr: u64,
     cpuectlr: u64,
     mpidr: u64,
+    generation: u64,
 ) -> ! {
+    // Assembly acquired the matched slot. Validate the pointer against static
+    // storage before obtaining any Rust reference, then acquire the same token.
+    let Some(slot) = crate::pcpu::PCPU_SLOTS
+        .iter()
+        .find(|slot| core::ptr::eq(*slot, slot_pointer))
+    else {
+        tvisor_util::halt();
+    };
+    let Some(config) = HOST_EL2_CONFIG.get() else {
+        tvisor_util::halt();
+    };
+    let Some(record) = slot.startup_view(generation, config) else {
+        tvisor_util::halt();
+    };
     if record.mailbox.enter(record.generation).is_err() {
         loop {
             unsafe {
@@ -333,10 +373,10 @@ extern "C" fn secondary_main(
         static __el2_vectors: u8;
     }
     let context_valid = crate::pcpu::validate_secondary_context(
-        record.logical_id,
-        record.affinity,
-        record.stack_bottom,
-        record.stack_top,
+        record.identity.logical_id,
+        record.identity.affinity,
+        record.identity.stack_bottom,
+        record.identity.stack_top,
         state.tpidr,
     );
     let failures = validate(
@@ -374,8 +414,10 @@ pub fn start_one(
         .map_err(|_| "secondary boot already attempted")?;
     let result = start_attempt(fdt, policy, attempt);
     if result.is_err() {
-        if let Some(record) = SECONDARY_RECORD.get(1) {
-            let _ = record.mailbox.finish(1, Outcome::BootAborted);
+        for id in 1..tvisor_util::cpu_topology::MAX_CPUS {
+            if let Some(record) = startup(id, 1) {
+                let _ = record.mailbox.finish(1, Outcome::BootAborted);
+            }
         }
         #[cfg(feature = "secondary-startup-timeout-test")]
         timeout_test::observe_terminal_failure();
@@ -424,8 +466,23 @@ fn start_attempt(
     }
     let address = validate_spin_table_target(topology.cpus(), id)
         .map_err(|_| "invalid secondary release target")?;
-    let (affinity, stack_top, context) =
-        crate::pcpu::secondary_entry(id).ok_or("secondary resources unavailable")?;
+    // Phase 11.3 releases only logical CPU1; other slots remain unpublished.
+    if id != 1 {
+        return Err("Phase 11.3 requires logical CPU1");
+    }
+    let slot = crate::pcpu::slot(id).ok_or("secondary slot unavailable")?;
+    let identity = slot.identity().ok_or("secondary resources unavailable")?;
+    if !tvisor_util::pcpu::find_slot_by_affinity(&crate::pcpu::PCPU_SLOTS, identity.affinity)
+        .is_some_and(|matched| core::ptr::eq(matched, slot))
+    {
+        return Err("secondary affinity is not uniquely routed to its slot");
+    }
+    let (affinity, stack_bottom, stack_top, context) = (
+        identity.affinity,
+        identity.stack_bottom,
+        identity.stack_top,
+        identity.context,
+    );
     if !topology
         .cpus()
         .iter()
@@ -448,9 +505,7 @@ fn start_attempt(
     {
         return Err("active host translation differs from startup policy");
     }
-    let stack_bottom = stack_top
-        .checked_sub(tvisor_util::pcpu::STACK_SIZE)
-        .ok_or("invalid secondary stack")?;
+
     let frequency: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack, preserves_flags));
@@ -506,18 +561,13 @@ fn start_attempt(
     ] {
         validate_identity_range(start, end)?;
     }
-    publish_record(StartupRecord {
-        logical_id: id as u64,
-        affinity,
-        stack_bottom,
-        stack_top,
-        context,
-        mair: policy.mair(),
-        tcr: policy.tcr(),
-        root: policy.root(),
-        sctlr: policy.sctlr(),
-        generation: 1,
-    })?;
+    HOST_EL2_CONFIG.publish(policy)?;
+    slot.publish_startup(
+        1,
+        HOST_EL2_CONFIG
+            .get()
+            .ok_or("host configuration unavailable")?,
+    )?;
     use tvisor_util::{
         startup_resources::{StartupResources, release_page},
         system_info::PhysRegion,
@@ -543,11 +593,16 @@ fn start_attempt(
         )?,
         writable: bounds(core::ptr::addr_of!(__writable_start) as u64, image_end)?,
         tables: bounds(tables_start, tables_end)?,
-        record: PhysRegion::new(
-            PhysAddr::new(core::ptr::addr_of!(SECONDARY_RECORD) as u64),
-            core::mem::size_of::<RecordStorage>() as u64,
+        slots: PhysRegion::new(
+            PhysAddr::new(core::ptr::addr_of!(crate::pcpu::PCPU_SLOTS) as u64),
+            core::mem::size_of_val(&crate::pcpu::PCPU_SLOTS) as u64,
         )
-        .map_err(|_| "invalid record region")?,
+        .map_err(|_| "invalid slot array region")?,
+        config: PhysRegion::new(
+            PhysAddr::new(core::ptr::addr_of!(HOST_EL2_CONFIG) as u64),
+            core::mem::size_of::<HostEl2ConfigStorage>() as u64,
+        )
+        .map_err(|_| "invalid shared host config region")?,
         context: PhysRegion::new(
             PhysAddr::new(context),
             core::mem::size_of::<tvisor_util::pcpu::PcpuContext<()>>() as u64,
@@ -568,9 +623,7 @@ fn start_attempt(
     let stacks = crate::pcpu::prepared_stacks()?;
     let frozen = crate::mm::validate_and_freeze_startup(&resources, &stacks)
         .map_err(|_| "startup mapping validation/freeze failed")?;
-    let record = SECONDARY_RECORD
-        .get(1)
-        .ok_or("startup record unavailable")?;
+    let record = startup(id, 1).ok_or("startup record unavailable")?;
     let ctr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
@@ -593,7 +646,7 @@ fn start_attempt(
     let start = io
         .release_start()
         .ok_or("missing secondary release timestamp")?;
-    if let Err(error) = wait_for_secondary(1, deadline, start)
+    if let Err(error) = wait_for_secondary(id, 1, deadline, start)
         .and_then(|()| crate::smp::verify_release_result(PhysAddr::new(address), resources.entry))
     {
         attempt.wait_failed();

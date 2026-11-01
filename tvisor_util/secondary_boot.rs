@@ -1,5 +1,5 @@
 //! One-shot boot gate and validated physical-counter deadline.
-use crate::{secondary_mailbox::Outcome, secondary_record::SecondaryRecord};
+use crate::{secondary_mailbox::Outcome, secondary_startup::StartupView};
 use core::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -74,7 +74,7 @@ impl Attempt<'_> {
     }
     pub fn complete(
         self,
-        record: &SecondaryRecord,
+        record: StartupView<'_>,
         generation: u64,
         fatal: bool,
     ) -> Result<GuestPermit, BootError> {
@@ -146,29 +146,11 @@ impl StartupDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        el2_policy::HostTranslation,
-        secondary_record::{RecordStorage, StartupRecord},
-    };
-    fn record() -> RecordStorage {
-        let s = RecordStorage::new();
-        let p = HostTranslation::new(0x430000, 4).unwrap();
-        s.publish(StartupRecord {
-            logical_id: 1,
-            affinity: 1,
-            stack_bottom: 0x800000,
-            stack_top: 0x810000,
-            context: 0x420000,
-            mair: p.mair(),
-            tcr: p.tcr(),
-            root: p.root(),
-            sctlr: p.sctlr(),
-            generation: 7,
-        })
-        .unwrap();
-        s
+    use crate::secondary_startup::test_fixture::Fixture;
+    fn record() -> std::boxed::Box<Fixture> {
+        Fixture::new(1, 1, 0x800000, 0x430000, 7)
     }
-    fn park(s: &RecordStorage) {
+    fn park(s: &Fixture) {
         let m = &s.get(7).unwrap().mailbox;
         m.enter(7).unwrap();
         m.acknowledge(7).unwrap();

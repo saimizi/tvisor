@@ -1,5 +1,9 @@
 # Phase 11.3 boot integration
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 10, 2026-10-31. **Supported-board builds now attempt one secondary release
 before entering Linux.** This is an implementation milestone, not a hardware
 acceptance PASS. No board was operated for this task. Tasks 11–15 remain.

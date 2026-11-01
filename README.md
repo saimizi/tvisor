@@ -62,7 +62,10 @@ loop. It also identifies Cortex-A72 before checking `CPUECTLR_EL1.SMPEN`.
 Coherency is a platform precondition: SMPEN is a defensive maintenance check,
 not proof of coherency, and the trampoline does not establish coherency itself.
 The boot CPU validates and publishes the physical entry and startup resources
-before releasing the secondary.
+before releasing the secondary. The trampoline finds the matching per-CPU slot
+by full affinity and loads stack bounds from `PcpuContext`; synchronization and
+diagnostics live in that slot, with EL2 configuration shared separately. See the
+[per-slot startup design](docs/phase11_3_slot_refactor.md).
 
 Disabled data cache alone does not prove a clean cache history. Firmware must
 also ensure safe instruction fetch and no conflicting dirty cache state; the

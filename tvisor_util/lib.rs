@@ -34,7 +34,7 @@ pub mod secondary_backend;
 pub mod secondary_boot;
 pub mod secondary_entry;
 pub mod secondary_mailbox;
-pub mod secondary_record;
+pub mod secondary_startup;
 pub mod secondary_validation;
 pub mod startup_publication;
 pub mod startup_resources;

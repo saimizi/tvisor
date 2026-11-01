@@ -1,5 +1,9 @@
 # Phase 11.3 local acceptance review
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 11, 2026-10-31. **PASS for the local validation gate.** This is not a
 Phase 11.3 hardware PASS. Supported-board builds retain Task 10's enabled release
 path. No hardware was operated for this task.

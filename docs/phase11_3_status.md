@@ -1,5 +1,13 @@
 # Phase 11.3 completion and review handoff
 
+Current update, 2026-11-01: the [per-slot refactor](phase11_3_slot_refactor.md)
+supersedes the singleton layout described below. Implementation and repeated acceptance are complete: 167 host tests per profile,
+warning-free normal/injected builds, ten rejected binary mutations per image,
+physical timeout/late-arrival and the complete four-boot quick regression passed.
+The soak completed 600.459 seconds and 8,137 memory passes, with no wakeups over
+500 ms. Final power-off was independently verified.
+The dated Task 1–15 handoff below remains historical evidence.
+
 2026-10-31: **implementation and scoped acceptance complete; ready for user
 review.** Tasks 1–15 are complete. This records the implemented state and evidence,
 not user approval or a merge. Validation captured an uncommitted working tree at base

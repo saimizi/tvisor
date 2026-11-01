@@ -6,7 +6,166 @@ use crate::{
     page_allocator::{AllocatorError, PageAllocator},
     system_info::{FixedList, PhysAddr},
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::{
+    el2_policy::HostEl2Config,
+    secondary_startup::{SecondaryStartup, StartupView},
+};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+/// Acquired snapshot of immutable context fields, never persisted as startup storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuIdentity {
+    pub logical_id: u64,
+    pub affinity: u64,
+    pub stack_bottom: u64,
+    pub stack_top: u64,
+    pub context: u64,
+}
+
+#[repr(C, align(64))]
+pub struct PcpuSlot<V> {
+    context: UnsafeCell<PcpuContext<V>>,
+    pub startup: SecondaryStartup,
+    prepared: AtomicBool,
+    claimed: AtomicBool,
+}
+// SAFETY: context initialization is claimed once; identity/bounds are then frozen.
+// Only the owning CPU may access mutable host_sp/active_vcpu via the raw pointer.
+// Shared Rust APIs reference only atomics and individually read immutable fields.
+unsafe impl<V> Sync for PcpuSlot<V> {}
+impl<V> PcpuSlot<V> {
+    pub const fn new() -> Self {
+        Self {
+            context: UnsafeCell::new(PcpuContext::empty()),
+            startup: SecondaryStartup::new(),
+            prepared: AtomicBool::new(false),
+            claimed: AtomicBool::new(false),
+        }
+    }
+    pub fn prepare(
+        &self,
+        id: usize,
+        affinity: u64,
+        stack: StackLayout,
+    ) -> Result<(), &'static str> {
+        if id >= MAX_CPUS
+            || affinity & !crate::cpu_topology::MPIDR_AFFINITY_MASK != 0
+            || stack.bottom == 0
+            || stack_layout(stack.guard_start).ok() != Some(stack)
+        {
+            return Err("invalid CPU preparation");
+        }
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            return Err("CPU slot already prepared");
+        }
+        unsafe {
+            self.context.get().write(PcpuContext {
+                host_sp: 0,
+                active_vcpu: core::ptr::null_mut(),
+                logical_id: id as u64,
+                affinity,
+                stack_bottom: stack.bottom,
+                stack_top: stack.top,
+                present: 1,
+            });
+        }
+        self.prepared.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub fn is_prepared(&self) -> bool {
+        self.prepared.load(Ordering::Acquire)
+    }
+    pub fn context_ptr(&self) -> *mut PcpuContext<V> {
+        self.context.get()
+    }
+    pub fn identity(&self) -> Option<CpuIdentity> {
+        if !self.is_prepared() {
+            return None;
+        }
+        // No reference to the whole context: its owner can mutate other fields.
+        let c = self.context.get();
+        Some(unsafe {
+            CpuIdentity {
+                logical_id: core::ptr::addr_of!((*c).logical_id).read(),
+                affinity: core::ptr::addr_of!((*c).affinity).read(),
+                stack_bottom: core::ptr::addr_of!((*c).stack_bottom).read(),
+                stack_top: core::ptr::addr_of!((*c).stack_top).read(),
+                context: c as u64,
+            }
+        })
+    }
+    pub fn publish_startup(
+        &self,
+        generation: u64,
+        config: &HostEl2Config,
+    ) -> Result<(), &'static str> {
+        let identity = self.identity().ok_or("CPU slot not prepared")?;
+        if identity.logical_id == 0
+            || config.mair != crate::el2_policy::HOST_MAIR
+            || config.sctlr != crate::el2_policy::HOST_SCTLR
+            || !crate::el2_policy::HostTranslation::new(config.root, ((config.tcr >> 16) & 7) as u8)
+                .is_ok_and(|p| p.tcr() == config.tcr)
+        {
+            return Err("invalid startup configuration");
+        }
+        self.startup
+            .mailbox
+            .publish(generation)
+            .map_err(|_| "startup already published or invalid generation")
+    }
+    pub fn startup_view<'a>(
+        &'a self,
+        generation: u64,
+        config: &'a HostEl2Config,
+    ) -> Option<StartupView<'a>> {
+        if !self.startup.mailbox.observe_ready(generation) {
+            return None;
+        }
+        Some(StartupView::new(
+            self.identity()?,
+            config,
+            generation,
+            &self.startup,
+            self as *const _ as u64,
+        ))
+    }
+}
+const _: () = {
+    assert!(core::mem::offset_of!(PcpuSlot<()>, context) == 0);
+    assert!(core::mem::offset_of!(PcpuSlot<()>, startup) == 64);
+    assert!(core::mem::size_of::<PcpuSlot<()>>() == 384);
+    assert!(core::mem::align_of::<PcpuSlot<()>>() == 64);
+    assert!(core::mem::offset_of!(PcpuContext<()>, logical_id) == 16);
+    assert!(core::mem::offset_of!(PcpuContext<()>, affinity) == 24);
+    assert!(core::mem::offset_of!(PcpuContext<()>, stack_bottom) == 32);
+    assert!(core::mem::offset_of!(PcpuContext<()>, stack_top) == 40);
+    assert!(core::mem::offset_of!(PcpuContext<()>, present) == 48);
+};
+
+/// Bounded lookup over immutable prepared identities, mirroring entry assembly.
+/// Full affinities may be sparse; duplicate matches are never routed arbitrarily.
+pub fn find_slot_by_affinity<V>(slots: &[PcpuSlot<V>], mpidr: u64) -> Option<&PcpuSlot<V>> {
+    if slots.len() > MAX_CPUS {
+        return None;
+    }
+    let affinity = mpidr & crate::cpu_topology::MPIDR_AFFINITY_MASK;
+    let mut found = None;
+    for slot in slots {
+        if slot
+            .identity()
+            .is_some_and(|identity| identity.affinity == affinity)
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(slot);
+        }
+    }
+    found
+}
 
 pub const STACK_SIZE: u64 = 64 * 1024;
 pub const GUARD_SIZE: u64 = PAGE_SIZE as u64;
@@ -164,27 +323,6 @@ const _: () = assert!(core::mem::align_of::<PcpuContext<()>>() == 64);
 const _: () = assert!(core::mem::offset_of!(PcpuContext<()>, host_sp) == 0);
 const _: () = assert!(core::mem::offset_of!(PcpuContext<()>, active_vcpu) == 8);
 
-/// One-time resource preparation publication, not a CPU release protocol.
-/// All release generations and acknowledgements live in SecondaryRecord.
-pub struct CpuPreparation {
-    prepared: AtomicBool,
-}
-impl CpuPreparation {
-    pub const fn new() -> Self {
-        Self {
-            prepared: AtomicBool::new(false),
-        }
-    }
-    pub fn publish_prepared(&self) -> Result<(), bool> {
-        self.prepared
-            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-            .map(|_| ())
-    }
-    pub fn is_prepared(&self) -> bool {
-        self.prepared.load(Ordering::Acquire)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,11 +401,12 @@ mod tests {
         let context = PcpuContext::<()>::empty();
         assert!(context.active_vcpu.is_null());
         assert_eq!(context.host_sp, 0);
-        let state = CpuPreparation::new();
+        let state = PcpuSlot::<()>::new();
         assert!(!state.is_prepared());
-        state.publish_prepared().unwrap();
+        let layout = stack_layout(0x7ff000).unwrap();
+        state.prepare(1, 0x100, layout).unwrap();
         assert!(state.is_prepared());
-        assert!(state.publish_prepared().is_err());
+        assert!(state.prepare(1, 0x100, layout).is_err());
     }
     fn topology(enabled: &[bool]) -> CpuTopology {
         use dtoolkit::{

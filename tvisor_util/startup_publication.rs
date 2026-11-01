@@ -4,7 +4,7 @@ use crate::{
     cpu_topology::CpuDescriptor,
     secondary_entry::{EntryContract, validate_spin_table_release},
     secondary_mailbox::{Outcome, WorkerState},
-    secondary_record::SecondaryRecord,
+    secondary_startup::StartupView,
     startup_resources::FrozenStartup,
     system_info::{PhysAddr, PhysRegion},
 };
@@ -56,8 +56,11 @@ impl Iterator for CacheLines {
 /// clean completes one DC CVAC issuance; complete is DSB SY, not just a compiler fence.
 pub trait PublicationIo {
     /// Identity VA=PA in the hardware backend; hosted tests model PA separately.
-    fn record_address(&self, record: &SecondaryRecord) -> u64 {
-        record as *const _ as u64
+    fn slot_address(&self, view: StartupView<'_>) -> u64 {
+        view.slot_address()
+    }
+    fn config_address(&self, view: StartupView<'_>) -> u64 {
+        view.config_address()
     }
 
     fn clean(&mut self, address: u64) -> Result<(), PublicationError>;
@@ -101,14 +104,14 @@ impl PublicationPlan {
                 .map_err(|_| PublicationError::Preconditions)?;
         Ok([r.code, r.vectors, r.rodata, r.writable, r.tables, stack])
     }
-    /// Consume actual frozen-resource evidence, the published production record
+    /// Consume actual frozen-resource evidence, the acquired per-slot view
     /// and the platform contract; no caller-supplied resource-ready booleans.
     pub fn publish(
         self,
         cpus: &[CpuDescriptor],
         target: usize,
         backend: EntryContract,
-        record: &SecondaryRecord,
+        record: StartupView<'_>,
         io: &mut impl PublicationIo,
     ) -> Result<PublishedStartup, PublicationError> {
         let address = validate_spin_table_release(cpus, target, backend)
@@ -120,19 +123,26 @@ impl PublicationPlan {
             .ok_or(PublicationError::Preconditions)?;
         if record.mailbox.state(record.generation) != Ok(WorkerState::Ready)
             || record.mailbox.outcome() != Outcome::Pending
-            || record.mair != crate::el2_policy::HOST_MAIR
-            || record.sctlr != crate::el2_policy::HOST_SCTLR
-            || !crate::el2_policy::HostTranslation::new(record.root, ((record.tcr >> 16) & 7) as u8)
-                .is_ok_and(|p| p.tcr() == record.tcr)
-            || io.record_address(record) != r.record.start().value()
+            || record.config.mair != crate::el2_policy::HOST_MAIR
+            || record.config.sctlr != crate::el2_policy::HOST_SCTLR
+            || !crate::el2_policy::HostTranslation::new(
+                record.config.root,
+                ((record.config.tcr >> 16) & 7) as u8,
+            )
+            .is_ok_and(|p| p.tcr() == record.config.tcr)
+            || io.slot_address(record) != r.context.start().value()
+            || io.slot_address(record)
+                != r.slots.start().value()
+                    + target as u64 * core::mem::size_of::<crate::pcpu::PcpuSlot<()>>() as u64
+            || io.config_address(record) != r.config.start().value()
             || address != self.cell
-            || record.logical_id != target as u64
-            || record.affinity != cpu.affinity
+            || record.identity.logical_id != target as u64
+            || record.identity.affinity != cpu.affinity
             || !record.mailbox.observe_ready(record.generation)
-            || record.context != r.context.start().value()
-            || record.root != r.root
-            || record.stack_bottom != r.stack.bottom
-            || record.stack_top != r.stack.top
+            || record.identity.context != record.slot_address()
+            || record.config.root != r.root
+            || record.identity.stack_bottom != r.stack.bottom
+            || record.identity.stack_top != r.stack.top
         {
             return Err(PublicationError::Preconditions);
         }
@@ -168,9 +178,8 @@ mod tests {
     use super::*;
     use crate::{
         cpu_topology::StartupMethod,
-        el2_policy::HostTranslation,
         el2_stage1_translation::{Mapping, MemoryType, TableSet, TableStorage},
-        secondary_record::{RecordStorage, StartupRecord},
+        secondary_startup::test_fixture::Fixture,
         startup_resources::BootTables,
     };
     #[derive(Debug, PartialEq, Eq)]
@@ -187,6 +196,7 @@ mod tests {
         value: u64,
         fail_at: Option<usize>,
         wrong_record: bool,
+        wrong_config: bool,
     }
     impl Io {
         fn event(&mut self, event: Event) -> Result<(), PublicationError> {
@@ -199,11 +209,18 @@ mod tests {
         }
     }
     impl PublicationIo for Io {
-        fn record_address(&self, _: &SecondaryRecord) -> u64 {
+        fn slot_address(&self, _: StartupView<'_>) -> u64 {
             if self.wrong_record {
-                0x103040
+                0x1031c0
             } else {
-                0x103000
+                0x103180
+            }
+        }
+        fn config_address(&self, _: StartupView<'_>) -> u64 {
+            if self.wrong_config {
+                0x103840
+            } else {
+                0x103800
             }
         }
         fn clean(&mut self, a: u64) -> Result<(), PublicationError> {
@@ -226,15 +243,19 @@ mod tests {
     fn region(a: u64, n: u64) -> PhysRegion {
         PhysRegion::new(PhysAddr::new(a), n).unwrap()
     }
-    fn fixture(cell: u64) -> (FrozenStartup, RecordStorage, [CpuDescriptor; 2]) {
+    fn fixture(cell: u64) -> (FrozenStartup, std::boxed::Box<Fixture>, [CpuDescriptor; 2]) {
         let r = crate::startup_resources::StartupResources {
             code: region(0x100000, 4096),
             vectors: region(0x101000, 4096),
             rodata: region(0x102000, 4096),
             writable: region(0x103000, 4096),
             tables: region(0x800000, 16 * 4096),
-            record: region(0x103000, core::mem::size_of::<RecordStorage>() as u64),
-            context: region(0x103800, 64),
+            slots: region(
+                0x103000,
+                core::mem::size_of::<[crate::pcpu::PcpuSlot<()>; 4]>() as u64,
+            ),
+            config: region(0x103800, 128),
+            context: region(0x103180, 64),
             release_page: region(cell & !4095, 4096),
             stack: crate::pcpu::stack_layout(0x200000).unwrap(),
             entry: 0x100000,
@@ -264,22 +285,7 @@ mod tests {
         crate::pcpu::map_stack(&mut tables, r.stack).unwrap();
         let mut gate = BootTables::new(tables);
         let frozen = gate.freeze_startup(r, core::iter::once(r.stack)).unwrap();
-        let record = RecordStorage::new();
-        let p = HostTranslation::new(r.root, 4).unwrap();
-        record
-            .publish(StartupRecord {
-                logical_id: 1,
-                affinity: 0x100,
-                stack_bottom: r.stack.bottom,
-                stack_top: r.stack.top,
-                context: r.context.start().value(),
-                root: p.root(),
-                mair: p.mair(),
-                tcr: p.tcr(),
-                sctlr: p.sctlr(),
-                generation: 7,
-            })
-            .unwrap();
+        let record = Fixture::new(1, 0x100, 0x201000, r.root, 7);
         let cpus = [
             CpuDescriptor {
                 affinity: 0,
@@ -362,11 +368,12 @@ mod tests {
         }
     }
     #[test]
-    fn unverified_backend_changed_target_and_stale_record_issue_no_maintenance_or_write() {
-        for case in 0..8 {
+    fn unverified_backend_changed_target_or_stale_startup_issues_no_maintenance_or_write() {
+        for case in 0..10 {
             let (frozen, s, mut cpus) = fixture(0xe0);
             let mut io = Io::default();
             let mut b = backend();
+            let mut view = s.get(7).unwrap();
             match case {
                 0 => b.coherent = false,
                 1 => b.el2_mmu_off = false,
@@ -380,6 +387,8 @@ mod tests {
                     .unwrap(),
                 5 => io.wrong_record = true,
                 6 => s.get(7).unwrap().mailbox.enter(7).unwrap(),
+                8 => io.wrong_config = true,
+                9 => view.generation = 8,
                 _ => {
                     cpus[1].startup = StartupMethod::SpinTable {
                         release_address: 0xe8,
@@ -389,7 +398,7 @@ mod tests {
             assert!(
                 PublicationPlan::new(frozen, 0xe0, 64)
                     .unwrap()
-                    .publish(&cpus, 1, b, s.get(7).unwrap(), &mut io)
+                    .publish(&cpus, 1, b, view, &mut io)
                     .is_err()
             );
             assert!(io.events.is_empty());

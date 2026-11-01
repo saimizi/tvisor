@@ -1,7 +1,7 @@
 //! Opt-in hardware acceptance instrumentation, absent from normal builds.
 //! Delay only after coherent entry, local validation and checkpoint writes.
 //! Never change mappings, registers, release routing or publication maintenance.
-use super::{BOOT_ATTEMPT, SECONDARY_RECORD, physical_counter, report_checkpoint};
+use super::{BOOT_ATTEMPT, physical_counter, report_checkpoint, startup};
 use core::sync::atomic::Ordering;
 use tvisor_util::{
     println,
@@ -41,7 +41,7 @@ pub(super) fn delay_acknowledgement() {
 /// Observe a real late arrival without retrying release or minting a permit.
 /// Invoked after the production attempt and abort-finalization have completed.
 pub(super) fn observe_terminal_failure() {
-    let Some(record) = SECONDARY_RECORD.get(1) else {
+    let Some(record) = startup(1, 1) else {
         println!("Phase 11.3 timeout-test FAIL: no retained record");
         return;
     };
@@ -79,14 +79,12 @@ pub(super) fn observe_terminal_failure() {
         record.mailbox.finish(1, Outcome::Success) == Err(ProtocolError::AlreadyFinished);
     // This probes only the one-shot gate; it never calls start_one/release again.
     let retry_rejected = matches!(BOOT_ATTEMPT.begin(), Err(BootError::AlreadyAttempted));
-    let retained = SECONDARY_RECORD
-        .get(1)
-        .is_some_and(|again| core::ptr::eq(record, again))
+    let retained = startup(1, 1).is_some_and(|again| record.slot_address() == again.slot_address())
         && crate::pcpu::validate_secondary_context(
-            record.logical_id,
-            record.affinity,
-            record.stack_bottom,
-            record.stack_top,
+            record.identity.logical_id,
+            record.identity.affinity,
+            record.identity.stack_bottom,
+            record.identity.stack_top,
             record.checkpoint.tpidr.load(Ordering::Relaxed),
         );
     unsafe extern "C" {
@@ -96,7 +94,7 @@ pub(super) fn observe_terminal_failure() {
         .and_then(|topology| {
             tvisor_util::secondary_entry::validate_spin_table_target(
                 topology.cpus(),
-                record.logical_id as usize,
+                record.identity.logical_id as usize,
             )
             .ok()
         })
@@ -115,12 +113,12 @@ pub(super) fn observe_terminal_failure() {
         && record.mailbox.outcome() == Outcome::TimedOut
         && BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
     println!(
-        "Phase 11.3 timeout-test retained record={:#x} context={:#x} stack=[{:#x}, {:#x}) root={:#x}",
-        record as *const _ as u64,
-        record.context,
-        record.stack_bottom,
-        record.stack_top,
-        record.root
+        "Phase 11.3 timeout-test retained slot={:#x} context={:#x} stack=[{:#x}, {:#x}) root={:#x}",
+        record.slot_address(),
+        record.identity.context,
+        record.identity.stack_bottom,
+        record.identity.stack_top,
+        record.config.root
     );
     println!(
         "Phase 11.3 timeout-test {}: boot={:?} outcome={:?} worker={:?} late_success_rejected={} retry_rejected={} retained={} cells_unchanged={}",

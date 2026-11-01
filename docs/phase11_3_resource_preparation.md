@@ -1,5 +1,9 @@
 # Phase 11.3 boot-side resource preparation
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 8, 2026-10-31. Production resource validation and the table mutation gate
 are in [`startup_resources.rs`](../tvisor_util/startup_resources.rs). The draft
 orchestrator in [`src/secondary.rs`](../src/secondary.rs) now uses them; boot

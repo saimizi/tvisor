@@ -1,5 +1,5 @@
 //! Allocation-free validation of the production secondary checkpoint.
-use crate::{cpu_topology::MPIDR_AFFINITY_MASK, el2_policy::*, secondary_record::SecondaryRecord};
+use crate::{cpu_topology::MPIDR_AFFINITY_MASK, el2_policy::*, secondary_startup::StartupView};
 use core::sync::atomic::Ordering;
 #[derive(Clone, Copy, Debug)]
 pub struct LocalState {
@@ -65,7 +65,7 @@ pub const FAILURE_NAMES: &[&str] = &[
     "LogicalId",
 ];
 pub fn validate(
-    r: &SecondaryRecord,
+    r: StartupView<'_>,
     s: LocalState,
     e: EntryState,
     vectors: u64,
@@ -75,17 +75,20 @@ pub fn validate(
     let checks = [
         r.generation != 0 && r.mailbox.observe_ready(r.generation), // Generation
         s.current_el == 8,                                          // ExceptionLevel
-        s.affinity & MPIDR_AFFINITY_MASK == r.affinity,             // Affinity
-        s.sp >= r.stack_bottom && s.sp < r.stack_top && s.sp & 15 == 0, // Stack
-        s.tpidr == r.context,                                       // ContextPointer
+        s.affinity & MPIDR_AFFINITY_MASK == r.identity.affinity,    // Affinity
+        s.sp >= r.identity.stack_bottom && s.sp < r.identity.stack_top && s.sp & 15 == 0, // Stack
+        s.tpidr == r.identity.context,                              // ContextPointer
         context_valid,                                              // ContextIdentity
         s.vbar == vectors && vectors != 0 && vectors & 2047 == 0,   // Vectors
-        s.mair == r.mair && s.mair == HOST_MAIR,                    // Mair
-        s.tcr == r.tcr
-            && crate::el2_policy::HostTranslation::new(r.root, ((r.tcr >> 16) & 7) as u8)
-                .is_ok_and(|p| p.tcr() == r.tcr), // Tcr
-        s.root == r.root,                                           // Root
-        s.sctlr == r.sctlr && s.sctlr == HOST_SCTLR,                // Sctlr
+        s.mair == r.config.mair && s.mair == HOST_MAIR,             // Mair
+        s.tcr == r.config.tcr
+            && crate::el2_policy::HostTranslation::new(
+                r.config.root,
+                ((r.config.tcr >> 16) & 7) as u8,
+            )
+            .is_ok_and(|p| p.tcr() == r.config.tcr), // Tcr
+        s.root == r.config.root,                                    // Root
+        s.sctlr == r.config.sctlr && s.sctlr == HOST_SCTLR,         // Sctlr
         s.daif & MASKED_DAIF == MASKED_DAIF,                        // InterruptMasks
         s.hcr == HOST_HCR,                                          // Hcr
         s.cptr == HOST_CPTR,                                        // Cptr
@@ -101,8 +104,8 @@ pub fn validate(
         e.sctlr & ((1 << 25) | (1 << 2) | 1) == 0,                  // EntryRegime
         (e.midr >> 24) & 255 == 0x41 && (e.midr >> 4) & 4095 == 0xd08, // CpuImplementation
         e.cpuectlr & (1 << 6) != 0,                                 // MaintenanceParticipation
-        e.mpidr & MPIDR_AFFINITY_MASK == r.affinity,                // EntryAffinity
-        r.logical_id > 0 && r.logical_id < crate::cpu_topology::MAX_CPUS as u64, // LogicalId
+        e.mpidr & MPIDR_AFFINITY_MASK == r.identity.affinity,       // EntryAffinity
+        r.identity.logical_id > 0 && r.identity.logical_id < crate::cpu_topology::MAX_CPUS as u64, // LogicalId
     ];
     Failures(
         checks
@@ -113,7 +116,7 @@ pub fn validate(
 }
 /// Called only by the entrant that won mailbox.enter, before arrival/failure.
 /// Rejected duplicate entrants must not call this writer.
-pub fn publish_checkpoint(r: &SecondaryRecord, s: LocalState, e: EntryState, failures: Failures) {
+pub fn publish_checkpoint(r: StartupView<'_>, s: LocalState, e: EntryState, failures: Failures) {
     r.checkpoint
         .current_el
         .store(s.current_el, Ordering::Relaxed);
@@ -148,30 +151,16 @@ mod tests {
     use super::*;
     use crate::{
         secondary_mailbox::{Outcome, WorkerState},
-        secondary_record::{RecordStorage, StartupRecord},
+        secondary_startup::test_fixture::Fixture,
     };
-    fn fixture() -> (RecordStorage, LocalState, EntryState) {
+    fn fixture() -> (std::boxed::Box<Fixture>, LocalState, EntryState) {
         let p = HostTranslation::new(0x430000, 4).unwrap();
-        let storage = RecordStorage::new();
-        storage
-            .publish(StartupRecord {
-                logical_id: 1,
-                affinity: 0x100,
-                context: 0x420000,
-                stack_bottom: 0x800000,
-                stack_top: 0x810000,
-                generation: 7,
-                root: p.root(),
-                mair: p.mair(),
-                tcr: p.tcr(),
-                sctlr: p.sctlr(),
-            })
-            .unwrap();
+        let storage = Fixture::new(1, 0x100, 0x800000, p.root(), 7);
         let state = LocalState {
             current_el: 8,
             affinity: 0x80000100,
             sp: 0x80ff00,
-            tpidr: 0x420000,
+            tpidr: storage.get(7).unwrap().identity.context,
             vbar: 0x440000,
             mair: p.mair(),
             tcr: p.tcr(),
@@ -314,7 +303,11 @@ mod tests {
     fn stack_bounds_and_timer_status_are_handled_without_false_success() {
         let (storage, s, e) = fixture();
         let r = storage.get(7).unwrap();
-        for sp in [r.stack_bottom - 16, r.stack_top, r.stack_bottom + 1] {
+        for sp in [
+            r.identity.stack_bottom - 16,
+            r.identity.stack_top,
+            r.identity.stack_bottom + 1,
+        ] {
             assert_ne!(
                 validate(r, LocalState { sp, ..s }, e, s.vbar, true, true).0 & bit("Stack"),
                 0
@@ -324,7 +317,7 @@ mod tests {
             validate(
                 r,
                 LocalState {
-                    sp: r.stack_bottom,
+                    sp: r.identity.stack_bottom,
                     cnthp_ctl: 4,
                     cntp_ctl: 4,
                     cntv_ctl: 4,
@@ -375,28 +368,22 @@ mod tests {
         assert!(r.mailbox.enter(7).is_err());
     }
     #[test]
-    fn matching_a_bad_record_does_not_bypass_named_register_policy() {
+    fn matching_a_bad_shared_config_does_not_bypass_named_register_policy() {
         let (_, state, entry) = fixture();
-        let storage = RecordStorage::new();
-        storage
-            .publish(StartupRecord {
-                logical_id: 1,
-                affinity: 0x100,
-                context: 0x420000,
-                stack_bottom: 0x800000,
-                stack_top: 0x810000,
-                generation: 7,
-                root: state.root,
-                mair: 0,
-                tcr: 0,
-                sctlr: 0,
-            })
-            .unwrap();
-        let r = storage.get(7).unwrap();
+        let storage = Fixture::new(1, 0x100, 0x800000, state.root, 7);
+        let bad = HostEl2Config {
+            mair: 0,
+            tcr: 0,
+            root: state.root,
+            sctlr: 0,
+        };
+        let mut r = storage.get(7).unwrap();
+        r.config = &bad;
         assert_eq!(
             validate(
                 r,
                 LocalState {
+                    tpidr: r.identity.context,
                     mair: 0,
                     tcr: 0,
                     sctlr: 0,

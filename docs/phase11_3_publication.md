@@ -1,5 +1,9 @@
 # Phase 11.3 cache publication and release
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 9, 2026-10-31. The production pipeline is in
 [`startup_publication.rs`](../tvisor_util/startup_publication.rs), with hardware
 callbacks in [`src/smp.rs`](../src/smp.rs) and the five small retained assembly

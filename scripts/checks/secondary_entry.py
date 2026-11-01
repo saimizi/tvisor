@@ -28,9 +28,13 @@ def check(elf):
     assert symbols['__text_start'] <= start < reject + 8 <= symbols['__text_end']
     assert symbols['__vectors_start'] <= symbols['__el2_vectors'] < symbols['__vectors_end']
     assert symbols['__el2_vectors'] % 2048 == 0
-    assert symbols['__writable_start'] <= symbols['SECONDARY_RECORD']
-    assert symbols['SECONDARY_RECORD'] + sizes['SECONDARY_RECORD'] <= symbols['__writable_end']
-    assert symbols['SECONDARY_RECORD'] % 64 == 0
+    assert 'SECONDARY_RECORD' not in symbols
+    for name, expected_size in [('PCPU_SLOTS', 4 * 384), ('HOST_EL2_CONFIG', 128)]:
+        assert sizes[name] == expected_size
+        assert symbols['__writable_start'] <= symbols[name]
+        assert symbols[name] + sizes[name] <= symbols['__writable_end']
+        assert symbols[name] % 64 == 0
+    lookup = symbols['__secondary_lookup']
     text = run('llvm-objdump', '-d', '--no-show-raw-insn',
                f'--start-address={start}', f'--stop-address={reject + 8}', elf)
     instructions = []
@@ -48,23 +52,28 @@ def check(elf):
     # No stack memory access, store, call, indirect branch or literal-pool read.
     allowed = {'msr', 'mrs', 'mov', 'movk', 'movz', 'ubfx', 'cmp', 'tst',
                'tbz', 'tbnz', 'b.ne', 'b.hs', 'b.ls', 'cbz', 'adr', 'adrp',
-               'add', 'and', 'ldr', 'subs', 'dsb', 'tlbi', 'ic', 'isb', 'ldar', 'nop'}
-    record_loads = {'x20, [x19, #56]', 'x10, [x19]', 'x9, [x19, #88]',
-                    'x9, [x19, #8]', 'x10, [x19, #96]', 'x12, [x19, #16]',
-                    'x10, [x19, #40]', 'x9, [x19, #24]', 'x9, [x19, #32]',
-                    'x9, [x19, #40]', 'x9, [x19, #48]'}
+               'add', 'and', 'ldr', 'subs', 'dsb', 'tlbi', 'ic', 'isb', 'ldar', 'nop', 'cbnz', 'b.lo'}
+    record_loads = {'x10, [x15, #48]', 'x10, [x15, #24]',
+                    'x9, [x19, #16]', 'x20, [x19, #64]',
+                    'x9, [x19, #40]', 'x10, [x19, #32]',
+                    'x10, [x17, #16]', 'x9, [x17]', 'x9, [x17, #8]',
+                    'x9, [x17, #16]', 'x9, [x17, #24]'}
     assert instructions[0][1:] == ('msr', 'DAIFSet, #15')
     assert before[1][1:] == ('mrs', 'x9, CurrentEL')
     assert before[2][1:] == ('cmp', 'x9, #8')
-    for _, op, args in before:
+    for address, op, args in before:
         assert op in allowed, (op, args)
         if op == 'ldr':
             assert args in record_loads, args
         if op == 'ldar':
             assert args == 'x10, [x9]'
-        if op in ('b.ne', 'b.hs', 'b.ls', 'tbz', 'tbnz', 'cbz'):
-            target = re.findall(r'0x[0-9a-f]+', args)[-1]
-            assert int(target, 16) == reject, args
+        if op in ('b.ne', 'b.hs', 'b.ls', 'tbz', 'tbnz', 'cbz', 'cbnz', 'b.lo'):
+            target = re.findall(r'0x[0-9a-f]+', args)[0]
+            destination = int(target, 16)
+            if lookup <= address < lookup + 52:
+                assert destination in (reject, lookup, lookup + 36), args
+            else:
+                assert destination == reject, args
     def index(op, operand):
         return next(i for i, (_, o, args) in enumerate(before) if o == op and operand in args)
     assert index('mrs', 'CurrentEL') < index('mrs', 'SCTLR_EL2') < index('mrs', 'MIDR_EL1')
@@ -78,7 +87,7 @@ def check(elf):
     assert any(operations[i:i + 3] == mask for i in range(len(operations) - 2)), 'full affinity mask'
     assert before[index('msr', 'SPSel') + 1][1] == 'isb'
     # Resolve both relaxed ADR and unrelaxed ADRP/ADD address construction.
-    for reg, symbol in [('x19', 'SECONDARY_RECORD'), ('x9', '__el2_vectors')]:
+    for reg, symbol in [('x15', 'PCPU_SLOTS'), ('x17', 'HOST_EL2_CONFIG'), ('x9', '__el2_vectors')]:
         addresses = []
         for i, (address, op, args) in enumerate(before):
             if op == 'adr' and args.startswith(reg + ', #'):
@@ -90,6 +99,17 @@ def check(elf):
                 assert next_op == 'add' and m, 'unexpected ADRP consumer'
                 addresses.append(page + int(m[1]))
         assert symbols[symbol] in addresses, f'{symbol}: incorrect address materialization'
+    lookup_ops = [(op, args.split(' //')[0].rstrip()) for address, op, args in before if lookup <= address < lookup + 52]
+    normalized_lookup = [(op, args.split(' <')[0]) for op, args in lookup_ops]
+    assert normalized_lookup == [
+        ('ldr','x10, [x15, #48]'), ('cmp','x10, #1'), ('b.ne',hex(lookup + 36)),
+        ('ldr','x10, [x15, #24]'), ('cmp','x10, x14'), ('b.ne',hex(lookup + 36)),
+        ('cbnz','x19, ' + hex(reject)), ('mov','x19, x15'), ('mov','x18, x16'),
+        ('add','x15, x15, #384'), ('add','x16, x16, #1'), ('cmp','x16, #4'), ('b.lo',hex(lookup))
+    ], 'unbounded or incorrect full-affinity slot scan'
+    assert ('and','x14, x9, x10') in operations
+    assert ('mov','x16, #0') in operations and ('mov','x19, xzr') in operations
+    assert ('cmp','x9, x18') in operations and ('mov','x12, x19') in operations
     required = [('tst', 'x9, #0x1'), ('tbnz', 'w9, #2'), ('tbnz', 'w9, #25'),
                 ('ubfx', 'x10, x9, #24, #8'), ('cmp', 'x10, #65'),
                 ('ubfx', 'x10, x9, #4, #12'), ('mov', 'x11, #3336'), ('cmp', 'x10, x11'),
@@ -101,10 +121,10 @@ def check(elf):
     ttbr = index('msr', 'TTBR0_EL2')
     assert [(op, args) for _, op, args in before[ttbr:ttbr + 10]] == [
         ('msr', 'TTBR0_EL2, x9'), ('isb', ''), ('dsb', 'sy'), ('tlbi', 'alle2'),
-        ('ic', 'iallu'), ('dsb', 'sy'), ('isb', ''), ('ldr', 'x9, [x19, #48]'),
+        ('ic', 'iallu'), ('dsb', 'sy'), ('isb', ''), ('ldr', 'x9, [x17, #24]'),
         ('msr', 'SCTLR_EL2, x9'), ('isb', '')]
     boundary_ops = [(op, args) for address, op, args in instructions if boundary <= address < reject]
-    assert boundary_ops[:5] == [('mov', 'x0, x19'), ('mov', 'x1, x21'), ('mov', 'x2, x22'), ('mov', 'x3, x23'), ('mov', 'x4, x24')]
+    assert boundary_ops[:6] == [('mov', 'x0, x19'), ('mov', 'x1, x21'), ('mov', 'x2, x22'), ('mov', 'x3, x23'), ('mov', 'x4, x24'), ('mov', 'x5, x20')]
     # Both CPUs must install the same explicit host baseline before Rust.
     primary = run('llvm-objdump', '-d', '--no-show-raw-insn',
                   f"--start-address={symbols['__enter_private_el2']}",
@@ -142,7 +162,7 @@ def check(elf):
             if m: actual.append((m[2], m[3]))
         assert actual == expected, (name, actual)
     print(text)
-    print('PASS: linked entry structure, bounded rejection, memory operands, ABI regions, boundary ordering and publication primitives')
+    print('PASS: linked entry structure, bounded slot lookup/rejection, memory operands, ABI regions, boundary ordering and publication primitives')
 
 
 if __name__ == '__main__':

@@ -1,5 +1,9 @@
 # Phase 11.3 secondary entry review
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 6, 2026-10-31. This review covers the linked stackless trampoline and its
 Rust boundary, not release authorization or hardware acceptance. The code is in
 [`src/secondary.rs`](../src/secondary.rs); the repeatable linked check is

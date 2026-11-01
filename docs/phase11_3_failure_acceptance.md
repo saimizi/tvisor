@@ -1,5 +1,9 @@
 # Phase 11.3 bounded-failure hardware acceptance
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 ## Documented test mechanism
 
 The opt-in Cargo feature `secondary-startup-timeout-test` builds a deliberately

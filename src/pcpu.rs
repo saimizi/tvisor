@@ -2,13 +2,12 @@
 use crate::vcpu::Vcpu;
 use core::{
     arch::asm,
-    cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tvisor_util::{
     aarch64_reg::{MpidrEl1, Sp},
     cpu_topology::{CpuTopology, MAX_CPUS, MPIDR_AFFINITY_MASK},
-    pcpu::{CpuPreparation, PcpuContext, STACK_ALLOCATION_SIZE, StackLayout, stack_layout},
+    pcpu::{PcpuContext, PcpuSlot, STACK_ALLOCATION_SIZE, StackLayout, stack_layout},
     println,
 };
 
@@ -17,27 +16,14 @@ const _: () = assert!(core::mem::size_of::<PcpuState>() == 64);
 const _: () = assert!(core::mem::offset_of!(PcpuState, host_sp) == 0);
 const _: () = assert!(core::mem::offset_of!(PcpuState, active_vcpu) == 8);
 
-#[repr(C, align(64))]
-struct PcpuSlot {
-    context: UnsafeCell<PcpuState>,
-    preparation: CpuPreparation,
+// Fixed assembly-visible array. Context is first in each slot; slot stride is
+// asserted in the shared library and again for the actual Vcpu specialization.
+#[unsafe(no_mangle)]
+pub static PCPU_SLOTS: [PcpuSlot<Vcpu>; MAX_CPUS] = [const { PcpuSlot::new() }; MAX_CPUS];
+const _: () = assert!(core::mem::size_of::<PcpuSlot<Vcpu>>() == 384);
+pub fn slot(id: usize) -> Option<&'static PcpuSlot<Vcpu>> {
+    PCPU_SLOTS.get(id)
 }
-// SAFETY: preparation runs once on the boot CPU while every other CPU remains
-// in firmware. Context mutation thereafter belongs exclusively to that slot's
-// physical CPU via TPIDR_EL2. No Rust references to the mutable context escape;
-// world-switch assembly writes only host_sp/active_vcpu. Other CPUs may consume
-// published immutable identity/bounds and the separate atomic startup fields,
-// never the owner's mutable fields. 11.1 releases no CPUs at all.
-unsafe impl Sync for PcpuSlot {}
-impl PcpuSlot {
-    const fn new() -> Self {
-        Self {
-            context: UnsafeCell::new(PcpuState::empty()),
-            preparation: CpuPreparation::new(),
-        }
-    }
-}
-static CPUS: [PcpuSlot; MAX_CPUS] = [const { PcpuSlot::new() }; MAX_CPUS];
 static BOOT_PREPARATION_CLAIMED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     static __boot_stack_guard_start: u8;
@@ -67,24 +53,8 @@ pub fn prepare_boot_cpu(topology: &CpuTopology) -> Result<(), &'static str> {
 }
 
 fn prepare_slot(id: usize, affinity: u64, stack: StackLayout) -> Result<(), &'static str> {
-    let slot = CPUS.get(id).ok_or("CPU slot capacity exceeded")?;
-    let context = PcpuState {
-        host_sp: 0,
-        active_vcpu: core::ptr::null_mut(),
-        logical_id: id as u64,
-        affinity,
-        stack_bottom: stack.bottom,
-        stack_top: stack.top,
-        present: 1,
-    };
-    // SAFETY: the boot CPU owns one-time preparation; no secondary is released.
-    // Bounds are published only after their mappings and guard are established.
-    unsafe {
-        slot.context.get().write(context);
-    }
-    slot.preparation
-        .publish_prepared()
-        .map_err(|_| "CPU slot already published")
+    let slot = PCPU_SLOTS.get(id).ok_or("CPU slot capacity exceeded")?;
+    slot.prepare(id, affinity, stack)
 }
 
 #[derive(Debug)]
@@ -153,53 +123,26 @@ pub fn prepare_secondary_cpus(
 }
 
 pub fn boot_entry() -> (*mut PcpuState, u64) {
-    assert!(CPUS[0].preparation.is_prepared());
-    let pointer = CPUS[0].context.get();
+    assert!(PCPU_SLOTS[0].is_prepared());
+    let pointer = PCPU_SLOTS[0].context_ptr();
     // SAFETY: bounds are immutable after release publication above.
     let top = unsafe { (*pointer).stack_top };
     (pointer, top)
-}
-
-/// Return immutable startup values for a prepared secondary. Only the boot
-/// CPU calls this, before releasing the selected CPU.
-pub fn secondary_entry(id: usize) -> Option<(u64, u64, u64)> {
-    if id == 0 {
-        return None;
-    }
-    let slot = CPUS.get(id)?;
-    if !slot.preparation.is_prepared() {
-        return None;
-    }
-    let ptr = slot.context.get();
-    // SAFETY: the boot CPU initialized this slot and no secondary has been
-    // released yet. Identity and stack bounds stay immutable after publication.
-    unsafe {
-        if !(*ptr).matches_secondary(
-            id as u64,
-            (*ptr).affinity,
-            (*ptr).stack_bottom,
-            (*ptr).stack_top,
-        ) {
-            return None;
-        }
-        Some(((*ptr).affinity, (*ptr).stack_top, ptr as u64))
-    }
 }
 
 pub fn prepared_stacks()
 -> Result<tvisor_util::system_info::FixedList<StackLayout, MAX_CPUS>, &'static str> {
     assert_boot_cpu_idle();
     let mut result = tvisor_util::system_info::FixedList::new();
-    for slot in &CPUS {
-        if slot.preparation.is_prepared() {
-            // SAFETY: boot CPU, before release; only immutable prepared bounds.
-            let c = unsafe { &*slot.context.get() };
+    for slot in &PCPU_SLOTS {
+        if slot.is_prepared() {
+            let c = slot.identity().ok_or("unpublished prepared context")?;
             let guard = c
                 .stack_bottom
                 .checked_sub(tvisor_util::pcpu::GUARD_SIZE)
                 .ok_or("invalid prepared guard")?;
             let layout = stack_layout(guard).map_err(|_| "invalid prepared stack")?;
-            if layout.top != c.stack_top || c.present != 1 {
+            if layout.top != c.stack_top {
                 return Err("inconsistent prepared stack");
             }
             result
@@ -222,16 +165,28 @@ pub fn validate_secondary_context(
     let Ok(index) = usize::try_from(id) else {
         return false;
     };
-    let Some(slot) = CPUS.get(index) else {
+    let Some(slot) = PCPU_SLOTS.get(index) else {
         return false;
     };
-    if index == 0 || slot.context.get() as u64 != pointer || !slot.preparation.is_prepared() {
+    if index == 0 || slot.context_ptr() as u64 != pointer || !slot.is_prepared() {
         return false;
     }
-    // SAFETY: the pointer matches the selected static slot and this CPU owns
-    // the context after release; boot preparation completed before publication.
-    let context = unsafe { &*slot.context.get() };
-    context.matches_secondary(id, affinity, bottom, top)
+    let Some(identity) = slot.identity() else {
+        return false;
+    };
+    // Only immutable identity fields are shared. During Phase 11.3 the selected
+    // secondary never runs a guest or writes host_sp/active_vcpu. The owner calls
+    // here before arrival, or CPU0 after acquiring Parked; no whole-context borrow.
+    identity.logical_id == id
+        && identity.affinity == affinity
+        && identity.stack_bottom == bottom
+        && identity.stack_top == top
+        && unsafe {
+            core::ptr::addr_of!((*slot.context_ptr()).host_sp).read() == 0
+                && core::ptr::addr_of!((*slot.context_ptr()).active_vcpu)
+                    .read()
+                    .is_null()
+        }
 }
 
 /// Called only outside a world switch on its owning boot CPU. No references
@@ -243,10 +198,10 @@ pub fn assert_boot_cpu_idle() {
     }
     assert_eq!(
         pointer,
-        CPUS[0].context.get() as u64,
+        PCPU_SLOTS[0].context_ptr() as u64,
         "wrong boot CPU TPIDR_EL2"
     );
-    let state = CPUS[0].context.get();
+    let state = PCPU_SLOTS[0].context_ptr();
     let affinity = MpidrEl1::dump().unwrap().value & MPIDR_AFFINITY_MASK;
     // SAFETY: known lifetime-stable slot, owner CPU, no active assembly writer.
     unsafe {
@@ -276,17 +231,17 @@ pub fn assert_boot_cpu_idle() {
 
 pub fn report_prepared() {
     assert_boot_cpu_idle();
-    for (id, slot) in CPUS.iter().enumerate() {
+    for (id, slot) in PCPU_SLOTS.iter().enumerate() {
         // SAFETY: workers are not released in 11.1. Only the boot CPU is active,
         // and this checkpoint is outside the guest world-switch assembly.
-        let context = slot.context.get();
+        let context = slot.context_ptr();
         unsafe {
             assert!(
                 core::ptr::addr_of!((*context).active_vcpu)
                     .read_volatile()
                     .is_null()
             );
-            if slot.preparation.is_prepared() {
+            if slot.is_prepared() {
                 println!(
                     "Phase 11.1 CPU{} prepared: affinity={:#x} context={:#x} stack=[{:#x}, {:#x}) active_vcpu=null{}",
                     id,
@@ -315,9 +270,9 @@ pub fn record_fatal(failure: tvisor_util::failure::Failure) {
         asm!("mrs {}, tpidr_el2", out(reg) pointer, options(nomem, nostack, preserves_flags));
     }
     // Compare addresses only: inherited TPIDR may be unset or arbitrary.
-    let cpu = CPUS
+    let cpu = PCPU_SLOTS
         .iter()
-        .position(|slot| slot.context.get() as usize == pointer)
+        .position(|slot| slot.context_ptr() as usize == pointer)
         .unwrap_or(MAX_CPUS);
     FATAL.record(cpu, failure);
 }

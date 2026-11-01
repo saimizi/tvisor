@@ -1,5 +1,70 @@
 //! Supported Armv8-A/A72 host EL2 policy. Guest execution has its own controls.
 use crate::aarch64_reg::*;
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+/// Immutable assembly ABI shared by all CPU slots after one-time publication.
+#[repr(C, align(64))]
+pub struct HostEl2Config {
+    pub mair: u64,
+    pub tcr: u64,
+    pub root: u64,
+    pub sctlr: u64,
+}
+#[repr(C, align(64))]
+pub struct HostEl2ConfigStorage {
+    config: UnsafeCell<HostEl2Config>,
+    claimed: AtomicBool,
+    ready: AtomicBool,
+}
+// SAFETY: one initializer, then immutable forever; acquire gates all Rust reads.
+unsafe impl Sync for HostEl2ConfigStorage {}
+impl HostEl2ConfigStorage {
+    pub const fn new() -> Self {
+        Self {
+            config: UnsafeCell::new(HostEl2Config {
+                mair: 0,
+                tcr: 0,
+                root: 0,
+                sctlr: 0,
+            }),
+            claimed: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+        }
+    }
+    pub fn publish(&self, policy: HostTranslation) -> Result<(), &'static str> {
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            return Err("host config already published");
+        }
+        unsafe {
+            self.config.get().write(HostEl2Config {
+                mair: policy.mair(),
+                tcr: policy.tcr(),
+                root: policy.root(),
+                sctlr: policy.sctlr(),
+            });
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub fn get(&self) -> Option<&HostEl2Config> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(unsafe { &*self.config.get() })
+    }
+}
+const _: () = {
+    assert!(core::mem::offset_of!(HostEl2ConfigStorage, config) == 0);
+    assert!(core::mem::size_of::<HostEl2Config>() == 64);
+    assert!(core::mem::size_of::<HostEl2ConfigStorage>() == 128);
+    assert!(core::mem::offset_of!(HostEl2Config, mair) == 0);
+    assert!(core::mem::offset_of!(HostEl2Config, tcr) == 8);
+    assert!(core::mem::offset_of!(HostEl2Config, root) == 16);
+    assert!(core::mem::offset_of!(HostEl2Config, sctlr) == 24);
+};
 
 pub const HCR_RW: u64 = 1 << 31;
 pub const HOST_HCR: u64 = HCR_RW; // RW=1; VM, routing and trap controls clear; E2H=0.
@@ -91,5 +156,37 @@ mod tests {
                 Err(PolicyError::UnsupportedPaRange)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    #[test]
+    fn shared_config_is_acquired_once_and_cannot_be_replaced() {
+        let storage = HostEl2ConfigStorage::new();
+        assert!(storage.get().is_none());
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| storage.publish(HostTranslation::new(0x800000, 4).unwrap()));
+            let b = scope.spawn(|| storage.publish(HostTranslation::new(0x900000, 4).unwrap()));
+            let results = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(results.iter().filter(|x| x.is_ok()).count(), 1);
+        });
+        let c = storage.get().unwrap();
+        assert!(c.root == 0x800000 || c.root == 0x900000);
+        assert_eq!(
+            (c.mair, c.tcr, c.sctlr),
+            (
+                HOST_MAIR,
+                HostTranslation::new(c.root, 4).unwrap().tcr(),
+                HOST_SCTLR
+            )
+        );
+        assert!(
+            storage
+                .publish(HostTranslation::new(0xa00000, 4).unwrap())
+                .is_err()
+        );
+        assert!(core::ptr::eq(c, storage.get().unwrap()));
     }
 }

@@ -1,5 +1,10 @@
 # Phase 11.3 design: one secondary CPU enters tvisor
 
+The 2026-11-01 [per-slot startup design](phase11_3_slot_refactor.md) replaces
+persistent startup identity/stack copies with `PcpuContext`, per-slot diagnostics
+and one shared EL2 configuration. It supersedes the singleton ABI references in
+the original task reports linked below.
+
 Status, 2026-10-31: implementation and scoped acceptance complete; ready for user
 review. See the [completion and evidence handoff](phase11_3_status.md).
 This document refines
@@ -77,9 +82,9 @@ released affinities to separate stacks.
 The [Task 3 ABI and ownership specification](phase11_3_startup_abi.md) records
 the integrated production layout and publication API.
 
-Use one authoritative startup protocol. The production `SecondaryRecord` embeds
-`SecondaryMailbox`; tests exercise that assembly-visible storage and its
-publication lifecycle. Preparation metadata carries no duplicate handoff words.
+Use one authoritative startup protocol. The production `PcpuSlot` embeds
+`PcpuContext` and `SecondaryStartup`; tests exercise that assembly-visible storage
+and its publication lifecycle. Preparation metadata carries no duplicate handoff words.
 
 The boot CPU owns preparation and release. After publication, the record's
 ordinary fields are immutable; the secondary owns its private stack and mutable

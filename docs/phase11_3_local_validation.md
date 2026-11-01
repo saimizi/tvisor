@@ -1,5 +1,9 @@
 # Phase 11.3 secondary local validation
 
+Historical review of the pre-refactor implementation. The 2026-11-01
+[per-slot startup refactor](phase11_3_slot_refactor.md) supersedes its singleton
+record layout; that document records the current ABI and repeated acceptance.
+
 Task 7, 2026-10-31. Production validation and checkpoint publication are in
 [`tvisor_util/secondary_validation.rs`](../tvisor_util/secondary_validation.rs).
 The hardware register collector and CPU 0 reporter are in
@@ -85,7 +89,7 @@ Entry observations move to offset 264 (32 bytes); the failure mask is at 296.
 Record size is now 320, aligned to 64. The claim flag is at 320 in a 384-byte
 storage wrapper. Compile-time assertions enforce the layout. The linked checker
 now uses the actual storage symbol size rather than assuming the older size.
-See the [current ABI table](phase11_3_startup_abi.md#record-layout).
+See the [current ABI table](phase11_3_startup_abi.md#layout).
 
 ## Verification and boundaries
 

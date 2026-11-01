@@ -43,6 +43,10 @@ def check(elf):
     call_pc = start + 4
     call = 0x94000000 | (((symbols['secondary_main'] - call_pc) // 4) & 0x3ffffff)
     store = symbols['__secondary_store_cell'] + 8  # ISB, MRS, STR
+    stride = find('add\tx15, x15, #384')
+    limit = find('cmp\tx16, #4')
+    duplicate = find('cbnz\tx19,')
+    config_load = find('ldr\tx9, [x17, #24]')
     mutations = [
         ('stack store before stack validation', start + 4, 0xf90003ff),
         ('Rust call before acquire', call_pc, call),
@@ -50,6 +54,10 @@ def check(elf):
         ('ordinary load instead of LDAR', acquire, 0xf940012a),
         ('missing cache clean', symbols['__secondary_clean_line'], 0xd503201f),
         ('32-bit release store', store, 0xb9000001),
+        ('incorrect slot stride', stride, struct.unpack_from('<I', original, offset(stride))[0] ^ (64 << 10)),
+        ('too many slot iterations', limit, struct.unpack_from('<I', original, offset(limit))[0] ^ (1 << 10)),
+        ('missing duplicate-affinity rejection', duplicate, 0xd503201f),
+        ('wrong shared config offset', config_load, struct.unpack_from('<I', original, offset(config_load))[0] ^ (4 << 10)),
     ]
     with contextlib.redirect_stdout(io.StringIO()):
         secondary_entry.check(elf)

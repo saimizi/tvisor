@@ -146,7 +146,7 @@ checkpoint and hardware acceptance findings remain for their assigned tasks.
 
 ## Task 4 follow-up (2026-10-31)
 
-The [ABI/protocol specification](phase11_3_startup_abi.md#task-4-protocol-transitions)
+The [ABI/protocol specification](phase11_3_startup_abi.md#protocol-and-rust-boundary)
 now defines serialized worker transitions, explicit failure and typed terminal
 outcomes. The waiter consumes Failed instead of reporting it as a generic
 timeout (F2 protocol portion); detailed local validation reasons remain Task 7.
@@ -278,3 +278,16 @@ confirmed off with identity verified. Top-level status text now reflects the
 implemented state; historical task reports are preserved. V9 is closed.
 No runtime implementation changed, no new hardware test was run, and nothing
 was committed or pushed. The completed milestone is ready for user review.
+
+## Per-slot refactor follow-up (2026-11-01)
+
+The [current refactor review](phase11_3_slot_refactor.md) supersedes the old
+singleton ABI while preserving all 47 requirement groups above. CPU identity and
+stack bounds exist only in `PcpuContext`; per-slot synchronization/diagnostics
+and shared configuration replace the separate record. The bounded full-affinity
+lookup, resource/publication validators and binary checks use the production
+slot layout. 167 host tests pass in both profiles, four builds are warning-free,
+and ten ELF corruptions per image are rejected. Physical timeout with late
+arrival and the full four-boot/600-second quick regression passed again with
+only CPU1 released; all other cells remained zero. The new report/bundle records
+current source/image provenance and independently verified final power-off.
