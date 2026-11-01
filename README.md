@@ -66,6 +66,9 @@ before releasing the secondary. The trampoline finds the matching per-CPU slot
 by full affinity and loads stack bounds from `PcpuContext`; synchronization and
 diagnostics live in that slot, with EL2 configuration shared separately. See the
 [per-slot startup design](docs/phase11_3_slot_refactor.md).
+CPU lifecycle and optional readiness waits are separate: a timeout does not
+change the CPU state. Phase 11.3 still treats a failed startup wait as a terminal
+guest-boot policy decision; see the [lifecycle design](docs/phase11_3_lifecycle_refactor.md).
 
 Disabled data cache alone does not prove a clean cache history. Firmware must
 also ensure safe instruction fetch and no conflicting dirty cache state; the

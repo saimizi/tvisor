@@ -3,7 +3,7 @@ use crate::{
     PAGE_SIZE,
     cpu_topology::CpuDescriptor,
     secondary_entry::{EntryContract, validate_spin_table_release},
-    secondary_mailbox::{Outcome, WorkerState},
+    secondary_mailbox::CpuState,
     secondary_startup::StartupView,
     startup_resources::FrozenStartup,
     system_info::{PhysAddr, PhysRegion},
@@ -75,10 +75,11 @@ pub struct PublicationPlan {
     cell: u64,
     line: u64,
 }
-pub struct PublishedStartup {
+pub struct PublishedStartup<'a> {
     cell: u64,
     entry: u64,
     line: u64,
+    startup: StartupView<'a>,
 }
 impl PublicationPlan {
     pub fn new(frozen: FrozenStartup, cell: u64, line: u64) -> Result<Self, PublicationError> {
@@ -106,14 +107,14 @@ impl PublicationPlan {
     }
     /// Consume actual frozen-resource evidence, the acquired per-slot view
     /// and the platform contract; no caller-supplied resource-ready booleans.
-    pub fn publish(
+    pub fn publish<'a>(
         self,
         cpus: &[CpuDescriptor],
         target: usize,
         backend: EntryContract,
-        record: StartupView<'_>,
+        record: StartupView<'a>,
         io: &mut impl PublicationIo,
-    ) -> Result<PublishedStartup, PublicationError> {
+    ) -> Result<PublishedStartup<'a>, PublicationError> {
         let address = validate_spin_table_release(cpus, target, backend)
             .map_err(|_| PublicationError::Preconditions)?;
         let r = self.frozen.resources();
@@ -121,8 +122,7 @@ impl PublicationPlan {
             .iter()
             .find(|cpu| cpu.logical_id == Some(target))
             .ok_or(PublicationError::Preconditions)?;
-        if record.mailbox.state(record.generation) != Ok(WorkerState::Ready)
-            || record.mailbox.outcome() != Outcome::Pending
+        if record.mailbox.state(record.generation) != Ok(CpuState::Prepared)
             || record.config.mair != crate::el2_policy::HOST_MAIR
             || record.config.sctlr != crate::el2_policy::HOST_SCTLR
             || !crate::el2_policy::HostTranslation::new(
@@ -156,13 +156,21 @@ impl PublicationPlan {
             cell: self.cell,
             entry: r.entry,
             line: self.line,
+            startup: record,
         })
     }
 }
-impl PublishedStartup {
+impl PublishedStartup<'_> {
     /// The handle is consumed even on failure. No retry or memory reuse is
     /// authorized, including if a backend reports an error after the store.
     pub fn release(self, io: &mut impl PublicationIo) -> Result<(), PublicationError> {
+        self.startup
+            .mailbox
+            .begin_start(self.startup.generation)
+            .map_err(|_| PublicationError::Preconditions)?;
+        // Make the Starting request visible before any firmware operation can
+        // release a CPU; it still does not certify that the cell store occurred.
+        io.complete()?;
         if io.read_cell(self.cell)? != 0 {
             return Err(PublicationError::NonzeroCell);
         }
@@ -357,6 +365,7 @@ mod tests {
                 &io.events[expected.len()..],
                 &[
                     Event::Barrier,
+                    Event::Barrier,
                     Event::Read(cell),
                     Event::Store(cell, 0x100000),
                     Event::Clean(cell & !63),
@@ -379,14 +388,13 @@ mod tests {
                 1 => b.el2_mmu_off = false,
                 2 => cpus[1].affinity = 2,
                 3 => cpus[1].startup = StartupMethod::Psci,
-                4 => s
-                    .get(7)
-                    .unwrap()
-                    .mailbox
-                    .finish(7, Outcome::TimedOut)
-                    .unwrap(),
+                4 => s.get(7).unwrap().mailbox.begin_start(7).unwrap(),
                 5 => io.wrong_record = true,
-                6 => s.get(7).unwrap().mailbox.enter(7).unwrap(),
+                6 => {
+                    let view = s.get(7).unwrap();
+                    view.mailbox.begin_start(7).unwrap();
+                    view.mailbox.claim_entry(7).unwrap().fail().unwrap();
+                }
                 8 => io.wrong_config = true,
                 9 => view.generation = 8,
                 _ => {
@@ -434,8 +442,24 @@ mod tests {
         let _ = (s, cpus);
     }
     #[test]
+    fn an_already_requested_start_cannot_issue_duplicate_firmware_operations() {
+        let (frozen, s, cpus) = fixture(0xe0);
+        let mut io = Io::default();
+        let published = PublicationPlan::new(frozen, 0xe0, 64)
+            .unwrap()
+            .publish(&cpus, 1, backend(), s.get(7).unwrap(), &mut io)
+            .unwrap();
+        io.events.clear();
+        s.get(7).unwrap().mailbox.begin_start(7).unwrap();
+        assert_eq!(
+            published.release(&mut io),
+            Err(PublicationError::Preconditions)
+        );
+        assert!(io.events.is_empty());
+    }
+    #[test]
     fn nonzero_cell_and_each_release_stage_failure_stop_without_retry() {
-        for failure in 0..=6 {
+        for failure in 0..=7 {
             let (frozen, s, cpus) = fixture(0xe0);
             let mut io = Io::default();
             let published = PublicationPlan::new(frozen, 0xe0, 64)
@@ -449,7 +473,9 @@ mod tests {
                 io.fail_at = Some(failure);
             }
             let result = published.release(&mut io);
-            if failure <= 5 {
+            // Starting records a request even when no cell store took place.
+            assert_eq!(s.get(7).unwrap().mailbox.lifecycle(), CpuState::Starting);
+            if failure <= 6 {
                 assert!(result.is_err());
             }
             assert!(
@@ -459,13 +485,13 @@ mod tests {
                     .count()
                     <= 1
             );
-            if failure <= 2 {
+            if failure <= 3 {
                 assert!(!io.events.contains(&Event::Sev));
             }
             if failure == 0 {
-                assert_eq!(io.events, [Event::Read(0xe0)]);
+                assert_eq!(io.events, [Event::Barrier, Event::Read(0xe0)]);
             }
-            if failure > 0 && failure <= 5 {
+            if failure > 0 && failure <= 6 {
                 assert_eq!(io.events.len(), failure);
             }
         }

@@ -1,5 +1,11 @@
 # Phase 11.3 implementation audit
 
+2026-11-01 follow-up: [lifecycle and waiting-policy separation](phase11_3_lifecycle_refactor.md)
+removes mailbox outcomes and keeps pure waits independent of terminal boot policy.
+170 host tests per profile, four checked builds, physical timeout/late-parking
+acceptance and the repeated full quick regression passed. The earlier audit and
+follow-ups below remain historical.
+
 Current result, Task 15: implementation and scoped acceptance are complete and
 ready for user review. See the [47-row closure map and evidence handoff](phase11_3_status.md).
 The Task 1 findings below remain a historical snapshot; dated follow-ups record

@@ -1,5 +1,12 @@
 # Phase 11.3 completion and review handoff
 
+Latest update: [lifecycle and waiting-policy separation](phase11_3_lifecycle_refactor.md)
+is complete with 170 host tests per profile, passing physical timeout/late-parking
+acceptance and the repeated full quick regression (four boots, 600.477-second soak,
+8,135 memory passes, no wakeup delays over 500 ms). Final power-off was independently
+verified. Ready for implementation review. Earlier
+completion reports below describe historical protocols.
+
 Current update, 2026-11-01: the [per-slot refactor](phase11_3_slot_refactor.md)
 supersedes the singleton layout described below. Implementation and repeated acceptance are complete: 167 host tests per profile,
 warning-free normal/injected builds, ten rejected binary mutations per image,

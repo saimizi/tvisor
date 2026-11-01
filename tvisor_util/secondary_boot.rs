@@ -1,5 +1,5 @@
 //! One-shot boot gate and validated physical-counter deadline.
-use crate::{secondary_mailbox::Outcome, secondary_startup::StartupView};
+use crate::{secondary_mailbox::WaitError, secondary_startup::StartupView};
 use core::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -23,6 +23,7 @@ pub struct SecondaryBoot {
 }
 pub struct Attempt<'a> {
     boot: &'a SecondaryBoot,
+    parked_observation: Option<(u64, u64)>,
 }
 /// Only a matching validated Parked checkpoint can create this consuming permit.
 pub struct GuestPermit {
@@ -55,8 +56,16 @@ impl SecondaryBoot {
         self.state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BootError::AlreadyAttempted)?;
-        Ok(Attempt { boot: self })
+        Ok(Attempt {
+            boot: self,
+            parked_observation: None,
+        })
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootWaitError {
+    PolicyTerminated,
+    Wait(WaitError),
 }
 impl Attempt<'_> {
     pub fn release_attempted(&mut self) -> Result<(), BootError> {
@@ -66,7 +75,38 @@ impl Attempt<'_> {
             .map(|_| ())
             .map_err(|_| BootError::InvalidTransition)
     }
+    /// Boot policy wraps the optional pure readiness wait and permanently records
+    /// failure. A successful observation is bound to this exact slot/generation.
+    pub fn wait_for_parked<F: FnMut() -> u64>(
+        &mut self,
+        startup: StartupView<'_>,
+        start: u64,
+        ticks: u64,
+        max_polls: usize,
+        counter: F,
+    ) -> Result<(), BootWaitError> {
+        if self.boot.status() != BootStatus::ReleaseAttempted {
+            return Err(BootWaitError::PolicyTerminated);
+        }
+        match startup.mailbox.wait_until_parked(
+            startup.generation,
+            start,
+            ticks,
+            max_polls,
+            counter,
+        ) {
+            Ok(()) => {
+                self.parked_observation = Some((startup.slot_address(), startup.generation));
+                Ok(())
+            }
+            Err(error) => {
+                self.wait_failed();
+                Err(BootWaitError::Wait(error))
+            }
+        }
+    }
     pub fn wait_failed(&mut self) {
+        self.parked_observation = None;
         let _ = self
             .boot
             .state
@@ -83,9 +123,8 @@ impl Attempt<'_> {
         }
         if fatal
             || record.generation != generation
-            || !record.mailbox.has_arrived(generation)
+            || self.parked_observation != Some((record.slot_address(), generation))
             || !record.mailbox.has_parked(generation)
-            || record.mailbox.outcome() != Outcome::Success
             || record.failures.load(Ordering::Relaxed) != 0
         {
             let _ = self
@@ -146,28 +185,25 @@ impl StartupDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secondary_startup::test_fixture::Fixture;
+    use crate::{secondary_mailbox::CpuState, secondary_startup::test_fixture::Fixture};
     fn record() -> std::boxed::Box<Fixture> {
         Fixture::new(1, 1, 0x800000, 0x430000, 7)
     }
     fn park(s: &Fixture) {
-        let m = &s.get(7).unwrap().mailbox;
-        m.enter(7).unwrap();
-        m.acknowledge(7).unwrap();
-        m.park(7).unwrap();
+        let r = s.get(7).unwrap();
+        r.mailbox.begin_start(7).unwrap();
+        r.mailbox.claim_entry(7).unwrap().park().unwrap();
     }
     #[test]
-    fn guest_runs_once_only_after_validated_success_and_boot_cannot_restart() {
+    fn guest_runs_once_only_after_a_matching_successful_boot_wait() {
         let gate = SecondaryBoot::new();
         let s = record();
         let mut attempt = gate.begin().unwrap();
         assert!(gate.begin().is_err());
         attempt.release_attempted().unwrap();
         park(&s);
-        s.get(7)
-            .unwrap()
-            .mailbox
-            .finish(7, Outcome::Success)
+        attempt
+            .wait_for_parked(s.get(7).unwrap(), 0, 10, 1, || 0)
             .unwrap();
         let permit = attempt.complete(s.get(7).unwrap(), 7, false).unwrap();
         let mut calls = 0;
@@ -181,12 +217,12 @@ mod tests {
         for phase in 0..3 {
             let gate = SecondaryBoot::new();
             {
-                let mut attempt = gate.begin().unwrap();
+                let mut a = gate.begin().unwrap();
                 if phase > 0 {
-                    attempt.release_attempted().unwrap();
+                    a.release_attempted().unwrap();
                 }
                 if phase == 2 {
-                    attempt.wait_failed();
+                    a.wait_failed();
                 }
             }
             assert_eq!(
@@ -201,53 +237,114 @@ mod tests {
         }
     }
     #[test]
-    fn no_permit_for_pending_arrival_failure_timeout_stale_generation_fatal_or_bad_checkpoint() {
-        for case in 0..7 {
+    fn late_park_and_successful_new_wait_never_reverse_failed_boot_policy() {
+        let gate = SecondaryBoot::new();
+        let s = record();
+        let r = s.get(7).unwrap();
+        let mut a = gate.begin().unwrap();
+        a.release_attempted().unwrap();
+        r.mailbox.begin_start(7).unwrap();
+        assert_eq!(
+            a.wait_for_parked(r, 0, 10, 1, || 10),
+            Err(BootWaitError::Wait(WaitError::Timeout))
+        );
+        assert_eq!(r.mailbox.lifecycle(), CpuState::Starting);
+        r.mailbox.claim_entry(7).unwrap().park().unwrap();
+        assert_eq!(r.mailbox.wait_until_parked(7, 0, 10, 1, || 0), Ok(()));
+        assert_eq!(
+            a.wait_for_parked(r, 0, 10, 1, || 0),
+            Err(BootWaitError::PolicyTerminated)
+        );
+        assert!(a.complete(r, 7, false).is_err());
+        assert_eq!(gate.status(), BootStatus::WaitFailed);
+        assert!(gate.begin().is_err());
+        assert_eq!(r.mailbox.lifecycle(), CpuState::Parked);
+    }
+    #[test]
+    fn no_permit_without_wait_or_with_stale_wrong_slot_fatal_or_bad_checkpoint() {
+        for case in 0..6 {
             let gate = SecondaryBoot::new();
             let s = record();
-            let mut attempt = gate.begin().unwrap();
-            attempt.release_attempted().unwrap();
+            let mut a = gate.begin().unwrap();
+            a.release_attempted().unwrap();
+            park(&s);
             let r = s.get(7).unwrap();
-            match case {
-                0 => {}
-                1 => {
-                    r.mailbox.enter(7).unwrap();
-                    r.mailbox.acknowledge(7).unwrap();
-                }
-                2 => {
-                    r.mailbox.enter(7).unwrap();
-                    r.mailbox.fail(7).unwrap();
-                    r.mailbox.finish(7, Outcome::SecondaryFailed).unwrap();
-                }
-                3 => {
-                    r.mailbox.finish(7, Outcome::TimedOut).unwrap();
-                    park(&s);
-                }
-                _ => {
-                    park(&s);
-                    r.mailbox.finish(7, Outcome::Success).unwrap();
-                }
+            if case != 0 {
+                a.wait_for_parked(r, 0, 10, 1, || 0).unwrap();
             }
-            if case == 6 {
+            if case == 3 {
                 r.failures.store(1, Ordering::Relaxed);
             }
+            let other = record();
+            if case == 4 {
+                park(&other);
+            }
+            if case == 5 {
+                a.wait_failed();
+            }
             assert!(
-                attempt
-                    .complete(r, if case == 4 { 8 } else { 7 }, case == 5)
-                    .is_err()
+                a.complete(
+                    if case == 4 { other.get(7).unwrap() } else { r },
+                    if case == 1 { 8 } else { 7 },
+                    case == 2
+                )
+                .is_err()
             );
             assert_eq!(gate.status(), BootStatus::WaitFailed);
             assert!(gate.begin().is_err());
         }
     }
     #[test]
-    fn boot_abort_preserves_first_mailbox_outcome_despite_late_worker() {
+    fn release_policy_failure_is_not_cpu_failure_and_survives_late_parking() {
+        let gate = SecondaryBoot::new();
         let s = record();
         let r = s.get(7).unwrap();
-        r.mailbox.finish(7, Outcome::BootAborted).unwrap();
-        park(&s);
-        assert!(r.mailbox.finish(7, Outcome::Success).is_err());
-        assert_eq!(r.mailbox.outcome(), Outcome::BootAborted);
+        {
+            let mut a = gate.begin().unwrap();
+            a.release_attempted().unwrap();
+            r.mailbox.begin_start(7).unwrap();
+        }
+        assert_eq!(gate.status(), BootStatus::ReleaseFailed);
+        assert_eq!(r.mailbox.lifecycle(), CpuState::Starting);
+        r.mailbox.claim_entry(7).unwrap().park().unwrap();
+        assert_eq!(r.mailbox.wait_until_parked(7, 0, 10, 1, || 0), Ok(()));
+        assert_eq!(gate.status(), BootStatus::ReleaseFailed);
+        assert!(gate.begin().is_err());
+    }
+    #[test]
+    fn genuine_failure_and_wait_bounds_fail_boot_without_overwriting_lifecycle() {
+        for case in 0..3 {
+            let gate = SecondaryBoot::new();
+            let s = record();
+            let r = s.get(7).unwrap();
+            let mut a = gate.begin().unwrap();
+            a.release_attempted().unwrap();
+            r.mailbox.begin_start(7).unwrap();
+            if case == 0 {
+                r.mailbox.claim_entry(7).unwrap().fail().unwrap();
+            }
+            let result = a.wait_for_parked(r, 0, if case == 1 { 0 } else { 10 }, 1, || 0);
+            assert_eq!(
+                result,
+                Err(BootWaitError::Wait(
+                    [
+                        WaitError::CpuFailed,
+                        WaitError::InvalidDeadline,
+                        WaitError::PollLimit
+                    ][case]
+                ))
+            );
+            assert_eq!(
+                r.mailbox.lifecycle(),
+                if case == 0 {
+                    CpuState::Failed
+                } else {
+                    CpuState::Starting
+                }
+            );
+            assert_eq!(gate.status(), BootStatus::WaitFailed);
+            assert!(a.complete(r, 7, false).is_err());
+        }
     }
     #[test]
     fn validates_deadline_conversion_and_counter_wrap_progress() {

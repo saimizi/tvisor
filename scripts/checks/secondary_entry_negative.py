@@ -47,6 +47,7 @@ def check(elf):
     limit = find('cmp\tx16, #4')
     duplicate = find('cbnz\tx19,')
     config_load = find('ldr\tx9, [x17, #24]')
+    generation_load = find('ldr\tx20, [x19, #64]')
     mutations = [
         ('stack store before stack validation', start + 4, 0xf90003ff),
         ('Rust call before acquire', call_pc, call),
@@ -58,6 +59,7 @@ def check(elf):
         ('too many slot iterations', limit, struct.unpack_from('<I', original, offset(limit))[0] ^ (1 << 10)),
         ('missing duplicate-affinity rejection', duplicate, 0xd503201f),
         ('wrong shared config offset', config_load, struct.unpack_from('<I', original, offset(config_load))[0] ^ (4 << 10)),
+        ('lifecycle state used as publication generation', generation_load, struct.unpack_from('<I', original, offset(generation_load))[0] ^ (1 << 10)),
     ]
     with contextlib.redirect_stdout(io.StringIO()):
         secondary_entry.check(elf)

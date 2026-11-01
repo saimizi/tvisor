@@ -6,13 +6,13 @@ use core::sync::atomic::Ordering;
 use tvisor_util::{
     println,
     secondary_boot::{BootError, BootStatus, StartupDeadline},
-    secondary_mailbox::{Outcome, ProtocolError, WorkerState},
+    secondary_mailbox::CpuState,
     system_info::PhysAddr,
 };
 
 const MAX_POLLS: usize = 250_000_000;
 
-fn deadline(seconds: u64) -> Option<StartupDeadline> {
+fn make_deadline(seconds: u64) -> Option<StartupDeadline> {
     let frequency: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency,
@@ -21,8 +21,8 @@ fn deadline(seconds: u64) -> Option<StartupDeadline> {
     StartupDeadline::new(frequency, seconds)
 }
 
-pub(super) fn delay_acknowledgement() {
-    if let Some(deadline) = deadline(4) {
+pub(super) fn delay_parking() {
+    if let Some(deadline) = make_deadline(4) {
         let start = physical_counter();
         for _ in 0..MAX_POLLS {
             if deadline.elapsed(start, physical_counter()) >= deadline.ticks() {
@@ -31,7 +31,7 @@ pub(super) fn delay_acknowledgement() {
             core::hint::spin_loop();
         }
     }
-    // A broken clock/poll fallback must not produce an early acknowledgement.
+    // A broken clock/poll fallback must not produce early parking.
     // CPU0 still has its unchanged finite startup wait and bounded observer.
     loop {
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
@@ -39,44 +39,56 @@ pub(super) fn delay_acknowledgement() {
 }
 
 /// Observe a real late arrival without retrying release or minting a permit.
-/// Invoked after the production attempt and abort-finalization have completed.
+/// Invoked after the production boot-policy attempt has finalized failure.
 pub(super) fn observe_terminal_failure() {
     let Some(record) = startup(1, 1) else {
         println!("Phase 11.3 timeout-test FAIL: no retained record");
         return;
     };
     if BOOT_ATTEMPT.status() != BootStatus::WaitFailed
-        || record.mailbox.outcome() != Outcome::TimedOut
+        || record.mailbox.state(1) != Ok(CpuState::Starting)
+        || record.mailbox.entry_is_claimed(1) != Ok(true)
     {
         println!("Phase 11.3 timeout-test FAIL: expected terminal timeout");
         return;
     }
     println!(
-        "Phase 11.3 timeout-test terminal before late arrival: boot={:?} outcome={:?} worker={:?}",
+        "Phase 11.3 timeout-test before late park: boot={:?} state={:?} entry_claimed={:?}",
         BOOT_ATTEMPT.status(),
-        record.mailbox.outcome(),
-        record.mailbox.state(1)
+        record.mailbox.state(1),
+        record.mailbox.entry_is_claimed(1)
     );
-    let Some(deadline) = deadline(5) else {
+    let Some(deadline) = make_deadline(5) else {
         println!("Phase 11.3 timeout-test FAIL: invalid observer deadline");
         return;
     };
     let start = physical_counter();
     for _ in 0..MAX_POLLS {
-        if record.mailbox.state(1) == Ok(WorkerState::Parked)
+        if record.mailbox.state(1) == Ok(CpuState::Parked)
             || deadline.elapsed(start, physical_counter()) >= deadline.ticks()
         {
             break;
         }
         core::hint::spin_loop();
     }
-    if record.mailbox.state(1) != Ok(WorkerState::Parked) {
+    if record.mailbox.state(1) != Ok(CpuState::Parked) {
         println!("Phase 11.3 timeout-test FAIL: no late parked checkpoint");
         return;
     }
     report_checkpoint(record);
-    let late_success_rejected =
-        record.mailbox.finish(1, Outcome::Success) == Err(ProtocolError::AlreadyFinished);
+    // Optional waits may be retried; successful readiness must not undo the
+    // independent terminal boot-policy decision or create a new guest permit.
+    let Some(late_deadline) = make_deadline(1) else {
+        println!("Phase 11.3 timeout-test FAIL: invalid late-wait deadline");
+        return;
+    };
+    let late_start = physical_counter();
+    let late_wait_succeeded = record
+        .mailbox
+        .wait_until_parked(1, 0, late_deadline.ticks(), 1, || {
+            late_deadline.elapsed(late_start, physical_counter())
+        })
+        .is_ok();
     // This probes only the one-shot gate; it never calls start_one/release again.
     let retry_rejected = matches!(BOOT_ATTEMPT.begin(), Err(BootError::AlreadyAttempted));
     let retained = startup(1, 1).is_some_and(|again| record.slot_address() == again.slot_address())
@@ -105,12 +117,13 @@ pub(super) fn observe_terminal_failure() {
             )
             .is_ok()
         });
-    let passed = late_success_rejected
+    let guest_blocked = BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
+    let passed = late_wait_succeeded
+        && guest_blocked
         && retry_rejected
         && retained
         && cells_unchanged
         && record.failures.load(Ordering::Relaxed) == 0
-        && record.mailbox.outcome() == Outcome::TimedOut
         && BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
     println!(
         "Phase 11.3 timeout-test retained slot={:#x} context={:#x} stack=[{:#x}, {:#x}) root={:#x}",
@@ -121,12 +134,12 @@ pub(super) fn observe_terminal_failure() {
         record.config.root
     );
     println!(
-        "Phase 11.3 timeout-test {}: boot={:?} outcome={:?} worker={:?} late_success_rejected={} retry_rejected={} retained={} cells_unchanged={}",
+        "Phase 11.3 timeout-test {}: boot={:?} state={:?} late_wait_succeeded={} guest_blocked={} retry_rejected={} retained={} cells_unchanged={}",
         if passed { "PASS" } else { "FAIL" },
         BOOT_ATTEMPT.status(),
-        record.mailbox.outcome(),
         record.mailbox.state(1),
-        late_success_rejected,
+        late_wait_succeeded,
+        guest_blocked,
         retry_rejected,
         retained,
         cells_unchanged

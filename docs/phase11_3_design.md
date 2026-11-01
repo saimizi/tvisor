@@ -1,5 +1,9 @@
 # Phase 11.3 design: one secondary CPU enters tvisor
 
+Current protocol: [CPU lifecycle and waiting policy](phase11_3_lifecycle_refactor.md)
+are separate. Per-slot state describes preparation/start/park/failure; timeout is
+an optional wait result, and CPU0 retains a separate terminal guest-boot policy.
+
 The 2026-11-01 [per-slot startup design](phase11_3_slot_refactor.md) replaces
 persistent startup identity/stack copies with `PcpuContext`, per-slot diagnostics
 and one shared EL2 configuration. It supersedes the singleton ABI references in

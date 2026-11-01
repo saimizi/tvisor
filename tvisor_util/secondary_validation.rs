@@ -114,7 +114,7 @@ pub fn validate(
             .fold(0, |bits, (i, ok)| bits | if *ok { 0 } else { 1 << i }),
     )
 }
-/// Called only by the entrant that won mailbox.enter, before arrival/failure.
+/// Called only by the entrant holding the unique entry claim, before arrival/failure.
 /// Rejected duplicate entrants must not call this writer.
 pub fn publish_checkpoint(r: StartupView<'_>, s: LocalState, e: EntryState, failures: Failures) {
     r.checkpoint
@@ -150,7 +150,7 @@ pub fn publish_checkpoint(r: StartupView<'_>, s: LocalState, e: EntryState, fail
 mod tests {
     use super::*;
     use crate::{
-        secondary_mailbox::{Outcome, WorkerState},
+        secondary_mailbox::{CpuState, WaitError},
         secondary_startup::test_fixture::Fixture,
     };
     fn fixture() -> (std::boxed::Box<Fixture>, LocalState, EntryState) {
@@ -193,15 +193,15 @@ mod tests {
         1 << FAILURE_NAMES.iter().position(|n| *n == name).unwrap()
     }
     #[test]
-    fn valid_local_and_entry_state_can_acknowledge_and_park() {
+    fn valid_local_and_entry_state_can_publish_parked() {
         let (storage, state, entry) = fixture();
         let r = storage.get(7).unwrap();
-        r.mailbox.enter(7).unwrap();
+        r.mailbox.begin_start(7).unwrap();
+        let claim = r.mailbox.claim_entry(7).unwrap();
         let failures = validate(r, state, entry, state.vbar, true, true);
         assert_eq!(failures, Failures(0));
         publish_checkpoint(r, state, entry, failures);
-        r.mailbox.acknowledge(7).unwrap();
-        r.mailbox.park(7).unwrap();
+        claim.park().unwrap();
         assert_eq!(r.failures.load(Ordering::Relaxed), 0);
         assert_eq!(r.entry.midr.load(Ordering::Relaxed), entry.midr);
     }
@@ -337,13 +337,17 @@ mod tests {
         );
     }
     #[test]
-    fn failure_snapshot_is_visible_and_late_failure_does_not_replace_timeout() {
+    fn late_failure_snapshot_is_visible_without_wait_mutating_lifecycle() {
         let (storage, state, entry) = fixture();
         let r = storage.get(7).unwrap();
-        r.mailbox.finish(7, Outcome::TimedOut).unwrap();
+        r.mailbox.begin_start(7).unwrap();
+        assert_eq!(
+            r.mailbox.wait_until_parked(7, 0, 10, 1, || 10),
+            Err(WaitError::Timeout)
+        );
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                r.mailbox.enter(7).unwrap();
+                let claim = r.mailbox.claim_entry(7).unwrap();
                 let bad = LocalState {
                     hcr: 0,
                     cnthctl: 0,
@@ -351,9 +355,9 @@ mod tests {
                 };
                 let failures = validate(r, bad, entry, state.vbar, true, true);
                 publish_checkpoint(r, bad, entry, failures);
-                r.mailbox.fail(7).unwrap();
+                claim.fail().unwrap();
             });
-            while r.mailbox.state(7) != Ok(WorkerState::Failed) {
+            while r.mailbox.state(7) != Ok(CpuState::Failed) {
                 std::thread::yield_now();
             }
             assert_eq!(
@@ -363,9 +367,12 @@ mod tests {
             assert_eq!(r.checkpoint.cnthctl.load(Ordering::Relaxed), 0);
             assert_eq!(r.entry.cpuectlr.load(Ordering::Relaxed), 64);
         });
-        assert!(!r.mailbox.has_arrived(7));
-        assert_eq!(r.mailbox.outcome(), Outcome::TimedOut);
-        assert!(r.mailbox.enter(7).is_err());
+        assert!(!r.mailbox.has_parked(7));
+        assert_eq!(
+            r.mailbox.wait_until_parked(7, 0, 10, 1, || 0),
+            Err(WaitError::CpuFailed)
+        );
+        assert!(r.mailbox.claim_entry(7).is_err());
     }
     #[test]
     fn matching_a_bad_shared_config_does_not_bypass_named_register_policy() {

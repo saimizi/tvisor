@@ -29,7 +29,6 @@ pub struct CpuIdentity {
 pub struct PcpuSlot<V> {
     context: UnsafeCell<PcpuContext<V>>,
     pub startup: SecondaryStartup,
-    prepared: AtomicBool,
     claimed: AtomicBool,
 }
 // SAFETY: context initialization is claimed once; identity/bounds are then frozen.
@@ -41,7 +40,6 @@ impl<V> PcpuSlot<V> {
         Self {
             context: UnsafeCell::new(PcpuContext::empty()),
             startup: SecondaryStartup::new(),
-            prepared: AtomicBool::new(false),
             claimed: AtomicBool::new(false),
         }
     }
@@ -72,11 +70,13 @@ impl<V> PcpuSlot<V> {
                 present: 1,
             });
         }
-        self.prepared.store(true, Ordering::Release);
-        Ok(())
+        self.startup
+            .mailbox
+            .mark_prepared()
+            .map_err(|_| "invalid CPU preparation lifecycle")
     }
     pub fn is_prepared(&self) -> bool {
-        self.prepared.load(Ordering::Acquire)
+        self.startup.mailbox.lifecycle() != crate::secondary_mailbox::CpuState::Offline
     }
     pub fn context_ptr(&self) -> *mut PcpuContext<V> {
         self.context.get()
@@ -136,6 +136,7 @@ impl<V> PcpuSlot<V> {
 const _: () = {
     assert!(core::mem::offset_of!(PcpuSlot<()>, context) == 0);
     assert!(core::mem::offset_of!(PcpuSlot<()>, startup) == 64);
+    assert!(core::mem::offset_of!(PcpuSlot<()>, claimed) == 320);
     assert!(core::mem::size_of::<PcpuSlot<()>>() == 384);
     assert!(core::mem::align_of::<PcpuSlot<()>>() == 64);
     assert!(core::mem::offset_of!(PcpuContext<()>, logical_id) == 16);

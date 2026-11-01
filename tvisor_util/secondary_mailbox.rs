@@ -1,58 +1,104 @@
-//! One-shot startup protocol. Requires coherent memory before atomic access.
-use core::sync::atomic::{AtomicU64, Ordering};
+//! Secondary lifecycle, publication token and side-effect-free readiness waits.
+//! Coherent memory is a prerequisite for every atomic access here.
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
     InvalidGeneration,
     InvalidTransition,
-    AlreadyFinished,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum WorkerState {
-    Ready = 0,
-    Entered = 1,
-    Arrived = 2,
-    Parked = 3,
-    Failed = 4,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum Outcome {
-    Pending = 0,
-    Success = 1,
-    TimedOut = 2,
-    SecondaryFailed = 3,
-    PollLimit = 4,
-    InvalidDeadline = 5,
-    BootAborted = 6,
+    DuplicateEntry,
 }
 
-/// ready is immutable after publication. The single state word serializes all
-/// worker transitions; outcome is exclusively decided by the boot CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum CpuState {
+    Offline = 0,
+    Prepared = 1,
+    /// Startup has been requested, not proof of a completed firmware release.
+    Starting = 2,
+    Parked = 3,
+    /// Reserved for management/IRQ readiness in a later milestone; no setter yet.
+    Online = 4,
+    Failed = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitError {
+    Timeout,
+    CpuFailed,
+    PollLimit,
+    InvalidDeadline,
+    InvalidGeneration,
+}
+
+/// Generation is publication metadata, state is lifecycle, and entry_claimed
+/// protects the single diagnostic writer. No waiting result is stored here.
 #[repr(C)]
 pub struct SecondaryMailbox {
     ready: AtomicU64,
     state: AtomicU64,
-    outcome: AtomicU64,
+    entry_claimed: AtomicBool,
+}
+
+/// Only a winning coherent Rust entrant may publish Parked/Failed.
+/// Dropping a claim leaves Starting and never invents an initialization result.
+pub struct EntryClaim<'a> {
+    mailbox: &'a SecondaryMailbox,
+    generation: u64,
+}
+impl EntryClaim<'_> {
+    pub fn park(self) -> Result<(), ProtocolError> {
+        self.mailbox
+            .transition(self.generation, CpuState::Starting, CpuState::Parked)
+    }
+    pub fn fail(self) -> Result<(), ProtocolError> {
+        self.mailbox
+            .transition(self.generation, CpuState::Starting, CpuState::Failed)
+    }
 }
 const _: () = {
     assert!(core::mem::offset_of!(SecondaryMailbox, ready) == 0);
     assert!(core::mem::offset_of!(SecondaryMailbox, state) == 8);
-    assert!(core::mem::offset_of!(SecondaryMailbox, outcome) == 16);
+    assert!(core::mem::offset_of!(SecondaryMailbox, entry_claimed) == 16);
     assert!(core::mem::size_of::<SecondaryMailbox>() == 24);
 };
 impl SecondaryMailbox {
     pub const fn new() -> Self {
         Self {
             ready: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-            outcome: AtomicU64::new(0),
+            state: AtomicU64::new(CpuState::Offline as u64),
+            entry_claimed: AtomicBool::new(false),
         }
+    }
+    pub fn lifecycle(&self) -> CpuState {
+        match self.state.load(Ordering::Acquire) {
+            0 => CpuState::Offline,
+            1 => CpuState::Prepared,
+            2 => CpuState::Starting,
+            3 => CpuState::Parked,
+            4 => CpuState::Online,
+            5 => CpuState::Failed,
+            _ => unreachable!(),
+        }
+    }
+    /// Called only after immutable context fields have been initialized.
+    pub(crate) fn mark_prepared(&self) -> Result<(), ProtocolError> {
+        self.state
+            .compare_exchange(
+                CpuState::Offline as u64,
+                CpuState::Prepared as u64,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .map(|_| ())
+            .map_err(|_| ProtocolError::InvalidTransition)
     }
     pub fn publish(&self, generation: u64) -> Result<(), ProtocolError> {
         if generation == 0 {
             return Err(ProtocolError::InvalidGeneration);
+        }
+        if self.lifecycle() != CpuState::Prepared {
+            return Err(ProtocolError::InvalidTransition);
         }
         self.ready
             .compare_exchange(0, generation, Ordering::Release, Ordering::Relaxed)
@@ -69,22 +115,15 @@ impl SecondaryMailbox {
             Err(ProtocolError::InvalidGeneration)
         }
     }
-    pub fn state(&self, generation: u64) -> Result<WorkerState, ProtocolError> {
+    pub fn state(&self, generation: u64) -> Result<CpuState, ProtocolError> {
         self.check(generation)?;
-        Ok(match self.state.load(Ordering::Acquire) {
-            0 => WorkerState::Ready,
-            1 => WorkerState::Entered,
-            2 => WorkerState::Arrived,
-            3 => WorkerState::Parked,
-            4 => WorkerState::Failed,
-            _ => unreachable!(),
-        })
+        Ok(self.lifecycle())
     }
     fn transition(
         &self,
         generation: u64,
-        from: WorkerState,
-        to: WorkerState,
+        from: CpuState,
+        to: CpuState,
     ) -> Result<(), ProtocolError> {
         self.check(generation)?;
         self.state
@@ -92,98 +131,64 @@ impl SecondaryMailbox {
             .map(|_| ())
             .map_err(|_| ProtocolError::InvalidTransition)
     }
-    /// Claim entry before writing checkpoint fields. Duplicate entrants must
-    /// park without changing the first entrant's evidence.
-    pub fn enter(&self, generation: u64) -> Result<(), ProtocolError> {
-        self.transition(generation, WorkerState::Ready, WorkerState::Entered)
+    /// Called by the consuming release handle before its first firmware operation.
+    /// Failure after this transition does not prove that a CPU failed to initialize.
+    pub fn begin_start(&self, generation: u64) -> Result<(), ProtocolError> {
+        self.transition(generation, CpuState::Prepared, CpuState::Starting)
     }
-    pub fn acknowledge(&self, generation: u64) -> Result<(), ProtocolError> {
-        self.transition(generation, WorkerState::Entered, WorkerState::Arrived)
-    }
-    pub fn park(&self, generation: u64) -> Result<(), ProtocolError> {
-        self.transition(generation, WorkerState::Arrived, WorkerState::Parked)
-    }
-    /// Local validation failure is published after writing diagnostic fields.
-    pub fn fail(&self, generation: u64) -> Result<(), ProtocolError> {
-        self.transition(generation, WorkerState::Entered, WorkerState::Failed)
-    }
-    pub fn has_arrived(&self, generation: u64) -> bool {
-        matches!(
-            self.state(generation),
-            Ok(WorkerState::Arrived | WorkerState::Parked)
-        )
-    }
-    pub fn has_parked(&self, generation: u64) -> bool {
-        self.state(generation) == Ok(WorkerState::Parked)
-    }
-    pub fn outcome(&self) -> Outcome {
-        match self.outcome.load(Ordering::Acquire) {
-            0 => Outcome::Pending,
-            1 => Outcome::Success,
-            2 => Outcome::TimedOut,
-            3 => Outcome::SecondaryFailed,
-            4 => Outcome::PollLimit,
-            5 => Outcome::InvalidDeadline,
-            6 => Outcome::BootAborted,
-            _ => unreachable!(),
-        }
-    }
-    pub fn finish(&self, generation: u64, outcome: Outcome) -> Result<(), ProtocolError> {
-        self.check(generation)?;
-        if outcome == Outcome::Pending
-            || (outcome == Outcome::Success && !self.has_parked(generation))
-            || (outcome == Outcome::SecondaryFailed
-                && self.state(generation)? != WorkerState::Failed)
-        {
+    pub fn claim_entry(&self, generation: u64) -> Result<EntryClaim<'_>, ProtocolError> {
+        if self.state(generation)? != CpuState::Starting {
             return Err(ProtocolError::InvalidTransition);
         }
-        self.outcome
-            .compare_exchange(0, outcome as u64, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| ProtocolError::AlreadyFinished)
+        self.entry_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ProtocolError::DuplicateEntry)?;
+        Ok(EntryClaim {
+            mailbox: self,
+            generation,
+        })
     }
-    /// Boot-owned measured wait. Outcome is finalized here, including on the
-    /// finite poll fallback. Late worker evidence never changes that outcome.
-    pub fn wait_and_finish<F: FnMut() -> u64>(
+    pub fn entry_is_claimed(&self, generation: u64) -> Result<bool, ProtocolError> {
+        self.check(generation)?;
+        Ok(self.entry_claimed.load(Ordering::Acquire))
+    }
+    pub fn has_parked(&self, generation: u64) -> bool {
+        self.state(generation) == Ok(CpuState::Parked)
+    }
+
+    /// Waiting never changes lifecycle or publication/entry-claim metadata.
+    /// A new wait may succeed after an earlier timeout; boot policy is separate.
+    pub fn wait_until_parked<F: FnMut() -> u64>(
         &self,
         generation: u64,
         start: u64,
         ticks: u64,
         max_polls: usize,
         mut counter: F,
-    ) -> Result<Outcome, ProtocolError> {
-        self.check(generation)?;
-        if self.outcome() != Outcome::Pending {
-            return Err(ProtocolError::AlreadyFinished);
+    ) -> Result<(), WaitError> {
+        self.check(generation)
+            .map_err(|_| WaitError::InvalidGeneration)?;
+        if ticks == 0 || ticks >= 1 << 63 {
+            return Err(WaitError::InvalidDeadline);
         }
-        let mut result = Outcome::PollLimit;
-        if ticks == 0 || ticks >= (1u64 << 63) {
-            result = Outcome::InvalidDeadline;
-        } else {
-            for _ in 0..max_polls {
-                if counter().wrapping_sub(start) >= ticks {
-                    result = Outcome::TimedOut;
-                    break;
-                }
-                let state = self.state(generation)?;
-                if state == WorkerState::Failed {
-                    result = Outcome::SecondaryFailed;
-                    break;
-                }
-                if state == WorkerState::Parked {
-                    // Bracket the acquired checkpoint with clock observations.
-                    result = if counter().wrapping_sub(start) >= ticks {
-                        Outcome::TimedOut
-                    } else {
-                        Outcome::Success
-                    };
-                    break;
-                }
-                core::hint::spin_loop();
+        for _ in 0..max_polls {
+            if counter().wrapping_sub(start) >= ticks {
+                return Err(WaitError::Timeout);
             }
+            match self.lifecycle() {
+                CpuState::Failed => return Err(WaitError::CpuFailed),
+                CpuState::Parked => {
+                    return if counter().wrapping_sub(start) >= ticks {
+                        Err(WaitError::Timeout)
+                    } else {
+                        Ok(())
+                    };
+                }
+                _ => {}
+            }
+            core::hint::spin_loop();
         }
-        self.finish(generation, result)?;
-        Ok(result)
+        Err(WaitError::PollLimit)
     }
 }
 
@@ -192,195 +197,223 @@ mod tests {
     use super::*;
     fn published() -> SecondaryMailbox {
         let m = SecondaryMailbox::new();
+        m.mark_prepared().unwrap();
         m.publish(7).unwrap();
         m
     }
-    fn parked(m: &SecondaryMailbox) {
-        m.enter(7).unwrap();
-        m.acknowledge(7).unwrap();
-        m.park(7).unwrap();
+    fn starting() -> SecondaryMailbox {
+        let m = published();
+        m.begin_start(7).unwrap();
+        m
+    }
+    fn park(m: &SecondaryMailbox) {
+        m.claim_entry(7).unwrap().park().unwrap();
     }
     #[test]
-    fn rejects_zero_stale_and_unsolicited_generations() {
+    fn preparation_publication_and_start_are_distinct_one_shot_operations() {
         let m = SecondaryMailbox::new();
+        assert_eq!(m.lifecycle(), CpuState::Offline);
+        assert!(m.publish(7).is_err());
+        assert!(m.begin_start(7).is_err());
+        m.mark_prepared().unwrap();
+        assert!(m.mark_prepared().is_err());
+        assert_eq!(m.lifecycle(), CpuState::Prepared);
         assert!(m.publish(0).is_err());
-        assert!(m.enter(7).is_err());
         m.publish(7).unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Prepared);
         assert!(m.publish(8).is_err());
+        assert!(m.claim_entry(7).is_err());
+        m.begin_start(7).unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Starting);
+        assert!(!m.entry_is_claimed(7).unwrap()); // Release completion/entry is not implied.
+        assert!(m.begin_start(7).is_err());
+    }
+    #[test]
+    fn zero_stale_and_unsolicited_generations_are_rejected() {
+        let m = published();
         for g in [0, 6, 8] {
-            assert!(m.enter(g).is_err());
-            assert!(m.acknowledge(g).is_err());
-            assert!(m.park(g).is_err());
-            assert!(m.fail(g).is_err());
-            assert!(m.finish(g, Outcome::TimedOut).is_err());
+            assert!(m.begin_start(g).is_err());
+            assert!(m.claim_entry(g).is_err());
+            assert_eq!(
+                m.wait_until_parked(g, 0, 10, 1, || 0),
+                Err(WaitError::InvalidGeneration)
+            );
         }
-        assert_eq!(m.state(7), Ok(WorkerState::Ready));
-        assert_eq!(m.outcome(), Outcome::Pending);
+        assert_eq!(m.lifecycle(), CpuState::Prepared);
     }
     #[test]
-    fn rejects_skipped_duplicate_and_conflicting_transitions() {
-        let m = published();
-        assert!(m.acknowledge(7).is_err());
-        assert!(m.park(7).is_err());
-        assert!(m.fail(7).is_err());
-        m.enter(7).unwrap();
-        assert!(m.enter(7).is_err());
-        m.acknowledge(7).unwrap();
-        assert!(m.acknowledge(7).is_err());
-        assert!(m.fail(7).is_err());
-        m.park(7).unwrap();
-        assert!(m.park(7).is_err());
-        assert!(m.fail(7).is_err());
-        assert!(m.has_arrived(7));
-        assert!(m.has_parked(7));
-    }
-    #[test]
-    fn failed_validation_cannot_acknowledge_or_park() {
-        let m = published();
-        m.enter(7).unwrap();
-        m.fail(7).unwrap();
-        assert!(m.fail(7).is_err());
-        assert!(m.acknowledge(7).is_err());
-        assert!(m.park(7).is_err());
-        assert!(!m.has_arrived(7));
-        assert!(!m.has_parked(7));
+    fn one_claim_owns_diagnostics_and_only_real_initialization_sets_terminal_state() {
+        let m = starting();
+        let claim = m.claim_entry(7).unwrap();
+        assert!(matches!(
+            m.claim_entry(7),
+            Err(ProtocolError::DuplicateEntry)
+        ));
+        assert_eq!(m.lifecycle(), CpuState::Starting);
+        claim.park().unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Parked);
+        assert!(m.claim_entry(7).is_err());
+        assert!(m.begin_start(7).is_err());
+        let m = starting();
+        m.claim_entry(7).unwrap().fail().unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Failed);
+        assert!(m.claim_entry(7).is_err());
         assert_eq!(
-            m.wait_and_finish(7, 0, 10, 1, || 0),
-            Ok(Outcome::SecondaryFailed)
+            m.wait_until_parked(7, 0, 10, 1, || 0),
+            Err(WaitError::CpuFailed)
         );
     }
     #[test]
-    fn deadline_is_terminal_despite_late_entry_and_park() {
-        let m = published();
-        assert_eq!(m.wait_and_finish(7, 0, 10, 1, || 10), Ok(Outcome::TimedOut));
-        parked(&m);
-        assert!(m.finish(7, Outcome::Success).is_err());
-        assert!(m.wait_and_finish(7, 0, 10, 1, || 0).is_err());
-        assert_eq!(m.outcome(), Outcome::TimedOut);
+    fn timeout_and_repeated_waits_do_not_change_cpu_lifecycle() {
+        let m = starting();
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 10),
+            Err(WaitError::Timeout)
+        );
+        assert_eq!(m.lifecycle(), CpuState::Starting);
+        park(&m);
+        assert_eq!(m.wait_until_parked(7, 0, 10, 1, || 0), Ok(()));
+        assert_eq!(m.lifecycle(), CpuState::Parked);
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 10),
+            Err(WaitError::Timeout)
+        );
+        assert_eq!(m.lifecycle(), CpuState::Parked);
     }
     #[test]
-    fn failure_after_timeout_preserves_boot_result() {
+    fn waiting_for_a_prepared_cpu_does_not_request_startup() {
         let m = published();
-        m.finish(7, Outcome::TimedOut).unwrap();
-        m.enter(7).unwrap();
-        m.fail(7).unwrap();
-        assert!(m.finish(7, Outcome::SecondaryFailed).is_err());
-        assert_eq!(m.outcome(), Outcome::TimedOut);
-        assert_eq!(m.state(7), Ok(WorkerState::Failed));
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 10),
+            Err(WaitError::Timeout)
+        );
+        assert_eq!(m.lifecycle(), CpuState::Prepared);
+        assert!(!m.entry_is_claimed(7).unwrap());
+        m.begin_start(7).unwrap();
+        park(&m);
+        assert_eq!(m.wait_until_parked(7, 0, 10, 1, || 0), Ok(()));
     }
     #[test]
-    fn invalid_deadlines_and_poll_exhaustion_are_distinct_terminal_results() {
+    fn failure_after_timeout_is_genuine_failure_not_waiting_policy() {
+        let m = starting();
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 10),
+            Err(WaitError::Timeout)
+        );
+        m.claim_entry(7).unwrap().fail().unwrap();
+        assert_eq!(m.lifecycle(), CpuState::Failed);
+        assert_eq!(
+            m.wait_until_parked(7, 0, 10, 1, || 0),
+            Err(WaitError::CpuFailed)
+        );
+    }
+    #[test]
+    fn invalid_deadline_and_poll_limit_leave_state_and_claim_unchanged() {
+        let m = starting();
         for ticks in [0, 1 << 63, u64::MAX] {
-            let m = published();
             assert_eq!(
-                m.wait_and_finish(7, 0, ticks, 1, || 0),
-                Ok(Outcome::InvalidDeadline)
+                m.wait_until_parked(7, 0, ticks, 1, || panic!("invalid deadline must not poll")),
+                Err(WaitError::InvalidDeadline)
             );
         }
-        let m = published();
         let mut calls = 0;
         assert_eq!(
-            m.wait_and_finish(7, 0, 10, 3, || {
+            m.wait_until_parked(7, 0, 10, 3, || {
                 calls += 1;
                 0
             }),
-            Ok(Outcome::PollLimit)
+            Err(WaitError::PollLimit)
         );
         assert_eq!(calls, 3);
-        let m = published();
         assert_eq!(
-            m.wait_and_finish(7, 0, 10, 0, || panic!("no polls")),
-            Ok(Outcome::PollLimit)
+            m.wait_until_parked(7, 0, 10, 0, || panic!("no polls")),
+            Err(WaitError::PollLimit)
         );
+        assert_eq!(m.lifecycle(), CpuState::Starting);
+        assert!(!m.entry_is_claimed(7).unwrap());
     }
     #[test]
-    fn deadline_wraparound_and_park_observation_boundary() {
-        let m = published();
+    fn counter_wrap_and_exact_park_deadline_remain_bounded() {
+        let m = starting();
         let start = u64::MAX - 1;
         let mut now = start;
         assert_eq!(
-            m.wait_and_finish(7, start, 4, 8, || {
+            m.wait_until_parked(7, start, 4, 8, || {
                 now = now.wrapping_add(1);
                 now
             }),
-            Ok(Outcome::TimedOut)
+            Err(WaitError::Timeout)
         );
-        let m = published();
-        parked(&m);
+        park(&m);
         let mut now = 8;
         assert_eq!(
-            m.wait_and_finish(7, 0, 10, 1, || {
+            m.wait_until_parked(7, 0, 10, 1, || {
                 now += 1;
                 now
             }),
-            Ok(Outcome::TimedOut)
+            Err(WaitError::Timeout)
         );
-        let m = published();
-        parked(&m);
-        assert_eq!(m.wait_and_finish(7, 0, 10, 1, || 9), Ok(Outcome::Success));
+        assert_eq!(m.wait_until_parked(7, 0, 10, 1, || 9), Ok(()));
     }
     #[test]
-    fn only_validated_park_can_succeed_and_first_terminal_result_wins() {
-        let m = published();
-        assert!(m.finish(7, Outcome::Pending).is_err());
-        assert!(m.finish(7, Outcome::Success).is_err());
-        assert!(m.finish(7, Outcome::SecondaryFailed).is_err());
-        parked(&m);
-        m.finish(7, Outcome::Success).unwrap();
-        assert!(m.finish(7, Outcome::TimedOut).is_err());
-        assert_eq!(m.outcome(), Outcome::Success);
-    }
-    #[test]
-    fn concurrent_terminal_decisions_have_exactly_one_winner() {
-        let m = published();
-        parked(&m);
-        let gate = std::sync::Barrier::new(2);
+    fn concurrent_entry_has_one_writer_and_dropped_claim_cannot_be_retried() {
+        let m = starting();
+        let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
             let a = scope.spawn(|| {
-                gate.wait();
-                m.finish(7, Outcome::Success)
+                barrier.wait();
+                m.claim_entry(7).is_ok()
             });
             let b = scope.spawn(|| {
-                gate.wait();
-                m.finish(7, Outcome::TimedOut)
-            });
-            let results = [a.join().unwrap(), b.join().unwrap()];
-            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-        });
-        assert!(matches!(m.outcome(), Outcome::Success | Outcome::TimedOut));
-    }
-    #[test]
-    fn full_width_generation_is_not_truncated() {
-        let m = SecondaryMailbox::new();
-        m.publish(u64::MAX).unwrap();
-        assert!(m.enter(u64::MAX - 1).is_err());
-        m.enter(u64::MAX).unwrap();
-        m.acknowledge(u64::MAX).unwrap();
-        m.park(u64::MAX).unwrap();
-        assert_eq!(
-            m.wait_and_finish(u64::MAX, 0, 10, 1, || 0),
-            Ok(Outcome::Success)
-        );
-    }
-    #[test]
-    fn worker_park_racing_deadline_cannot_override_timeout() {
-        let m = published();
-        let gate = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                gate.wait();
-                parked(&m);
+                barrier.wait();
+                m.claim_entry(7).is_ok()
             });
             assert_eq!(
-                m.wait_and_finish(7, 0, 10, 1, || {
-                    gate.wait();
+                [a.join().unwrap(), b.join().unwrap()]
+                    .iter()
+                    .filter(|x| **x)
+                    .count(),
+                1
+            );
+        });
+        assert_eq!(m.lifecycle(), CpuState::Starting);
+        assert!(m.claim_entry(7).is_err());
+    }
+    #[test]
+    fn full_width_generation_and_concurrent_waiters_are_independent() {
+        let m = SecondaryMailbox::new();
+        m.mark_prepared().unwrap();
+        m.publish(u64::MAX).unwrap();
+        m.begin_start(u64::MAX).unwrap();
+        m.claim_entry(u64::MAX).unwrap().park().unwrap();
+        assert!(m.claim_entry(u64::MAX - 1).is_err());
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| m.wait_until_parked(u64::MAX, 0, 10, 1, || 0));
+            let b = scope.spawn(|| m.wait_until_parked(u64::MAX, 0, 10, 1, || 10));
+            assert_eq!(a.join().unwrap(), Ok(()));
+            assert_eq!(b.join().unwrap(), Err(WaitError::Timeout));
+        });
+        assert_eq!(m.lifecycle(), CpuState::Parked);
+    }
+    #[test]
+    fn park_racing_timeout_is_observable_by_a_fresh_wait() {
+        let m = starting();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                barrier.wait();
+                park(&m)
+            });
+            assert_eq!(
+                m.wait_until_parked(7, 0, 10, 1, || {
+                    barrier.wait();
                     10
                 }),
-                Ok(Outcome::TimedOut)
+                Err(WaitError::Timeout)
             );
             worker.join().unwrap();
         });
-        assert!(m.has_parked(7));
-        assert_eq!(m.outcome(), Outcome::TimedOut);
+        assert_eq!(m.lifecycle(), CpuState::Parked);
+        assert_eq!(m.wait_until_parked(7, 0, 10, 1, || 0), Ok(()));
     }
 }

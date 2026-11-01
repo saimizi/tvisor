@@ -1,11 +1,14 @@
 //! Stackless secondary entry. This entry is not released until the backend
 //! publishes a validated record and completes the spin-table release protocol.
 use core::{arch::global_asm, sync::atomic::Ordering};
-use tvisor_util::secondary_mailbox::Outcome;
 use tvisor_util::{
     el2_policy::{HostEl2Config, HostEl2ConfigStorage},
     pcpu::{PcpuContext, PcpuSlot},
     secondary_startup::StartupView,
+};
+use tvisor_util::{
+    secondary_boot::{Attempt, BootWaitError},
+    secondary_mailbox::{CpuState, WaitError},
 };
 
 #[cfg(feature = "secondary-startup-timeout-test")]
@@ -31,13 +34,14 @@ fn wait_for_secondary(
     generation: u64,
     deadline: tvisor_util::secondary_boot::StartupDeadline,
     start: u64,
+    attempt: &mut Attempt<'_>,
 ) -> Result<(), &'static str> {
     let record = startup(id, generation).ok_or("secondary slot startup is not published")?;
-    let outcome = record.mailbox.wait_and_finish(generation, 0, deadline.ticks(), 100_000_000, || {
+    let result = attempt.wait_for_parked(record, 0, deadline.ticks(), 100_000_000, || {
         let now: u64;
         unsafe { core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags)); }
         deadline.elapsed(start, now)
-    }).map_err(|_| "invalid secondary wait transition")?;
+    });
     #[cfg(feature = "secondary-startup-timeout-test")]
     tvisor_util::println!(
         "Phase 11.3 timeout-test wait elapsed ticks={} budget={}",
@@ -45,26 +49,33 @@ fn wait_for_secondary(
         deadline.ticks()
     );
     tvisor_util::println!(
-        "Phase 11.3 generation={} outcome={:?} worker={:?}",
+        "Phase 11.3 generation={} wait={:?} state={:?}",
         generation,
-        outcome,
+        result,
         record.mailbox.state(generation)
     );
     if matches!(
         record.mailbox.state(generation),
-        Ok(tvisor_util::secondary_mailbox::WorkerState::Parked
-            | tvisor_util::secondary_mailbox::WorkerState::Failed)
+        Ok(CpuState::Parked | CpuState::Failed)
     ) {
         report_checkpoint(record);
     }
-    match outcome {
-        Outcome::Success => {}
-        Outcome::SecondaryFailed => return Err("secondary local validation failed"),
-        Outcome::TimedOut => return Err("secondary startup timed out"),
-        Outcome::PollLimit => return Err("secondary startup poll limit exceeded"),
-        Outcome::InvalidDeadline => return Err("invalid secondary startup deadline"),
-        Outcome::Pending => return Err("secondary startup remained pending"),
-        Outcome::BootAborted => return Err("secondary boot was aborted"),
+    match result {
+        Ok(()) => {}
+        Err(BootWaitError::Wait(WaitError::CpuFailed)) => {
+            return Err("secondary local validation failed");
+        }
+        Err(BootWaitError::Wait(WaitError::Timeout)) => return Err("secondary startup timed out"),
+        Err(BootWaitError::Wait(WaitError::PollLimit)) => {
+            return Err("secondary startup poll limit exceeded");
+        }
+        Err(BootWaitError::Wait(WaitError::InvalidDeadline)) => {
+            return Err("invalid secondary startup deadline");
+        }
+        Err(BootWaitError::Wait(WaitError::InvalidGeneration)) => {
+            return Err("invalid secondary startup generation");
+        }
+        Err(BootWaitError::PolicyTerminated) => return Err("secondary boot policy is terminal"),
     }
     Ok(())
 }
@@ -205,6 +216,7 @@ __secondary_lookup:
     cbz x9, .Lsecondary_reject
     cmp x9, x18
     b.ne .Lsecondary_reject
+    // Publication generation only; lifecycle and wait policy are separate.
     ldr x20, [x19, #{mailbox}]
     cbz x20, .Lsecondary_reject
     // Validate all stack/context inputs before installing either pointer.
@@ -326,13 +338,10 @@ extern "C" fn secondary_main(
     let Some(record) = slot.startup_view(generation, config) else {
         tvisor_util::halt();
     };
-    if record.mailbox.enter(record.generation).is_err() {
-        loop {
-            unsafe {
-                core::arch::asm!("wfe", options(nomem, nostack));
-            }
-        }
-    }
+    let entry_claim = match record.mailbox.claim_entry(record.generation) {
+        Ok(claim) => claim,
+        Err(_) => tvisor_util::halt(),
+    };
     use tvisor_util::secondary_validation::{EntryState, LocalState, publish_checkpoint, validate};
     macro_rules! read { ($reg:literal) => {{ let value: u64;
         unsafe { core::arch::asm!(concat!("mrs {}, ", $reg), out(reg) value, options(nomem, nostack, preserves_flags)); } value
@@ -390,12 +399,10 @@ extern "C" fn secondary_main(
     publish_checkpoint(record, state, entry, failures);
     if failures.0 == 0 {
         #[cfg(feature = "secondary-startup-timeout-test")]
-        timeout_test::delay_acknowledgement();
-        if record.mailbox.acknowledge(record.generation).is_ok() {
-            let _ = record.mailbox.park(record.generation);
-        }
+        timeout_test::delay_parking();
+        let _ = entry_claim.park();
     } else {
-        let _ = record.mailbox.fail(record.generation);
+        let _ = entry_claim.fail();
     }
     loop {
         unsafe {
@@ -414,11 +421,6 @@ pub fn start_one(
         .map_err(|_| "secondary boot already attempted")?;
     let result = start_attempt(fdt, policy, attempt);
     if result.is_err() {
-        for id in 1..tvisor_util::cpu_topology::MAX_CPUS {
-            if let Some(record) = startup(id, 1) {
-                let _ = record.mailbox.finish(1, Outcome::BootAborted);
-            }
-        }
         #[cfg(feature = "secondary-startup-timeout-test")]
         timeout_test::observe_terminal_failure();
     }
@@ -446,7 +448,7 @@ fn start_attempt(
     let entry_contract = backend.contract();
     #[cfg(feature = "secondary-startup-timeout-test")]
     tvisor_util::println!(
-        "Phase 11.3 TEST ONLY: secondary-startup-timeout-test; acknowledgement delayed 4 seconds"
+        "Phase 11.3 TEST ONLY: secondary-startup-timeout-test; parking delayed 4 seconds"
     );
     tvisor_util::println!(
         "Phase 11.3 backend=bcm2711-armstub MIDR={:#x} MPIDR={:#x}",
@@ -646,7 +648,7 @@ fn start_attempt(
     let start = io
         .release_start()
         .ok_or("missing secondary release timestamp")?;
-    if let Err(error) = wait_for_secondary(id, 1, deadline, start)
+    if let Err(error) = wait_for_secondary(id, 1, deadline, start, &mut attempt)
         .and_then(|()| crate::smp::verify_release_result(PhysAddr::new(address), resources.entry))
     {
         attempt.wait_failed();

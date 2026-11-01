@@ -1,6 +1,8 @@
 # Phase 11.3 startup ABI and ownership
 
-The current ABI is the 2026-11-01 [per-slot startup design](phase11_3_slot_refactor.md).
+The current lifecycle/wait protocol is the 2026-11-01
+[lifecycle refactor](phase11_3_lifecycle_refactor.md), building on the
+[per-slot startup design](phase11_3_slot_refactor.md).
 It replaces the original singleton startup record. There is no separate persistent
 identity/stack record: `PcpuContext` is the single source of these fields.
 
@@ -21,11 +23,11 @@ host-tested specialization assert the same layout.
 | 0 | `PcpuContext`: 64 bytes, world-switch fields at 0/8 |
 | 16 / 24 | Immutable logical ID / full affinity |
 | 32 / 40 / 48 | Immutable stack bottom / stack top / present |
-| 64 / 72 / 80 | Mailbox ready generation / worker state / terminal outcome |
+| 64 / 72 / 80 | Mailbox ready generation / lifecycle / entry claim |
 | 88 | Twenty atomic local checkpoint fields |
 | 248 | Four original entry observations |
 | 280 | Atomic validation failure mask |
-| 320 / 321 | One-time prepared / preparation-claimed flags |
+| 320 | Preparation-claimed flag; no prepared Boolean |
 
 `SecondaryStartup` occupies 256 bytes at slot offset 64. Generation is held only
 in its mailbox's ready word. `HostEl2Config` separately contains MAIR, TCR, root
@@ -54,22 +56,26 @@ used as a second assembly ABI. Views borrow their backing storage; production
 storage remains valid across guest execution and failure. Hosted fixtures keep
 storage stable before capturing simulated context addresses.
 
-## Protocol and Rust boundary
+## Lifecycle, waiting and Rust boundary
 
-The mailbox protocol is unchanged: Ready → Entered → Arrived → Parked, or
-Entered → Failed. Ready holds the one-shot generation; each transition checks
-it. CPU0 decides the overall terminal outcome exactly once. Parked means locally
-validated and about to hold with interrupts masked, not Online.
+The lifecycle is Offline → Prepared → Starting → Parked/Failed. Online is
+reserved for a later milestone. Generation is separate publication metadata;
+a private entry-claim Boolean protects the single checkpoint writer. There is
+no mailbox outcome or waiting-result field. Preparation publishes Prepared;
+the consuming release handle publishes Starting and executes DSB before any
+firmware operation, without implying the release completed.
 
 The trampoline scans full affinities, rejects missing/duplicate matches and
 checks the matched index against the context logical ID. It passes x0=slot,
 x1–x4=entry observations, x5=generation to Rust. Rust validates the pointer against
-the static array, acquire-observes config/ready and claims Entered before writing
-a checkpoint. No Rust code, stack memory access, lock or allocation precedes the
-coherent acquire boundary.
+the static array, acquire-observes config/ready and claims diagnostic ownership
+before writing a checkpoint. The claim consumes Starting into Parked or Failed.
+No Rust code or stack memory access precedes the coherent acquire boundary.
 
-No timeout, late arrival or failure authorizes a new publication, cell clear,
-release retry, mapping change or resource reclamation. A late worker may advance
-its diagnostic state but cannot replace a terminal failure. All later attempts
-fail the one-shot boot gate; no guest permit is produced after failed startup.
-See the current design for ABI checks, tests and repeated physical acceptance.
+The optional wait only returns readiness or a WaitError; timeout never changes
+lifecycle. CPU0's separate boot controller makes wait failure terminal for guest
+boot. Its private successful-wait receipt is bound to a slot and generation;
+late Parked or a successful new optional wait cannot mint a guest permit after
+that policy has failed. No timeout authorizes release retry, cell clearing,
+mapping changes or resource reclamation. See the lifecycle review for tests and
+repeated physical acceptance.

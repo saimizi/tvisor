@@ -1,5 +1,9 @@
 # Phase 11.3 per-CPU startup storage refactor
 
+The later [lifecycle/wait refactor](phase11_3_lifecycle_refactor.md) supersedes
+this report's worker/outcome protocol and preparation flags. This dated report
+retains the accepted per-slot storage design and its original test evidence.
+
 2026-11-01: **implementation and repeated acceptance complete; ready for review.** This design supersedes the singleton-record ABI
 in the original Task 3–15 reports. The earlier evidence remains a historical
 record of that implementation, not acceptance evidence for this ABI.
