@@ -55,3 +55,5 @@ pub fn halt() -> ! {
         core::hint::spin_loop();
     }
 }
+
+pub mod allocation_check;

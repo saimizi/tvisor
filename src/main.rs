@@ -15,11 +15,15 @@ use tvisor_util::gicv2;
 use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 use tvisor_util::{halt, println};
 
+#[cfg(feature = "all-core-stress-test")]
+mod all_core_test;
 mod boot;
 mod exception;
 mod guest;
 mod heap;
 mod management;
+#[cfg(all(feature = "all-core-stress-test", feature = "management-irq-test"))]
+compile_error!("acceptance features must be run separately");
 mod mm;
 mod pcpu;
 mod secondary;
@@ -243,3 +247,9 @@ pub fn panic(info: &core::panic::PanicInfo) -> ! {
     let _ = tvisor_util::debug_util::emergency_print(format_args!("PANIC: {}\n", info));
     halt()
 }
+
+#[cfg(all(
+    feature = "all-core-timeout-test",
+    feature = "secondary-startup-timeout-test"
+))]
+compile_error!("timeout acceptance features must be run separately");

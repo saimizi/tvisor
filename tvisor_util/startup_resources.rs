@@ -76,6 +76,27 @@ impl FrozenStartup {
     }
 }
 impl<const N: usize> BootTables<TableSet<'_, N>> {
+    /// Validate the complete release set before sealing once. No capability is
+    /// returned if any member fails; none can be added after the first release.
+    pub fn freeze_startups<const C: usize>(
+        &mut self,
+        resources: [Option<StartupResources>; C],
+        stacks: impl IntoIterator<Item = StackLayout>,
+    ) -> Result<[Option<FrozenStartup>; C], ResourceError> {
+        if resources.iter().all(Option::is_none) {
+            return Err(ResourceError::Layout);
+        }
+        self.validate_and_freeze(|tables| {
+            for r in resources.iter().flatten() {
+                validate_resources(tables, r)?;
+            }
+            for stack in stacks {
+                validate_stack(tables, stack).map_err(|_| ResourceError::Mapping)?;
+            }
+            Ok(())
+        })?;
+        Ok(resources.map(|r| r.map(|resources| FrozenStartup { resources })))
+    }
     pub fn freeze_startup(
         &mut self,
         resources: StartupResources,
@@ -264,6 +285,23 @@ mod tests {
         }
         crate::pcpu::map_stack(&mut t, resources.stack).unwrap();
         t
+    }
+    #[test]
+    fn group_validation_is_atomic_and_seals_before_any_capability_escapes() {
+        let r = resources();
+        let mut bad = r;
+        bad.entry = 0;
+        let mut storage = TableStorage::<16>::zeroed();
+        let mut boot = BootTables::new(tables(&mut storage, &r, None));
+        assert!(
+            boot.freeze_startups([Some(r), Some(bad)], [r.stack])
+                .is_err()
+        );
+        assert!(boot.edit().is_ok());
+        let proofs = boot.freeze_startups([Some(r), None], [r.stack]).unwrap();
+        assert!(proofs[0].is_some() && proofs[1].is_none());
+        assert!(boot.edit().is_err());
+        assert!(boot.freeze_startups([Some(r)], [r.stack]).is_err());
     }
     #[test]
     fn validates_real_page_tables_and_freezes_all_mutation() {

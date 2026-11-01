@@ -196,6 +196,7 @@ test; there is no return path to the U-Boot prompt.
 - [Phase 11.4 centralized HCR policy follow-up](docs/phase11_4_hcr_policy.md)
 - [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
 - [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
+- [Phase 11.5 all-core startup and concurrent resource acceptance](docs/phase11_5_status.md)
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)

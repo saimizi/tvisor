@@ -11,7 +11,10 @@ use tvisor_util::{
     secondary_mailbox::{CpuState, WaitError},
 };
 
-#[cfg(feature = "secondary-startup-timeout-test")]
+#[cfg(any(
+    feature = "secondary-startup-timeout-test",
+    feature = "all-core-timeout-test"
+))]
 #[path = "secondary_timeout_test.rs"]
 mod timeout_test;
 
@@ -21,8 +24,17 @@ fn startup(id: usize, generation: u64) -> Option<StartupView<'static>> {
     crate::pcpu::slot(id)?.startup_view(generation, HOST_EL2_CONFIG.get()?)
 }
 
+const MAX_CPUS: usize = tvisor_util::cpu_topology::MAX_CPUS;
+static BOOT_ATTEMPTS: [tvisor_util::secondary_boot::SecondaryBoot; MAX_CPUS] =
+    [const { tvisor_util::secondary_boot::SecondaryBoot::new() }; MAX_CPUS];
 static BOOT_ATTEMPT: tvisor_util::secondary_boot::SecondaryBoot =
     tvisor_util::secondary_boot::SecondaryBoot::new();
+static RELEASED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn required_mask() -> u64 {
+    crate::smp::topology()
+        .and_then(|t| tvisor_util::secondary_entry::secondary_mask(t.cpus()).ok())
+        .unwrap_or(0)
+}
 pub fn boot_status() -> tvisor_util::secondary_boot::BootStatus {
     BOOT_ATTEMPT.status()
 }
@@ -42,7 +54,10 @@ fn wait_for_secondary(
         unsafe { core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags)); }
         deadline.elapsed(start, now)
     });
-    #[cfg(feature = "secondary-startup-timeout-test")]
+    #[cfg(any(
+        feature = "secondary-startup-timeout-test",
+        feature = "all-core-timeout-test"
+    ))]
     tvisor_util::println!(
         "Phase 11.3 timeout-test wait elapsed ticks={} budget={}",
         deadline.elapsed(start, physical_counter()),
@@ -399,8 +414,13 @@ extern "C" fn secondary_main(
     );
     publish_checkpoint(record, state, entry, failures);
     if failures.0 == 0 {
-        #[cfg(feature = "secondary-startup-timeout-test")]
-        timeout_test::delay_parking();
+        #[cfg(any(
+            feature = "secondary-startup-timeout-test",
+            feature = "all-core-timeout-test"
+        ))]
+        if record.identity.logical_id as usize == timeout_test::TEST_CPU {
+            timeout_test::delay_parking();
+        }
         let _ = entry_claim.park();
     } else {
         let _ = entry_claim.fail();
@@ -412,26 +432,38 @@ extern "C" fn secondary_main(
 }
 
 /// One boot attempt under the documented Raspberry Pi 4 Model B firmware trust profile.
-pub fn start_one(
+pub fn start_all(
     fdt: dtoolkit::fdt::Fdt<'_>,
     policy: tvisor_util::el2_policy::HostTranslation,
-) -> Result<tvisor_util::secondary_boot::GuestPermit, &'static str> {
-    let attempt = BOOT_ATTEMPT
+) -> Result<tvisor_util::secondary_boot::AllGuestPermit, &'static str> {
+    let mut group = BOOT_ATTEMPT
         .begin()
-        .map_err(|_| "secondary boot already attempted")?;
-    let result = start_attempt(fdt, policy, attempt);
+        .map_err(|_| "secondary group already attempted")?;
+    let result = start_group(fdt, policy, &mut group).and_then(|(mask, permits)| {
+        group
+            .complete_all(mask, permits, crate::pcpu::has_fatal())
+            .map_err(|_| "incomplete secondary group")
+    });
     if result.is_err() {
-        #[cfg(feature = "secondary-startup-timeout-test")]
+        #[cfg(any(
+            feature = "secondary-startup-timeout-test",
+            feature = "all-core-timeout-test"
+        ))]
         timeout_test::observe_terminal_failure();
     }
     result
 }
-
-fn start_attempt(
+fn start_group(
     fdt: dtoolkit::fdt::Fdt<'_>,
     policy: tvisor_util::el2_policy::HostTranslation,
-    mut attempt: tvisor_util::secondary_boot::Attempt<'_>,
-) -> Result<tvisor_util::secondary_boot::GuestPermit, &'static str> {
+    group: &mut Attempt<'_>,
+) -> Result<
+    (
+        u64,
+        [Option<tvisor_util::secondary_boot::GuestPermit>; MAX_CPUS],
+    ),
+    &'static str,
+> {
     let topology = crate::smp::topology().ok_or("missing CPU topology")?;
     let midr: u64;
     let mpidr: u64;
@@ -446,7 +478,10 @@ fn start_attempt(
                 "unsupported Raspberry Pi 4 Model B backend profile"
             })?;
     let entry_contract = backend.contract();
-    #[cfg(feature = "secondary-startup-timeout-test")]
+    #[cfg(any(
+        feature = "secondary-startup-timeout-test",
+        feature = "all-core-timeout-test"
+    ))]
     tvisor_util::println!(
         "Phase 11.3 TEST ONLY: secondary-startup-timeout-test; parking delayed 4 seconds"
     );
@@ -455,42 +490,15 @@ fn start_attempt(
         midr,
         mpidr
     );
-    use tvisor_util::{
-        secondary_entry::{select_secondary, validate_spin_table_target},
-        system_info::PhysAddr,
-    };
     crate::pcpu::assert_boot_cpu_idle();
-    let topology = crate::smp::topology().ok_or("missing CPU topology")?;
-    let id = select_secondary(topology.cpus()).map_err(|_| "no eligible secondary")?;
-    // Check the platform evidence before making even reversible mapping changes.
+    let required = required_mask();
+    #[cfg(feature = "secondary-startup-timeout-test")]
+    let required = required & 2;
+    if required == 0 {
+        return Err("no eligible secondary");
+    }
     if !entry_contract.el2_mmu_off || !entry_contract.coherent {
-        return Err("secondary entry/coherency contract is unverified");
-    }
-    let address = validate_spin_table_target(topology.cpus(), id)
-        .map_err(|_| "invalid secondary release target")?;
-    // Phase 11.3 releases only logical CPU1; other slots remain unpublished.
-    if id != 1 {
-        return Err("Phase 11.3 requires logical CPU1");
-    }
-    let slot = crate::pcpu::slot(id).ok_or("secondary slot unavailable")?;
-    let identity = slot.identity().ok_or("secondary resources unavailable")?;
-    if !tvisor_util::pcpu::find_slot_by_affinity(&crate::pcpu::PCPU_SLOTS, identity.affinity)
-        .is_some_and(|matched| core::ptr::eq(matched, slot))
-    {
-        return Err("secondary affinity is not uniquely routed to its slot");
-    }
-    let (affinity, stack_bottom, stack_top, context) = (
-        identity.affinity,
-        identity.stack_bottom,
-        identity.stack_top,
-        identity.context,
-    );
-    if !topology
-        .cpus()
-        .iter()
-        .any(|cpu| cpu.enabled && cpu.logical_id == Some(id) && cpu.affinity == affinity)
-    {
-        return Err("prepared secondary affinity differs from topology");
+        return Err("unverified entry contract");
     }
     let actual_mair: u64;
     let actual_tcr: u64;
@@ -528,16 +536,131 @@ fn start_attempt(
     if !progressed {
         return Err("physical startup counter did not progress");
     }
-    tvisor_util::println!(
-        "Phase 11.3 selected CPU{} affinity={:#x} cell={:#x}; deadline ticks={} frequency={} Hz",
-        id,
-        affinity,
-        address,
-        deadline.ticks(),
-        frequency
+    HOST_EL2_CONFIG.publish(policy)?;
+    let config = HOST_EL2_CONFIG.get().ok_or("host config unavailable")?;
+    let mut attempts: [Option<Attempt<'_>>; MAX_CPUS] = core::array::from_fn(|_| None);
+    let mut resources = [None; MAX_CPUS];
+    for id in 1..MAX_CPUS {
+        if required & (1 << id) == 0 {
+            continue;
+        }
+        attempts[id] = Some(
+            BOOT_ATTEMPTS[id]
+                .begin()
+                .map_err(|_| "CPU already attempted")?,
+        );
+        resources[id] = Some(prepare_resources(id, policy)?);
+        crate::pcpu::slot(id)
+            .ok_or("slot missing")?
+            .publish_startup(1, config)?;
+    }
+    let stacks = crate::pcpu::prepared_stacks()?;
+    let mut frozen = crate::mm::validate_and_freeze_startups(resources, &stacks)
+        .map_err(|_| "group resource validation/freeze failed")?;
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0",out(reg) ctr,options(nomem,nostack,preserves_flags));
+    }
+    let line = 4u64 << ((ctr >> 16) & 15);
+    let mut publications: [Option<tvisor_util::startup_publication::PublishedStartup<'static>>;
+        MAX_CPUS] = core::array::from_fn(|_| None);
+    // Complete all cleaning/publication before any secondary can execute Rust.
+    for id in 1..MAX_CPUS {
+        let Some(proof) = frozen[id].take() else {
+            continue;
+        };
+        let address = tvisor_util::secondary_entry::validate_spin_table_target(topology.cpus(), id)
+            .map_err(|_| "invalid target")?;
+        let plan = tvisor_util::startup_publication::PublicationPlan::new(proof, address, line)
+            .map_err(|_| "invalid publication plan")?;
+        let mut io = unsafe { crate::smp::HardwarePublication::new() };
+        publications[id] = Some(
+            plan.publish(
+                topology.cpus(),
+                id,
+                entry_contract,
+                startup(id, 1).ok_or("startup unavailable")?,
+                &mut io,
+            )
+            .map_err(|_| "publication failed")?,
+        );
+    }
+    group
+        .release_attempted()
+        .map_err(|_| "invalid aggregate release policy")?;
+    let mut permits = core::array::from_fn(|_| None);
+    for id in 1..MAX_CPUS {
+        let Some(published) = publications[id].take() else {
+            continue;
+        };
+        let mut attempt = attempts[id].take().ok_or("attempt missing")?;
+        attempt
+            .release_attempted()
+            .map_err(|_| "invalid release policy")?;
+        let mut io = unsafe { crate::smp::HardwarePublication::new() };
+        published
+            .release(&mut io)
+            .map_err(|_| "release failed; reset required")?;
+        let released = RELEASED.fetch_or(1 << id, Ordering::AcqRel) | (1 << id);
+        let start = io.release_start().ok_or("missing release timestamp")?;
+        tvisor_util::println!(
+            "Phase 11.5 requested CPU{} generation=1 released_mask={:#x}",
+            id,
+            released
+        );
+        if let Err(e) = wait_for_secondary(id, 1, deadline, start, &mut attempt).and_then(|()| {
+            crate::smp::verify_release_set(
+                released,
+                resources[id].ok_or("resources missing")?.entry,
+            )
+        }) {
+            attempt.wait_failed();
+            group.wait_failed();
+            return Err(e);
+        }
+        permits[id] = Some(
+            attempt
+                .complete(
+                    startup(id, 1).ok_or("startup missing")?,
+                    1,
+                    crate::pcpu::has_fatal(),
+                )
+                .map_err(|_| "checkpoint cannot authorize boot")?,
+        );
+    }
+    Ok((required, permits))
+}
+
+fn prepare_resources(
+    id: usize,
+    policy: tvisor_util::el2_policy::HostTranslation,
+) -> Result<tvisor_util::startup_resources::StartupResources, &'static str> {
+    use tvisor_util::{secondary_entry::validate_spin_table_target, system_info::PhysAddr};
+    let topology = crate::smp::topology().ok_or("missing topology")?;
+    let address =
+        validate_spin_table_target(topology.cpus(), id).map_err(|_| "invalid release target")?;
+    let slot = crate::pcpu::slot(id).ok_or("secondary slot unavailable")?;
+    let identity = slot.identity().ok_or("secondary resources unavailable")?;
+    if !tvisor_util::pcpu::find_slot_by_affinity(&crate::pcpu::PCPU_SLOTS, identity.affinity)
+        .is_some_and(|matched| core::ptr::eq(matched, slot))
+    {
+        return Err("secondary affinity is not uniquely routed to its slot");
+    }
+    let (affinity, stack_bottom, stack_top, context) = (
+        identity.affinity,
+        identity.stack_bottom,
+        identity.stack_top,
+        identity.context,
     );
+    if !topology
+        .cpus()
+        .iter()
+        .any(|cpu| cpu.enabled && cpu.logical_id == Some(id) && cpu.affinity == affinity)
+    {
+        return Err("prepared secondary affinity differs from topology");
+    }
     crate::mm::map_firmware_release_cell(PhysAddr::new(address))
-        .map_err(|_| "release-cell mapping failed")?;
+        .map_err(|_| "release mapping failed")?;
     unsafe extern "C" {
         static __text_start: u8;
         static __text_end: u8;
@@ -563,13 +686,6 @@ fn start_attempt(
     ] {
         validate_identity_range(start, end)?;
     }
-    HOST_EL2_CONFIG.publish(policy)?;
-    slot.publish_startup(
-        1,
-        HOST_EL2_CONFIG
-            .get()
-            .ok_or("host configuration unavailable")?,
-    )?;
     use tvisor_util::{
         startup_resources::{StartupResources, release_page},
         system_info::PhysRegion,
@@ -622,41 +738,7 @@ fn start_attempt(
     };
     crate::smp::verify_unreleased_cell(PhysAddr::new(address))
         .map_err(|_| "release cell is not zero or identity mapped")?;
-    let stacks = crate::pcpu::prepared_stacks()?;
-    let frozen = crate::mm::validate_and_freeze_startup(&resources, &stacks)
-        .map_err(|_| "startup mapping validation/freeze failed")?;
-    let record = startup(id, 1).ok_or("startup record unavailable")?;
-    let ctr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
-    }
-    let line = 4u64 << ((ctr >> 16) & 15);
-    let plan = tvisor_util::startup_publication::PublicationPlan::new(frozen, address, line)
-        .map_err(|_| "invalid cache publication plan")?;
-    // SAFETY: actual active identity mappings were checked; the frozen plan
-    // names retained static/allocated resources and a reserved unique cell.
-    let mut io = unsafe { crate::smp::HardwarePublication::new() };
-    let published = plan
-        .publish(topology.cpus(), id, entry_contract, record, &mut io)
-        .map_err(|_| "startup cache publication/preflight failed")?;
-    attempt
-        .release_attempted()
-        .map_err(|_| "invalid secondary release lifecycle")?;
-    published
-        .release(&mut io)
-        .map_err(|_| "secondary release failed; reset required")?;
-    let start = io
-        .release_start()
-        .ok_or("missing secondary release timestamp")?;
-    if let Err(error) = wait_for_secondary(id, 1, deadline, start, &mut attempt)
-        .and_then(|()| crate::smp::verify_release_result(PhysAddr::new(address), resources.entry))
-    {
-        attempt.wait_failed();
-        return Err(error);
-    }
-    attempt
-        .complete(record, 1, crate::pcpu::has_fatal())
-        .map_err(|_| "secondary checkpoint cannot permit guest boot")
+    Ok(resources)
 }
 
 fn validate_identity_range(start: u64, end: u64) -> Result<(), &'static str> {

@@ -16,7 +16,7 @@ mod acceptance;
 
 static CHANNELS: [[Channel; MAX_CPUS]; MAX_CPUS] =
     [const { [const { Channel::new() }; MAX_CPUS] }; MAX_CPUS];
-static ACTIVATE: AtomicBool = AtomicBool::new(false);
+static ACTIVATE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 struct CpuRuntime {
     target: AtomicU64,
     ready: AtomicBool,
@@ -59,7 +59,7 @@ impl CpuRuntime {
 }
 static CPUS: [CpuRuntime; MAX_CPUS] = [const { CpuRuntime::new() }; MAX_CPUS];
 
-fn current_id() -> Option<usize> {
+pub(crate) fn current_id() -> Option<usize> {
     let pointer: u64;
     unsafe {
         asm!("mrs {}, tpidr_el2", out(reg) pointer, options(nomem, nostack, preserves_flags))
@@ -75,7 +75,7 @@ pub fn counter() -> u64 {
     };
     value
 }
-fn frequency() -> u64 {
+pub(crate) fn frequency() -> u64 {
     let value;
     unsafe { asm!("mrs {}, cntfrq_el0", out(reg) value, options(nomem, nostack, preserves_flags)) };
     value
@@ -137,7 +137,7 @@ fn initialize_local(worker: bool) -> Result<(), &'static str> {
     cpu.ready.store(true, Ordering::Release);
     Ok(())
 }
-/// Boot CPU only, before shared tables are frozen and CPU1 is released.
+/// Boot CPU only, before shared tables are frozen and any secondary is released.
 pub fn initialize_boot() -> Result<(), &'static str> {
     if current_id() != Some(0) {
         return Err("management boot initialization on worker");
@@ -179,6 +179,9 @@ pub fn request(
         return Err("self request unsupported");
     }
     let target = target(target_id).ok_or("management target not ready")?;
+    if CPUS[target_id].stopped.load(Ordering::Acquire) {
+        return Err("management target stopped");
+    }
     let pending = CHANNELS[source][target_id]
         .submit(operation, argument)
         .map_err(|_| "management channel busy/exhausted")?;
@@ -189,7 +192,7 @@ pub fn request(
     };
     Ok(pending)
 }
-fn wait(pending: &mut Pending<'_>) -> Result<Reply, &'static str> {
+pub(crate) fn wait(pending: &mut Pending<'_>) -> Result<Reply, &'static str> {
     let ticks = frequency()
         .checked_mul(2)
         .filter(|n| *n > 0 && *n < (1 << 63))
@@ -219,67 +222,99 @@ impl Drop for RestoreIrq {
 /// Returns after validating the worker's interface and bidirectional boot-time
 /// dispatch. CPU0 restores its previous IRQ mask before guest preparation.
 pub fn activate_secondary() -> Result<(), &'static str> {
-    ACTIVATE.store(true, Ordering::Release);
-    unsafe { asm!("dsb ishst", "sev", options(nostack, preserves_flags)) };
-    let start = counter();
-    let ticks = frequency()
-        .checked_mul(2)
-        .ok_or("invalid counter frequency")?;
-    for _ in 0..100_000_000 {
-        if crate::pcpu::has_fatal() {
-            return Err("worker management initialization failed");
-        }
-        if target(1).is_some() {
-            break;
-        }
-        if counter().wrapping_sub(start) >= ticks {
-            return Err("worker management initialization timeout");
-        }
-        core::hint::spin_loop();
-    }
-    if target(1).is_none() {
-        return Err("worker management poll limit");
-    }
-    report(1);
+    let required = crate::secondary::required_mask();
     let _restore = RestoreIrq(LocalIrq::save_and_mask());
     LocalIrq::restore(0);
-    let mut ping = request(1, Operation::Ping, 0x1140)?;
-    if wait(&mut ping)?
-        != (Reply {
-            value: 0x1140,
-            failed: false,
-        })
-    {
-        return Err("worker ping mismatch");
-    }
-    let mut test = request(1, Operation::WorkerTest, 1024)?;
-    if wait(&mut test)?
-        != (Reply {
-            value: worker_test(1024),
-            failed: false,
-        })
-    {
-        return Err("worker test mismatch");
-    }
-    let mut rejected = request(1, Operation::WorkerTest, 4097)?;
-    if !wait(&mut rejected)?.failed {
-        return Err("unbounded worker test accepted");
-    }
-    let start = counter();
-    while CPUS[0].requests.load(Ordering::Acquire) == 0 {
-        if counter().wrapping_sub(start) >= ticks {
-            return Err("worker-to-boot ping timeout");
+    for id in 1..MAX_CPUS {
+        if required & (1 << id) == 0 {
+            continue;
         }
-        core::hint::spin_loop();
+        ACTIVATE[id]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "management activation already attempted")?;
+        unsafe { asm!("dsb ishst", "sev", options(nostack, preserves_flags)) };
+        let ticks = frequency().checked_mul(2).ok_or("invalid counter")?;
+        let start = counter();
+        let mut ready = false;
+        for _ in 0..100_000_000 {
+            if crate::pcpu::has_fatal() {
+                return Err("management initialization failed");
+            }
+            if target(id).is_some()
+                && crate::pcpu::PCPU_SLOTS[id].startup.mailbox.lifecycle()
+                    == tvisor_util::secondary_mailbox::CpuState::Online
+            {
+                ready = true;
+                break;
+            }
+            if counter().wrapping_sub(start) >= ticks {
+                return Err("management initialization timeout");
+            }
+            core::hint::spin_loop();
+        }
+        if !ready {
+            return Err("management initialization poll limit");
+        }
+        report(id);
+        let value = 0x1150 + id as u64;
+        let mut ping = request(id, Operation::Ping, value)?;
+        if wait(&mut ping)?
+            != (Reply {
+                value,
+                failed: false,
+            })
+        {
+            return Err("worker ping mismatch");
+        }
+        let mut job = request(id, Operation::WorkerTest, 1024)?;
+        if wait(&mut job)?
+            != (Reply {
+                value: worker_test(1024),
+                failed: false,
+            })
+        {
+            return Err("worker computation mismatch");
+        }
+        let mut rejected = request(id, Operation::WorkerTest, 4097)?;
+        if !wait(&mut rejected)?.failed {
+            return Err("unbounded worker job accepted");
+        }
+        // Owner startup also sends a source-bearing ping to CPU0. Waiting here
+        // has IRQ enabled and holds no allocator/logging/table lock.
+        let start = counter();
+        for poll in 0..100_000_000 {
+            if CHANNELS[id][0].completed_count() != 0 {
+                break;
+            }
+            if poll == 99_999_999 {
+                return Err("worker-to-boot ping poll limit");
+            }
+            if counter().wrapping_sub(start) >= ticks {
+                return Err("worker-to-boot ping timeout");
+            }
+            core::hint::spin_loop();
+        }
+        tvisor_util::println!("Phase 11.5 CPU{} Online management bidirectional PASS", id);
+    }
+    for id in 1..MAX_CPUS {
+        if required & (1 << id) != 0 {
+            for other in 0..id {
+                if (other == 0 || required & (1 << other) != 0) && target(id) == target(other) {
+                    return Err("duplicate GIC targets");
+                }
+            }
+        }
     }
     tvisor_util::println!(
-        "Phase 11.4 bidirectional ping and bounded worker test passed; HCR={:#x}",
+        "Phase 11.5 all-core management PASS required_mask={:#x} HCR={:#x}",
+        required,
         check_routing()?
     );
     #[cfg(feature = "management-irq-test")]
     acceptance::before_linux()?;
     Ok(())
 }
+
 fn worker_test(count: u64) -> u64 {
     let mut value = 0x114u64;
     for i in 0..count {
@@ -328,6 +363,11 @@ pub fn dispatch(gic: &GicV2, ack: InterruptAck, guest: bool, guest_masked: bool)
         Operation::WorkerTest if id != 0 && request.argument <= 4096 => Reply {
             value: worker_test(request.argument),
             failed: false,
+        },
+        #[cfg(feature = "all-core-stress-test")]
+        Operation::RunTest if id != 0 => Reply {
+            value: request.argument,
+            failed: !crate::all_core_test::submit(id, request.argument),
         },
         Operation::Park if id != 0 => {
             let mailbox = &crate::pcpu::PCPU_SLOTS[id].startup.mailbox;
@@ -421,11 +461,14 @@ pub fn notify_fatal() {
     }
 }
 pub fn worker(id: usize, generation: u64) -> ! {
-    while !ACTIVATE.load(Ordering::Acquire) {
+    while !ACTIVATE[id].load(Ordering::Acquire) {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
     CPUS[id].generation.store(generation, Ordering::Relaxed);
-    if id != 1 || initialize_local(true).is_err() {
+    if id == 0
+        || crate::secondary::required_mask() & (1 << id) == 0
+        || initialize_local(true).is_err()
+    {
         let _ = unsafe {
             crate::pcpu::PCPU_SLOTS[id]
                 .startup
@@ -464,8 +507,14 @@ pub fn worker(id: usize, generation: u64) -> ! {
     loop {
         unsafe { asm!("msr daifset, #2", options(nostack, preserves_flags)) };
         stop_if_requested();
+        #[cfg(feature = "all-core-stress-test")]
+        if crate::all_core_test::pending(id) {
+            unsafe { asm!("msr daifclr, #2", options(nostack, preserves_flags)) };
+            crate::all_core_test::worker(id);
+            continue;
+        }
         #[cfg(feature = "management-irq-test")]
-        if test_worker.active() {
+        if id == 1 && test_worker.active() {
             unsafe { asm!("msr daifclr, #2", options(nostack, preserves_flags)) };
             test_worker.step();
             continue;
@@ -514,6 +563,8 @@ pub fn guest_entry() {
     }
     #[cfg(feature = "management-irq-test")]
     acceptance::linux_progress();
+    #[cfg(feature = "all-core-stress-test")]
+    crate::all_core_test::guest_progress();
 }
 
 #[cfg(feature = "management-irq-test")]

@@ -108,21 +108,30 @@ pub fn verify_unreleased_cell(address: PhysAddr) -> Result<(), StartupContractEr
     Ok(())
 }
 
-/// CPU0's post-arrival evidence: only the selected firmware cell may change.
-/// Reads use the existing mappings; no mapping or firmware state is modified.
-pub fn verify_release_result(selected: PhysAddr, entry: u64) -> Result<(), &'static str> {
-    let contract = startup_contract().ok_or("startup contract unavailable after release")?;
+/// CPU0 validates the cumulative released set; untouched cells must remain zero.
+pub fn verify_release_set(released: u64, entry: u64) -> Result<(), &'static str> {
+    let contract = startup_contract().ok_or("startup contract unavailable")?;
+    let topology = topology().ok_or("topology unavailable")?;
     for cell in contract.release_cells() {
-        let value = read_release_cell(cell.start())
-            .map_err(|_| "release-cell readback failed after arrival")?;
+        let value = read_release_cell(cell.start()).map_err(|_| "release-cell readback failed")?;
+        let expected = if topology.cpus().iter().any(|c| {
+            c.logical_id.is_some_and(|id| released & (1 << id) != 0)
+                && c.startup
+                    == tvisor_util::cpu_topology::StartupMethod::SpinTable {
+                        release_address: cell.start().value(),
+                    }
+        }) {
+            entry
+        } else {
+            0
+        };
         println!(
-            "Phase 11.3 release readback cell={:#x} value={:#x}",
+            "Phase 11.5 release readback cell={:#x} value={:#x}",
             cell.start().value(),
             value
         );
-        let expected = if cell.start() == selected { entry } else { 0 };
         if value != expected {
-            return Err("unexpected firmware release-cell value after arrival");
+            return Err("unexpected release-cell value");
         }
     }
     Ok(())

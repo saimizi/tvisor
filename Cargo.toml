@@ -13,6 +13,10 @@ secondary-startup-timeout-test = ["baremetal"]
 # Hardware acceptance: masked EL1 probes and worker-to-guest SGI traffic.
 management-irq-test = ["baremetal"]
 
+all-core-timeout-test = ["baremetal"]
+# Hardware acceptance: concurrent EL2 allocations, logging and management traffic.
+all-core-stress-test = ["baremetal"]
+
 [lib]
 name = "tvisor_util"
 crate-type = ["rlib"]

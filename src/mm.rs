@@ -540,15 +540,19 @@ pub fn validate_device_identity(region: PhysRegion) -> Result<(), PrepareError> 
     Ok(())
 }
 
-/// Validate and seal under the same lock; later writer requests are rejected.
-pub fn validate_and_freeze_startup(
-    resources: &tvisor_util::startup_resources::StartupResources,
+pub fn validate_and_freeze_startups(
+    resources: [Option<tvisor_util::startup_resources::StartupResources>;
+        tvisor_util::cpu_topology::MAX_CPUS],
     stacks: &FixedList<tvisor_util::pcpu::StackLayout, { tvisor_util::cpu_topology::MAX_CPUS }>,
-) -> Result<tvisor_util::startup_resources::FrozenStartup, PrepareError> {
+) -> Result<
+    [Option<tvisor_util::startup_resources::FrozenStartup>; tvisor_util::cpu_topology::MAX_CPUS],
+    PrepareError,
+> {
     let mut guard = TVISOR_TABLES.lock();
-    let tables = guard.as_mut().ok_or(PrepareError::Validation)?;
-    tables
-        .freeze_startup(*resources, stacks.into_iter().copied())
+    guard
+        .as_mut()
+        .ok_or(PrepareError::Validation)?
+        .freeze_startups(resources, stacks.into_iter().copied())
         .map_err(|_| PrepareError::Validation)
 }
 

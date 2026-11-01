@@ -9,7 +9,9 @@ The subsequent [lifecycle/waiting refactor](phase11_3_lifecycle_refactor.md) sep
 CPU state from wait results and terminal boot policy; all scoped acceptance gates
 have passed again. [Phase 11.4 implementation and acceptance](phase11_4_status.md)
 is complete with passing scoped hardware acceptance and the full quick regression,
-and is ready for user review. Phases 11.5–11.6 remain implementation contracts.
+and has been accepted. Phase 11.5 implementation and validation are recorded in
+[the all-core handoff](phase11_5_status.md). Phase 11.6 remains an implementation
+contract.
 
 Implementation progress and board observations for 11.0 are recorded in
 [Phase 11.0 status](phase11_0_status.md) and the

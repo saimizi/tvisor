@@ -27,13 +27,40 @@ pub struct Attempt<'a> {
 }
 /// Only a matching validated Parked checkpoint can create this consuming permit.
 pub struct GuestPermit {
-    _private: (),
+    logical_id: usize,
 }
 impl GuestPermit {
     pub fn run<T>(self, guest: impl FnOnce() -> T) -> T {
         guest()
     }
 }
+/// Consuming evidence for every required secondary, never a count alone.
+pub struct AllGuestPermit {
+    _permits: [Option<GuestPermit>; crate::cpu_topology::MAX_CPUS],
+}
+impl AllGuestPermit {
+    fn combine(
+        required: u64,
+        permits: [Option<GuestPermit>; crate::cpu_topology::MAX_CPUS],
+    ) -> Result<Self, BootError> {
+        let valid = (1u64 << crate::cpu_topology::MAX_CPUS) - 1;
+        if required == 0 || required & 1 != 0 || required & !valid != 0 {
+            return Err(BootError::InvalidCheckpoint);
+        }
+        for (id, p) in permits.iter().enumerate() {
+            if (required & (1 << id) != 0) != p.is_some()
+                || p.as_ref().is_some_and(|p| p.logical_id != id)
+            {
+                return Err(BootError::InvalidCheckpoint);
+            }
+        }
+        Ok(Self { _permits: permits })
+    }
+    pub fn run<T>(self, guest: impl FnOnce() -> T) -> T {
+        guest()
+    }
+}
+
 impl SecondaryBoot {
     pub const fn new() -> Self {
         Self {
@@ -112,6 +139,37 @@ impl Attempt<'_> {
             .state
             .compare_exchange(2, 6, Ordering::AcqRel, Ordering::Acquire);
     }
+    /// Aggregate policy accepts only the complete set of per-CPU boot receipts.
+    pub fn complete_all(
+        self,
+        required: u64,
+        permits: [Option<GuestPermit>; crate::cpu_topology::MAX_CPUS],
+        fatal: bool,
+    ) -> Result<AllGuestPermit, BootError> {
+        if self.boot.status() != BootStatus::ReleaseAttempted {
+            return Err(BootError::InvalidTransition);
+        }
+        let permit = if fatal {
+            Err(BootError::InvalidCheckpoint)
+        } else {
+            AllGuestPermit::combine(required, permits)
+        };
+        match permit {
+            Ok(p) => {
+                self.boot
+                    .state
+                    .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| BootError::InvalidTransition)?;
+                Ok(p)
+            }
+            Err(e) => {
+                self.boot
+                    .state
+                    .store(BootStatus::WaitFailed as u64, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
     pub fn complete(
         self,
         record: StartupView<'_>,
@@ -137,7 +195,9 @@ impl Attempt<'_> {
             .state
             .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BootError::InvalidTransition)?;
-        Ok(GuestPermit { _private: () })
+        Ok(GuestPermit {
+            logical_id: record.identity.logical_id as usize,
+        })
     }
 }
 impl Drop for Attempt<'_> {
@@ -193,6 +253,41 @@ mod tests {
         let r = s.get(7).unwrap();
         r.mailbox.begin_start(7).unwrap();
         r.mailbox.claim_entry(7).unwrap().park().unwrap();
+    }
+    fn cpu_permit(id: usize) -> GuestPermit {
+        let gate = SecondaryBoot::new();
+        let s = Fixture::new(id, id as u64, 0x800000 + id as u64 * 0x20000, 0x430000, 7);
+        let mut a = gate.begin().unwrap();
+        a.release_attempted().unwrap();
+        park(&s);
+        a.wait_for_parked(s.get(7).unwrap(), 0, 10, 1, || 0)
+            .unwrap();
+        a.complete(s.get(7).unwrap(), 7, false).unwrap()
+    }
+    #[test]
+    fn aggregate_gate_requires_each_matching_cpu_receipt_and_is_one_shot() {
+        for invalid in 0..5 {
+            let gate = SecondaryBoot::new();
+            let mut a = gate.begin().unwrap();
+            a.release_attempted().unwrap();
+            let mut permits = core::array::from_fn(|_| None);
+            permits[1] = Some(cpu_permit(1));
+            permits[2] = Some(cpu_permit(if invalid == 1 { 1 } else { 2 }));
+            if invalid != 0 {
+                permits[3] = Some(cpu_permit(3));
+            }
+            let result = a.complete_all(if invalid == 2 { 6 } else { 14 }, permits, invalid == 3);
+            if invalid == 4 {
+                let mut n = 0;
+                result.unwrap().run(|| n += 1);
+                assert_eq!(n, 1);
+                assert_eq!(gate.status(), BootStatus::Success);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(gate.status(), BootStatus::WaitFailed);
+            }
+            assert!(gate.begin().is_err());
+        }
     }
     #[test]
     fn guest_runs_once_only_after_a_matching_successful_boot_wait() {

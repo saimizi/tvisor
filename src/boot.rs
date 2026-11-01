@@ -368,7 +368,7 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 boot GIC setup failed: {}", error);
             break 'wait;
         }
-        let permit = match crate::secondary::start_one(*fdt, policy) {
+        let permit = match crate::secondary::start_all(*fdt, policy) {
             Ok(permit) => permit,
             Err(error) => {
                 println!(
@@ -383,7 +383,11 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 management activation failed: {}", error);
             break 'wait;
         }
-        println!("Phase 11.3 validated secondary parked; entering one-vCPU Linux guest");
+        #[cfg(feature = "all-core-stress-test")]
+        crate::all_core_test::before_guest().expect("all-core boot stress failed");
+        println!(
+            "Phase 11.5 all required secondaries validated and Online; entering one-vCPU Linux guest"
+        );
         match permit.run(crate::guest::run_guest) {
             Ok(()) => println!("Linux guest exited cleanly; halting"),
             Err(error) => println!("Linux guest execution failed: {}", error),

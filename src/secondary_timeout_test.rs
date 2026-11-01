@@ -7,8 +7,12 @@ use tvisor_util::{
     println,
     secondary_boot::{BootError, BootStatus, StartupDeadline},
     secondary_mailbox::CpuState,
-    system_info::PhysAddr,
 };
+
+#[cfg(feature = "all-core-timeout-test")]
+pub(super) const TEST_CPU: usize = 2;
+#[cfg(not(feature = "all-core-timeout-test"))]
+pub(super) const TEST_CPU: usize = 1;
 
 const MAX_POLLS: usize = 250_000_000;
 
@@ -41,7 +45,7 @@ pub(super) fn delay_parking() {
 /// Observe a real late arrival without retrying release or minting a permit.
 /// Invoked after the production boot-policy attempt has finalized failure.
 pub(super) fn observe_terminal_failure() {
-    let Some(record) = startup(1, 1) else {
+    let Some(record) = startup(TEST_CPU, 1) else {
         println!("Phase 11.3 timeout-test FAIL: no retained record");
         return;
     };
@@ -89,9 +93,10 @@ pub(super) fn observe_terminal_failure() {
             late_deadline.elapsed(late_start, physical_counter())
         })
         .is_ok();
-    // This probes only the one-shot gate; it never calls start_one/release again.
+    // This probes only the one-shot gate; it never calls start_all/release again.
     let retry_rejected = matches!(BOOT_ATTEMPT.begin(), Err(BootError::AlreadyAttempted));
-    let retained = startup(1, 1).is_some_and(|again| record.slot_address() == again.slot_address())
+    let retained = startup(TEST_CPU, 1)
+        .is_some_and(|again| record.slot_address() == again.slot_address())
         && crate::pcpu::validate_secondary_context(
             record.identity.logical_id,
             record.identity.affinity,
@@ -102,23 +107,24 @@ pub(super) fn observe_terminal_failure() {
     unsafe extern "C" {
         fn __secondary_entry();
     }
-    let cells_unchanged = crate::smp::topology()
-        .and_then(|topology| {
-            tvisor_util::secondary_entry::validate_spin_table_target(
-                topology.cpus(),
-                record.identity.logical_id as usize,
-            )
-            .ok()
-        })
-        .is_some_and(|address| {
-            crate::smp::verify_release_result(
-                PhysAddr::new(address),
-                __secondary_entry as *const () as u64,
-            )
-            .is_ok()
-        });
+    let cells_unchanged = crate::smp::verify_release_set(
+        super::RELEASED.load(Ordering::Acquire),
+        __secondary_entry as *const () as u64,
+    )
+    .is_ok();
+    #[cfg(feature = "all-core-timeout-test")]
+    let group_preserved = startup(1, 1).is_some_and(|s| s.mailbox.state(1) == Ok(CpuState::Parked))
+        && startup(3, 1).is_some_and(|s| s.mailbox.state(1) == Ok(CpuState::Prepared))
+        && super::RELEASED.load(Ordering::Acquire) == 6;
+    #[cfg(not(feature = "all-core-timeout-test"))]
+    let group_preserved = true;
+    println!(
+        "Phase 11.5 timeout-test CPU{} group_preserved={}",
+        TEST_CPU, group_preserved
+    );
     let guest_blocked = BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
-    let passed = late_wait_succeeded
+    let passed = group_preserved
+        && late_wait_succeeded
         && guest_blocked
         && retry_rejected
         && retained

@@ -20,6 +20,25 @@ pub enum EntryError {
     CoherencyUnverified,
 }
 
+/// Every enabled non-boot CPU must have one bounded, unique logical slot.
+pub fn secondary_mask(cpus: &[CpuDescriptor]) -> Result<u64, EntryError> {
+    let mut seen = 0u64;
+    for cpu in cpus.iter().filter(|c| c.enabled) {
+        let id = cpu.logical_id.ok_or(EntryError::InvalidTarget)?;
+        if id >= crate::cpu_topology::MAX_CPUS || seen & (1 << id) != 0 {
+            return Err(EntryError::InvalidTarget);
+        }
+        seen |= 1 << id;
+    }
+    if seen & 1 == 0 {
+        return Err(EntryError::InvalidTarget);
+    }
+    if seen & !1 == 0 {
+        return Err(EntryError::MissingTarget);
+    }
+    Ok(seen & !1)
+}
+
 /// Select the lowest enabled non-boot logical CPU. Backend and release-cell
 /// validation are separate: a failing target must not silently fall back to a
 /// different CPU or startup mechanism.
@@ -93,6 +112,19 @@ mod tests {
             el2_mmu_off: true,
             coherent: true,
         }
+    }
+    #[test]
+    fn all_core_membership_is_topology_driven_and_rejects_duplicates() {
+        let cpus = [
+            cpu(3, StartupMethod::Psci),
+            cpu(0, StartupMethod::Psci),
+            cpu(1, StartupMethod::Psci),
+        ];
+        assert_eq!(secondary_mask(&cpus), Ok(0b1010));
+        assert!(secondary_mask(&[cpus[0], cpus[1], cpus[0]]).is_err());
+        assert!(secondary_mask(&[cpus[0]]).is_err());
+        assert!(secondary_mask(&[cpus[1], cpu(4, StartupMethod::Psci)]).is_err());
+        assert_eq!(secondary_mask(&[cpus[1]]), Err(EntryError::MissingTarget));
     }
     #[test]
     fn selects_lowest_enabled_non_boot_logical_id() {

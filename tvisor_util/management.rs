@@ -10,6 +10,7 @@ pub enum Operation {
     WorkerTest = 2,
     Park = 3,
     FatalStop = 4,
+    RunTest = 5,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -73,6 +74,9 @@ impl Channel {
         self.writer.store(false, Ordering::Release);
         result
     }
+    pub fn completed_count(&self) -> u64 {
+        self.acknowledged.load(Ordering::Acquire)
+    }
     /// Called by the target's non-reentrant IRQ dispatcher. CAS also makes
     /// duplicate/spurious doorbells harmless and prevents duplicate execution.
     pub fn take(&self) -> Option<Request<'_>> {
@@ -91,6 +95,7 @@ impl Channel {
             2 => Operation::WorkerTest,
             3 => Operation::Park,
             4 => Operation::FatalStop,
+            5 => Operation::RunTest,
             _ => unreachable!(),
         };
         Some(Request {
