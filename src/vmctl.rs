@@ -892,6 +892,8 @@ impl VmCtl {
         let guest_stage2_root_pa = self.guest_stage2_page_table_root().unwrap().value();
         let guest_stage2_regs =
             guest_stage2_register_values(self.vm_id(), guest_stage2_root_pa, pa_range)?;
+        #[cfg(feature = "management-irq-test")]
+        crate::management::verify_stage2_profiles(&guest_stage2_regs);
         unsafe { guest::activate_guest_stage2(&guest_stage2_regs) };
         *need_deactivate = true;
 

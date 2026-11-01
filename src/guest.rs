@@ -145,6 +145,7 @@ pub unsafe fn invalidate_icache_all() {
 /// invalidates prior guest TLB entries for VMID 1, and synchronizes context with `isb`.
 #[inline]
 pub unsafe fn activate_guest_stage2(regs: &GuestStage2RegisterValues) {
+    assert_eq!(regs.hcr_el2, tvisor_util::el2_policy::GUEST_HCR);
     unsafe {
         // 1. Ensure descriptor writes are visible to hardware table walkers
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
@@ -184,15 +185,27 @@ pub unsafe fn activate_guest_stage2(regs: &GuestStage2RegisterValues) {
             options(nostack, preserves_flags),
         );
     }
+    assert_hcr_profile(tvisor_util::el2_policy::GUEST_HCR);
+}
+
+fn assert_hcr_profile(expected: u64) {
+    let actual: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, hcr_el2", out(reg) actual, options(nomem, nostack, preserves_flags));
+    }
+    assert_eq!(actual, expected, "EL2 HCR policy readback mismatch");
 }
 
 /// Deactivates Stage-2 translation and cleanly invalidates the guest VM context.
 ///
 /// Crucially, `tlbi vmalls12e1is` is executed while `VTTBR_EL2` still has the guest's
 /// VMID installed so that invalidation targets the correct VMID. Stage-2 translation
-/// and `VTTBR_EL2` are only cleared after invalidation is fully synchronized.
+/// is disabled and `VTTBR_EL2` cleared only after invalidation is synchronized.
+/// Restore HOST_HCR, removing guest-only SWIO/TSC as well as VM while keeping
+/// host IRQ routing. Ordinary IRQ/emulated exits retain GUEST_HCR and do not
+/// call this function. The caller must keep IRQs masked during the transition.
 #[inline]
-unsafe fn deactivate_guest_stage2() {
+pub(crate) unsafe fn deactivate_guest_stage2() {
     unsafe {
         // 1. Invalidate all Stage 1 & 2 translations for the current VMID while VTTBR_EL2 is active
         core::arch::asm!("tlbi vmalls12e1is", options(nostack, preserves_flags));
@@ -200,21 +213,18 @@ unsafe fn deactivate_guest_stage2() {
         // 2. Complete invalidation across Inner Shareable domain and synchronize
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
 
-        // 3. Disable only Stage-2 translation, preserving the other HCR_EL2
-        // controls selected by tvisor. CPTR_EL2 is deliberately left at its
-        // valid Phase-9 value because it contains architecturally RES1 fields
-        // and must not be cleared with xzr.
+        // 3. Install the explicit host profile. Do not inherit guest/firmware
+        // controls. Leave CPTR_EL2 at its valid shared host/guest policy value.
         core::arch::asm!(
-            "mrs x9, HCR_EL2",
-            "bic x9, x9, #1",
-            "msr HCR_EL2, x9",
+            "msr HCR_EL2, {host_hcr}",
             "isb",
             "msr VTTBR_EL2, xzr",
             "isb",
-            out("x9") _,
+            host_hcr = in(reg) tvisor_util::el2_policy::HOST_HCR,
             options(nostack, preserves_flags),
         );
     }
+    assert_hcr_profile(tvisor_util::el2_policy::HOST_HCR);
 }
 
 #[derive(Debug)]

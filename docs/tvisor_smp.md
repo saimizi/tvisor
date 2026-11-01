@@ -416,6 +416,10 @@ their VM; migration and VMID reuse across CPUs are deferred to Phase 12.
 
 ## 11.4: GICv2 and management interrupts
 
+The proposed [IRQ ownership and HCR policy](irq_handling.md) defines explicit
+host/guest profiles, per-source dispatch and completion rules, and the remaining
+follow-up to the initial Phase 11.4 implementation.
+
 Split distributor-wide SPI setup (boot CPU once) from per-CPU banked SGI/PPI and
 CPU-interface setup. Validate MMIO mappings first on each CPU. Discover each
 CPU's actual GIC target-interface mask; do not assume it equals `1 << logical_id`.

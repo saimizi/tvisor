@@ -325,3 +325,91 @@ pub fn linux_progress() {
         );
     }
 }
+
+/// Exercise the production activation/deactivation operations with the actual,
+/// retained guest root, before any guest executes. UART RX is already enabled
+/// by VM preparation, so mask its physical SPI during the host-only SGI window;
+/// the current-EL test handler intentionally accepts only management SGIs.
+pub fn stage2_profiles(
+    regs: &tvisor_util::guest_stage2_translation::GuestStage2RegisterValues,
+) -> Result<(), &'static str> {
+    macro_rules! read {
+        ($reg:literal) => {{
+            let value: u64;
+            unsafe {
+                asm!(concat!("mrs {}, ", $reg), out(reg) value, options(nomem, nostack, preserves_flags));
+            }
+            value
+        }};
+    }
+    use tvisor_util::el2_policy::{GUEST_HCR, HOST_HCR};
+    let gic = gicv2::global().ok_or("HCR test GIC missing")?;
+    if read!("daif") & (1 << 7) == 0 || read!("hcr_el2") != HOST_HCR {
+        return Err("HCR test requires masked host profile");
+    }
+    let uart = crate::guest::get_host_console_irq();
+    let enabled = gic
+        .gicd_isenabler_n_get(uart)
+        .map_err(|_| "UART mask read failed")?;
+    gic.gicd_disable_irq(uart)
+        .map_err(|_| "UART test mask failed")?;
+    // Drop restores the original IRQ mask before the UART is re-enabled below,
+    // including on an ordinary error return from this test closure.
+    let result = (|| {
+        let _restore = RestoreIrq(LocalIrq::save_and_mask());
+        unsafe { crate::guest::activate_guest_stage2(regs) };
+        if read!("hcr_el2") != GUEST_HCR || read!("vttbr_el2") != regs.vttbr_el2 {
+            return Err("guest HCR/VTTBR readback failed");
+        }
+        unsafe { crate::guest::deactivate_guest_stage2() };
+        if read!("hcr_el2") != HOST_HCR || read!("vttbr_el2") != 0 {
+            return Err("host HCR/VTTBR restoration failed");
+        }
+        let before = CPUS[0].current_irqs.load(Ordering::Acquire);
+        arm(1)?;
+        LocalIrq::restore(0);
+        let start = counter();
+        let mut serviced = false;
+        for _ in 0..100_000_000 {
+            if counter().wrapping_sub(start) >= frequency() * 2 {
+                return Err("post-deactivation host SGI deadline");
+            }
+            if CPUS[0].current_irqs.load(Ordering::Acquire) > before {
+                serviced = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !serviced {
+            return Err("post-deactivation host SGI poll limit");
+        }
+        drain()?;
+        let host_irqs = CPUS[0].current_irqs.load(Ordering::Acquire) - before;
+        let _ = LocalIrq::save_and_mask();
+        // A second activation checks that deactivation left no inherited guest
+        // controls or VMID. Keep the tables retained throughout both cycles.
+        unsafe { crate::guest::activate_guest_stage2(regs) };
+        if read!("hcr_el2") != GUEST_HCR || read!("vttbr_el2") != regs.vttbr_el2 {
+            return Err("guest HCR/VTTBR reactivation failed");
+        }
+        unsafe { crate::guest::deactivate_guest_stage2() };
+        if read!("hcr_el2") != HOST_HCR || read!("vttbr_el2") != 0 {
+            return Err("final host HCR/VTTBR restoration failed");
+        }
+        if FAILED.load(Ordering::Acquire) {
+            return Err("HCR test management request failed");
+        }
+        tvisor_util::println!(
+            "Phase 11.4 TEST HCR profiles PASS: guest={:#x} host={:#x} VTTBR-cleared=true reactivated=true host_sgi_irqs={}",
+            GUEST_HCR,
+            HOST_HCR,
+            host_irqs
+        );
+        Ok(())
+    })();
+    if enabled {
+        gic.gicd_enable_irq(uart)
+            .map_err(|_| "UART test mask restore failed")?;
+    }
+    result
+}

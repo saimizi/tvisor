@@ -90,12 +90,10 @@ fn target(id: usize) -> Option<CpuTarget> {
 fn check_routing() -> Result<u64, &'static str> {
     let hcr: u64;
     unsafe { asm!("mrs {}, hcr_el2", out(reg) hcr, options(nomem, nostack, preserves_flags)) };
-    // IRQ to EL2, non-VHE, no TGE, VI/VF, FIQ or SError rerouting.
-    if hcr
-        & ((1 << 34) | (1 << 27) | (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | (1 << 3))
-        != 1 << 4
-    {
-        return Err("invalid management HCR routing");
+    // A temporary EL2 handler can run under either configured profile. Both
+    // carry the shared IRQ policy; reject all unconfigured/stale register bits.
+    if hcr != tvisor_util::el2_policy::HOST_HCR && hcr != tvisor_util::el2_policy::GUEST_HCR {
+        return Err("invalid management HCR profile");
     }
     Ok(hcr)
 }
@@ -502,7 +500,11 @@ fn report(id: usize) {
 /// happens outside IRQ with no allocator/table lock held.
 pub fn guest_entry() {
     let hcr = check_routing().expect("guest entry lost physical IRQ routing");
-    assert_ne!(hcr & 1, 0, "guest stage-2 disabled");
+    assert_eq!(
+        hcr,
+        tvisor_util::el2_policy::GUEST_HCR,
+        "guest HCR profile not installed"
+    );
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if !REPORTED.swap(true, Ordering::Relaxed) {
         tvisor_util::println!(
@@ -512,4 +514,11 @@ pub fn guest_entry() {
     }
     #[cfg(feature = "management-irq-test")]
     acceptance::linux_progress();
+}
+
+#[cfg(feature = "management-irq-test")]
+pub fn verify_stage2_profiles(
+    regs: &tvisor_util::guest_stage2_translation::GuestStage2RegisterValues,
+) {
+    acceptance::stage2_profiles(regs).expect("HCR transition acceptance failed");
 }

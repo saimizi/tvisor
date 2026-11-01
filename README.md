@@ -192,6 +192,8 @@ test; there is no return path to the U-Boot prompt.
 
 - [Development plan](docs/development_plan.md)
 - [Phase 11 physical SMP design](docs/tvisor_smp.md)
+- [IRQ ownership, HCR profiles and handling policy (proposal)](docs/irq_handling.md)
+- [Phase 11.4 centralized HCR policy follow-up](docs/phase11_4_hcr_policy.md)
 - [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
 - [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
 - [System-information model](docs/system_information_model.md)

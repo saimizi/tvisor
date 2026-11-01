@@ -7,6 +7,12 @@ Phase 11.4 acceptance by the user and merge remain separate from this implementa
 and validation result. Validation and the local review bundle captured the working
 tree before the review commit.
 
+Review follow-up: the proposed [IRQ ownership and HCR policy](irq_handling.md)
+records the requested centralized profiles and broader physical-IRQ dispatch
+contract. The [HCR follow-up](phase11_4_hcr_policy.md) implements the profile changes
+and records their new validation. Broader dispatch work remains pending; the
+results below describe the initial implementation.
+
 ## Work breakdown
 
 1. Audit physical IRQ routing, acknowledgement and guest world switches.

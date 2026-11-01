@@ -68,8 +68,15 @@ const _: () = {
 
 pub const HCR_RW: u64 = 1 << 31;
 pub const HCR_IMO: u64 = 1 << 4;
+pub const HCR_VM: u64 = 1;
+pub const HCR_SWIO: u64 = 1 << 1;
+pub const HCR_TSC: u64 = 1 << 19;
 // Route host physical IRQs to EL2; FIQ/SError policy and all traps stay clear.
 pub const HOST_HCR: u64 = HCR_RW | HCR_IMO; // VM=TGE=E2H=VI=VF=0.
+/// Controls added while a guest stage-2 context is installed. Temporary exits
+/// to EL2 retain this profile; full deactivation restores HOST_HCR explicitly.
+pub const GUEST_HCR_ADDITIONS: u64 = HCR_VM | HCR_SWIO | HCR_TSC;
+pub const GUEST_HCR: u64 = HOST_HCR | GUEST_HCR_ADDITIONS;
 pub const CPTR_RES1: u64 = (3 << 12) | 0x3ff;
 pub const HOST_CPTR: u64 = CPTR_RES1; // TFP/TTA/TCPAC clear; allow host FP/SIMD.
 pub const HOST_HSTR: u64 = 0;
@@ -129,6 +136,19 @@ impl HostTranslation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_and_guest_hcr_profiles_have_explicit_shared_and_guest_only_controls() {
+        assert_eq!(HOST_HCR, HCR_RW | HCR_IMO);
+        assert_eq!(GUEST_HCR & HOST_HCR, HOST_HCR);
+        assert_eq!(GUEST_HCR & !HOST_HCR, GUEST_HCR_ADDITIONS);
+        assert_eq!(HOST_HCR & GUEST_HCR_ADDITIONS, 0);
+        assert_eq!(GUEST_HCR_ADDITIONS, HCR_VM | HCR_SWIO | HCR_TSC);
+        // FMO, AMO, VF, VI, VSE, TGE and E2H stay clear in both profiles.
+        let prohibited =
+            (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 27) | (1 << 34);
+        assert_eq!(HOST_HCR & prohibited, 0);
+        assert_eq!(GUEST_HCR & prohibited, 0);
+    }
     #[test]
     fn matches_existing_board_translation_without_reserved_or_host_extension_bits() {
         let p = HostTranslation::new(0x4100000, 4).unwrap();
