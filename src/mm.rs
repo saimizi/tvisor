@@ -242,7 +242,7 @@ pub fn setup_el2_stage1_page_table(
 
     validate_el2_stage1_page_table(&tables, uart_region.start().value(), live_dtb_pages)?;
 
-    println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.1 EL2 stack mapping validation: static boot guard validated; table pages={}/{}",
         tables.used_pages(),
         MAX_TABLE_PAGES
@@ -358,7 +358,7 @@ pub fn map_usable_ram(
         .push(live_dtb_aligned)
         .map_err(|_| PrepareError::Validation)?;
 
-    let used_pages = with_tables(|tables| {
+    let _used_pages = with_tables(|tables| {
         map_identity_regions_excluding(tables, memory_map.usable_ram(), &exclusions, true, false)?;
         map_identity(
             tables,
@@ -374,10 +374,10 @@ pub fn map_usable_ram(
         Ok(tables.used_pages())
     })?;
 
-    println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.1 final EL2 mappings: {} guards unmapped (one static boot); table pages={}/{}",
         secondary_stacks.len() + 1,
-        used_pages,
+        _used_pages,
         MAX_TABLE_PAGES
     );
 
@@ -562,6 +562,7 @@ pub fn startup_tables_frozen() -> bool {
 
 /// Boot-only: reserve both backing pages and the complete scratch table path.
 /// Failure retains allocations; no runtime table-page allocation is permitted.
+#[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 pub fn prepare_tlb_scratch(value: u64) -> Result<[u64; 2], &'static str> {
     let a = allocate_page().map_err(|_| "scratch page allocation")?;
     let b = allocate_page().map_err(|_| "scratch page allocation")?;
@@ -596,10 +597,13 @@ pub fn prepare_tlb_scratch(value: u64) -> Result<[u64; 2], &'static str> {
     };
     Ok([a.value(), b.value()])
 }
+#[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 core::arch::global_asm!(include_str!("tlb_sync.S"));
+#[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 unsafe extern "C" {
     fn __el2_scratch_sync(entry: *mut u64);
 }
+#[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 pub fn replace_tlb_scratch(epoch: u64, old: u64, new: u64) -> Result<(), &'static str> {
     if !crate::tlb::ready_to_write(epoch) || !crate::tlb::owns(old) || !crate::tlb::owns(new) {
         return Err("invalid scratch update authority");

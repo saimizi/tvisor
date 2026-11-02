@@ -1,4 +1,3 @@
-use alloc::format;
 use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
@@ -12,11 +11,7 @@ use tvisor_util::system_info::{PhysAddr, PhysRegion};
 use tvisor_util::*;
 use tvisor_util::{aarch64_reg::*, gicv2::global};
 
-use crate::{
-    guest::get_host_console_irq,
-    heap::{self, stats},
-    mm,
-};
+use crate::{guest::get_host_console_irq, heap, mm};
 
 static PHASE7_RO_CANARY: u64 = 0x726f_6461_7461_5037;
 static PHASE7_RW_CANARY: AtomicU64 = AtomicU64::new(0x7277_6461_7461_5037);
@@ -115,15 +110,17 @@ pub unsafe fn enter_private_el2(el2_stage1_page_table: mm::El2Stage1PageTable) -
 #[unsafe(no_mangle)]
 extern "C" fn private_el2_main(mair_el2: u64, tcr_el2: u64, ttbr0_el2: u64, sctlr_el2: u64) -> ! {
     crate::pcpu::assert_boot_cpu_idle();
-    println!("Phase 6 private EL2 foundations active");
-    println!("    SP: {:#018x}", Sp::dump().value);
+    tvisor_util::diagnostic_println!("Phase 6 private EL2 foundations active");
+    tvisor_util::diagnostic_println!("    SP: {:#018x}", Sp::dump().value);
+    #[cfg(feature = "diagnostics")]
     if let Some(spsel) = SpSel::dump() {
-        println!(" SPSel: {:#018x}", spsel.value);
+        tvisor_util::diagnostic_println!(" SPSel: {:#018x}", spsel.value);
     }
+    #[cfg(feature = "diagnostics")]
     if let Some(vbar) = VbarEl2::dump() {
-        println!("VBAR_EL2: {:#018x}", vbar.value);
+        tvisor_util::diagnostic_println!("VBAR_EL2: {:#018x}", vbar.value);
     }
-    println!("Phase 7 checkpoint 1: switching EL2 stage-1 page tables");
+    tvisor_util::diagnostic_println!("Phase 7 checkpoint 1: switching EL2 stage-1 page tables");
     // SAFETY: All values were validated before takeover, table stores were
     // published, and this routine never returns to the inherited regime.
     unsafe { __switch_el2_stage1_page_tables(mair_el2, tcr_el2, ttbr0_el2, sctlr_el2) }
@@ -180,15 +177,15 @@ fn check_switched_environment(
     expected_sctlr: u64,
 ) {
     let stack_canary = 0x7476_6973_6f72_5037_u64;
-    println!("Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active");
+    tvisor_util::diagnostic_println!("Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active");
     let actual_mair = MairEl2::dump().expect("EL2 MAIR readback").value;
     let actual_tcr = TcrEl2::dump().expect("EL2 TCR readback").value;
     let actual_ttbr0 = Ttbr0El2::dump().expect("EL2 TTBR0 readback").value;
     let actual_sctlr = SctlrEl2::dump().expect("EL2 SCTLR readback").value;
-    println!("  MAIR_EL2={:#018x}", actual_mair);
-    println!("   TCR_EL2={:#018x}", actual_tcr);
-    println!(" TTBR0_EL2={:#018x}", actual_ttbr0);
-    println!(" SCTLR_EL2={:#018x}", actual_sctlr);
+    tvisor_util::diagnostic_println!("  MAIR_EL2={:#018x}", actual_mair);
+    tvisor_util::diagnostic_println!("   TCR_EL2={:#018x}", actual_tcr);
+    tvisor_util::diagnostic_println!(" TTBR0_EL2={:#018x}", actual_ttbr0);
+    tvisor_util::diagnostic_println!(" SCTLR_EL2={:#018x}", actual_sctlr);
     assert_eq!(actual_mair, expected_mair);
     assert_eq!(actual_tcr, expected_tcr);
     assert_eq!(actual_ttbr0, expected_ttbr0);
@@ -200,7 +197,9 @@ fn check_switched_environment(
         PHASE7_RW_CANARY.load(Ordering::Relaxed),
         0x5037_7772_6974_6162
     );
-    println!("Phase 7 checkpoint 3: register, stack, and image validation passed");
+    tvisor_util::diagnostic_println!(
+        "Phase 7 checkpoint 3: register, stack, and image validation passed"
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -289,11 +288,11 @@ extern "C" fn post_switch_page_tables(
             break 'wait;
         }
         let memory_map = memory_map().expect("published boot memory map");
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 11.0 DT firmware reservations verified before allocation; spin-table cells={}",
             startup.release_cells().len()
         );
-        let initialized = match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
+        let _initialized = match mm::initialize_allocator_after_takeover(memory_map, live_dtb) {
             Ok(initialized) => initialized,
             Err(error) => {
                 println!("Allocator initialization failed: {}", error);
@@ -301,13 +300,13 @@ extern "C" fn post_switch_page_tables(
             }
         };
 
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 8 allocator initialized after takeover: RAM={} reserved={} in-use={} unused={} DTB={}",
-            initialized.stats.ram_pages,
-            initialized.stats.reserved_pages,
-            initialized.stats.in_use_pages,
-            initialized.stats.unused_pages,
-            initialized.live_dtb,
+            _initialized.stats.ram_pages,
+            _initialized.stats.reserved_pages,
+            _initialized.stats.in_use_pages,
+            _initialized.stats.unused_pages,
+            _initialized.live_dtb,
         );
 
         // Bitmap metadata lives in the already mapped tvisor image. Dynamic
@@ -320,7 +319,7 @@ extern "C" fn post_switch_page_tables(
         }
 
         // Initialize heap allocator
-        let heap = match heap::initialize(None) {
+        let _heap = match heap::initialize(None) {
             Ok(heap) => heap,
             Err(error) => {
                 println!("Heap initialization failed: {}", error);
@@ -328,25 +327,27 @@ extern "C" fn post_switch_page_tables(
             }
         };
 
-        let initialize_heap_state = format!(
-            "Rust heap initialized: arena=[{}, {}) bytes={} free={}",
-            heap.arena_start, heap.arena_end, heap.stats.arena_bytes, heap.stats.free_bytes,
-        );
-        println!("{}", initialize_heap_state);
-
-        let Ok(current_heap) = stats() else {
-            println!("Failed to get current heap stats");
-            break 'wait;
-        };
-
-        let current_heap_state = format!(
-            "Rust heap now: arena=[{:#018x}, {:#018x}) bytes={} free={}",
-            current_heap.arena_start,
-            current_heap.arena_start + current_heap.arena_bytes,
-            current_heap.arena_bytes,
-            current_heap.free_bytes
-        );
-        println!("{}", current_heap_state);
+        #[cfg(feature = "diagnostics")]
+        {
+            tvisor_util::diagnostic_println!(
+                "Rust heap initialized: arena=[{}, {}) bytes={} free={}",
+                _heap.arena_start,
+                _heap.arena_end,
+                _heap.stats.arena_bytes,
+                _heap.stats.free_bytes,
+            );
+            let Ok(current_heap) = heap::stats() else {
+                println!("Failed to get current heap stats");
+                break 'wait;
+            };
+            tvisor_util::diagnostic_println!(
+                "Rust heap now: arena=[{:#018x}, {:#018x}) bytes={} free={}",
+                current_heap.arena_start,
+                current_heap.arena_start + current_heap.arena_bytes,
+                current_heap.arena_bytes,
+                current_heap.free_bytes
+            );
+        }
 
         let policy = match tvisor_util::el2_policy::HostTranslation::new(
             expected_ttbr0,
@@ -368,6 +369,7 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 boot GIC setup failed: {}", error);
             break 'wait;
         }
+        #[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
         crate::tlb::prepare().expect("scratch mapping preparation failed");
         match crate::secondary::start_all(*fdt, policy) {
             Ok(()) => (),
@@ -392,16 +394,10 @@ extern "C" fn post_switch_page_tables(
         #[cfg(feature = "tlb-update-test")]
         crate::tlb::before_guest().expect("EL2 mapping acceptance failed");
         #[cfg(not(feature = "tlb-update-test"))]
-        {
-            crate::tlb::remap().expect("Online mapping update failed");
-            crate::tlb::park_workers().expect("worker parking failed");
-            crate::tlb::remap().expect("Parked mapping update failed");
-        }
+        crate::tlb::park_workers().expect("worker parking failed");
         #[cfg(feature = "all-core-stress-test")]
         crate::all_core_test::before_guest().expect("all-core boot stress failed");
-        println!(
-            "Phase 11.6 all required secondaries validated and Parked; entering one-vCPU Linux guest"
-        );
+        println!("tvisor: entering one-vCPU Linux guest");
         if let Err(error) = crate::secondary::ensure_guest_authorized() {
             println!("Secondary boot gate rejected guest: {}", error);
             break 'wait;

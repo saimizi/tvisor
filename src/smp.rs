@@ -6,7 +6,7 @@ use tvisor_util::{
     aarch64_reg::MpidrEl1,
     cpu_startup::{StartupContractError, StartupMemoryContract, discover_startup_memory},
     cpu_topology::{CpuDiscoveryError, CpuTopology, discover_cpu_topology},
-    println,
+    diagnostic_println,
     system_info::PhysAddr,
 };
 
@@ -32,17 +32,18 @@ pub fn startup_contract() -> Option<&'static StartupMemoryContract> {
 pub fn discover(fdt: Fdt<'_>) -> Result<(), DiscoveryError> {
     let mpidr = MpidrEl1::dump().ok_or(DiscoveryError::MissingMpidr)?.value;
     let topology = discover_cpu_topology(fdt, mpidr).map_err(DiscoveryError::Topology)?;
-    println!("Physical CPU discovery: boot MPIDR={:#x}", mpidr);
+    diagnostic_println!("Physical CPU discovery: boot MPIDR={:#x}", mpidr);
+    #[cfg(feature = "diagnostics")]
     for cpu in topology.cpus() {
-        println!("    {:?}", cpu);
+        diagnostic_println!("    {:?}", cpu);
     }
-    println!("    PSCI DT description: {:?}", topology.psci);
+    diagnostic_println!("    PSCI DT description: {:?}", topology.psci);
     if topology.psci.is_some() {
-        println!(
+        diagnostic_println!(
             "    PSCI EL2 eligibility/version/CPU_ON/entry contract: unverified; no firmware calls"
         );
     } else {
-        println!("    PSCI: not advertised; conduit/version/CPU_ON queries skipped");
+        diagnostic_println!("    PSCI: not advertised; conduit/version/CPU_ON queries skipped");
     }
 
     let contract = discover_startup_memory(fdt, &topology).map_err(DiscoveryError::Contract)?;
@@ -51,12 +52,17 @@ pub fn discover(fdt: Fdt<'_>) -> Result<(), DiscoveryError> {
     contract
         .verify_release_cells(read_release_cell)
         .map_err(DiscoveryError::Contract)?;
+    #[cfg(feature = "diagnostics")]
     for cell in contract.release_cells() {
-        println!("    Spin-table release cell={} initial value=0", cell);
+        diagnostic_println!("    Spin-table release cell={} initial value=0", cell);
     }
-    println!("    DT startup interface validated; firmware instructions are not inspected");
-    println!("    Secondary EL2/MMU/cache/coherency state must be validated at 11.3 entry");
-    println!("    Secondary release deferred until Phase 11.3 final boot preflight");
+    diagnostic_println!(
+        "    DT startup interface validated; firmware instructions are not inspected"
+    );
+    diagnostic_println!(
+        "    Secondary EL2/MMU/cache/coherency state must be validated at 11.3 entry"
+    );
+    diagnostic_println!("    Secondary release deferred until Phase 11.3 final boot preflight");
     crate::pcpu::prepare_boot_cpu(&topology).map_err(DiscoveryError::Pcpu)?;
     TOPOLOGY.call_once(|| topology);
     STARTUP_CONTRACT.call_once(|| contract);
@@ -108,7 +114,7 @@ pub fn verify_release_set(released: u64, entry: u64) -> Result<(), &'static str>
     let topology = topology().ok_or("topology unavailable")?;
     for cell in contract.release_cells() {
         let value = read_release_cell(cell.start()).map_err(|_| "release-cell readback failed")?;
-        println!(
+        diagnostic_println!(
             "Phase 11.5 release readback cell={:#x} value={:#x}",
             cell.start().value(),
             value

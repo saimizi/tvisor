@@ -2,14 +2,16 @@
 
 Phase 11.5 is accepted. Phase 11.6 implements a serialized EL2 stage-1
 scratch-page update protocol using the existing per-CPU contexts, management
-channels and worker loops. Local checks pass. Hardware acceptance and the
-six-hour final regression are **pending**, following a controller failure before
-tvisor was loaded. This is not a completed Phase 11.6 acceptance report.
+channels and worker loops. The diagnostics/build-configuration cleanup passed
+all local and hardware regression checks, including the full six-hour physical
+SMP run, which completed on 2026-11-03 at 04:30 JST. Final power-off was verified.
+These results satisfy the Phase 11.6 implementation/regression gate; user review
+and acceptance remain separate.
 
 ## Runtime scope
 
-Before secondary release and table freeze, CPU0 reserves two physical pages and
-the complete table path for one Normal, inner-shareable, writable, non-executable
+In TLB acceptance images, before secondary release and table freeze, CPU0
+reserves two physical pages and the complete table path for one Normal, inner-shareable, writable, non-executable
 4 KiB mapping at VA `0x1_0000_0000`. The backing pages and table pages remain
 allocated until reset. Ordinary table editing remains frozen. The only runtime
 exception accepts this fixed scratch leaf, its exact old descriptor, and the
@@ -20,10 +22,19 @@ CPU0 coordinates updates under the explicit host HCR profile, with the guest
 deactivated. Guest-active calls are rejected before starting an epoch. Workers
 remain host-only. Guest stage-2 changes and guest SMP remain Phase 12 work.
 
-Normal images perform one update with Online workers, park and ping every
-worker, then perform another update with Parked workers before entering Linux.
-All eligible CPUs are activated through the existing startup path. Parked
-workers retain their EL2 regime and remain responsive to management SGIs.
+Normal images activate all eligible CPUs, park and ping every worker, and enter
+Linux. They keep EL2 mappings frozen and do not reserve scratch backing or run
+remapping self-tests. Parked workers retain their EL2 regime and remain
+responsive to management SGIs. `src/tlb_test.rs` contains the opt-in scratch
+driver; the shared update state and break-before-make table primitives remain
+in the reusable utility modules.
+
+`diagnostics` enables verbose startup/resource messages in either debug or
+release builds. It is off by default. All hardware acceptance features enable
+it automatically. `diagnostics` alone does not enable scratch allocation or
+remapping. Fatal reports and boot validation remain active in quiet builds;
+failed secondary startup still dumps its checkpoint. Successful remap records
+are compiled only with `tlb-update-test` or `tlb-update-timeout-test`.
 
 ## Update protocol
 
@@ -89,21 +100,24 @@ per-CPU resources remain retained until reset.
 
 | Image/runner mode | Required result |
 |---|---|
-| Normal / `bringup` | Online update, responsive Parked workers, Parked update, single-vCPU Linux and console checks |
+| Normal / `quiet` | Full four-boot quick guest regression with acceptance messages absent; no UART-based SMP gate claimed |
+| `diagnostics` / `bringup` | Responsive Parked workers, single-vCPU Linux and console checks; no scratch remaps |
 | `tlb-update-test` / `mapping` | 32 Online and 16 Parked remaps, exact epochs/signatures, old-page poisoning, unchanged allocator baseline, 35-second Linux timer/memory probe |
 | `tlb-update-timeout-test` / `mapping-timeout` | CPU2 reaches quiescence late; failure stays terminal, late acknowledgement rejected, old mapping/backing retained and guest entry blocked |
-| `all-core-stress-test` / `stress` | Both remaps plus the existing all-core allocator/heap/logging/IPI workload, including workers running alongside Linux's 120-second probe |
-| Normal / `quick` | Four cold boots, 35-second smoke, full 600-second soak and post-soak probe |
-| Normal / `overnight` | Eleven cold boots, 35-second smoke, full 21,600-second soak and five post-soak probes |
+| `all-core-stress-test` / `stress` | Existing all-core allocator/heap/logging/IPI workload, including workers running alongside Linux's 120-second probe |
+| `diagnostics` / `quick` | Four cold boots, 35-second smoke, full 600-second soak and post-soak probe |
+| `diagnostics` / `overnight` | Eleven cold boots, 35-second smoke, full 21,600-second soak and five post-soak probes |
 
-Each successful boot must contain the existing unique per-CPU resource and
+Each successful diagnostics-enabled SMP boot must contain the unique per-CPU resource and
 bidirectional management checks, followed by an observed physical SMP gate.
 `online_mask` counts initialized retaining CPUs, including Parked CPUs;
 `parked_mask` is the actual Parked subset. Both are derived from per-CPU runtime
 state under lifecycle serialization, rather than copied from topology masks.
 On the four-core platform they must be `0xf` and `0xe`. Each parked worker must
 also answer a fresh ping. The runner requires the exact remap epoch sequence
-for the selected image. Guest DT CPU count remains one.
+recorded by the manifest (zero for new normal/stress images, 48 for mapping
+acceptance). Older frozen bundles retain their two-remap expectation. Guest DT
+CPU count remains one.
 
 The fault image is opt-in and delays CPU2 for four seconds against a two-second
 quiescence deadline. It observes the real late owner, verifies unchanged mapping
@@ -114,13 +128,42 @@ sequence exhaustion and repeated epochs with concurrent owners.
 
 ## Current verification
 
-Native debug and optimized library suites pass all **200 tests**, including
-128 mapping epochs with four concurrent modeled owners. These tests check the
-software protocol; they do not validate physical TLB behavior. Normal,
-mapping-acceptance, timeout and concurrent-stress bare-metal builds pass. The
-linked helper checker verifies the exact maintenance sequence and rejects nine
-negative mutations. The existing secondary-entry checker and eleven negative
-mutations continue to pass.
+The final suite used the staged cleanup on top of `bb294f9`, with immutable
+source/artifact hashes, frozen host runners and the existing Linux 6.18.2
+fixtures. Evidence is retained in
+`docs/evidence/diagnostics_regression_20261102_01/`. No Linux image was rebuilt.
+Only this completion report and documentation labels were updated afterward;
+implementation and runner source still match the tested snapshots.
+
+All 200 native tests pass in debug, optimized and diagnostics-enabled
+configurations. Ten warning-free bare-metal variants pass linked checks:
+ordinary debug/release, diagnostics debug/release, mapping, mapping timeout,
+allocator stress, management IRQ, single-secondary timeout and all-core timeout.
+Quiet ELF checks confirm that success messages and scratch acceptance helpers
+are absent while failure diagnostics remain. Entry checks reject eleven
+negative mutations; the TLBI helper check rejects nine. IRQ-frame checks cover
+Q0–Q31, FPCR/FPSR, exception return and vector/frame layout.
+
+| Hardware check | Final result |
+|---|---|
+| Scratch remapping | PASS: 48 exact epochs, 32 Online and 16 Parked; unchanged allocator baseline; Linux probe passed |
+| CPU2 timeout | PASS: real late acknowledgement rejected, old mapping/backing retained, guest entry blocked |
+| Concurrent Linux stress | PASS: both allocator baselines restored; 120.323-second guest probe, 428 wakeups and 1,969 memory passes |
+| Quiet default-image quick | PASS: all four boots, acceptance output absent, 600.461-second soak, smoke and post-reboot probes |
+| Diagnostics-enabled physical SMP overnight | PASS: all eleven boots and full 21,600.334-second soak; physical SMP gates passed on every boot |
+
+The quiet soak recorded 2,136 wakeups, 8,135 memory passes and maximum lateness
+7.573 ms. The overnight soak recorded 76,832 wakeups, 289,655 memory passes and
+maximum lateness 50.007 ms. Neither had any wakeups over 500 ms late. Overnight
+completed 379 tagged guest commands and 360 independent console/IRQ checks;
+timer IRQ samples increased strictly from 20,800 to 5,405,184. All eleven fresh
+UART boot segments contained the required physical SMP gate and no fatal
+markers. The suite stopped successfully after verified power-off, independently
+confirmed through the controller. Guest CPU count remained one.
+
+Earlier manual boots confirmed the quiet default output. The first overnight
+attempt was interrupted at the user's request for console inspection; it is
+retained as incomplete and is not counted as the completed six-hour pass above.
 
 The first hardware pilot is preserved in
 `docs/evidence/phase11_6/mapping-02/`. It failed in `power_on_uboot`, before any
@@ -128,17 +171,27 @@ tvisor artifact was transferred or executed: relay confirmation completed after
 the firmware countdown, so the controller missed the fresh countdown. The
 runner verified final power-off. This is a **harness failure**, not evidence of
 either success or failure of the new hypervisor protocol. The separate rpictl
-daemon needs its countdown capture armed before applying power. No hardware
-acceptance or overnight PASS is claimed.
+daemon needed its countdown capture armed before applying power. That attempt
+provided no hardware acceptance evidence.
 
-A proposed controller fix was built in an isolated copy and tested with a
-pseudo-terminal and simulated relay. With relay confirmation delayed beyond
-the simulated countdown, the original controller timed out and the corrected
-controller interrupted autoboot and verified power successfully. The live
-daemon and its source remain unchanged, pending authorization to modify the
-separate controller project. Fresh final bundles for mapping, timeout,
-concurrency, quick and overnight checks are prepared but have not run; their
-source and artifact hashes match the current implementation.
+The controller fix was subsequently reviewed, merged as controller revision
+`b72a334`, installed and verified against the running executable. Its 30 tests
+pass. On hardware, `hardware-mapping-02` passed all 48 remaps and a 35.987-second
+Linux probe (128 wakeups, 285 memory passes, maximum lateness 7.625 ms, no wakeups
+over 500 ms late). `hardware-timeout-01` passed late-acknowledgement rejection,
+resource retention and blocked guest entry. `hardware-concurrency-01` passed
+both allocator baselines and a concurrent 120.319-second Linux probe (428
+wakeups, 1,968 memory passes, maximum lateness 7.625 ms, no wakeups over 500 ms).
+Each completed verified power-off. The full quick run also passed; the six-hour
+run was later interrupted for the requested default-console inspection. Those
+initial results describe frozen revision `bb294f9`, before normal-image scratch
+tests were removed by this cleanup. The final staged-cleanup results above
+come from a separate complete suite.
+
+The first updated-controller attempt, `hardware-mapping-01`, is retained as a
+harness failure: relay queries timed out before any tvisor load. A bounded
+read-only diagnostic and a subsequent controller query verified recovery and
+power OFF. The fresh successful attempt uses a separate evidence directory.
 
 The stability runner now distinguishes a known RAM-only guest from a board that
 failed before guest launch. If the latter has booted the SD-card OS, cleanup
@@ -155,9 +208,12 @@ python3 scripts/checks/phase115_prepare.py --fixture EXISTING_QUICK_BUNDLE \
 ```
 
 Kinds are `normal`, `mapping`, `mapping-timeout` and `stress`. Mapping and stress
-use optimized builds. Add `--mode overnight` with `--kind normal` for the final
-six-hour run. Preparation verifies frozen Linux/config/probe hashes, builds
-tvisor, checks linked entry and TLBI instructions, and preserves source hashes
+use optimized builds. Normal bundles are quiet by default. Add `--diagnostics`
+for physical SMP resource/park checks; these do not enable scratch tests. Add
+`--mode overnight --kind normal --diagnostics` for the final six-hour SMP run.
+Preparation verifies frozen Linux/config/probe hashes, builds
+tvisor, checks linked entry instructions, diagnostic isolation and (for TLB
+acceptance) TLBI instructions, and preserves source hashes
 and copies including untracked implementation files. It does not rebuild Linux
 or touch hardware. Publish only the three manifest artifacts to the existing
 TFTP server for an authorized hardware run, then run:

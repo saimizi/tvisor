@@ -20,6 +20,8 @@ class ExpectedTimeout(Exception):
 class Acceptance(Run):
     def __init__(self, directory, mode):
         super().__init__(directory, 600 if mode == 'quick' else 0, 'quick')
+        if self.manifest.get('diagnostics_enabled') is False:
+            raise RuntimeError('SMP acceptance requires a normal bundle prepared with --diagnostics, or an acceptance feature')
         self.acceptance_mode = mode
         if mode != 'quick':
             self.expected_boots = 0 if mode == 'timeout' else 1

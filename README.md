@@ -81,6 +81,20 @@ trampoline does not require the instruction cache to be disabled. See the
 
 ## Build and host tests
 
+Ordinary debug and release builds keep startup diagnostics quiet. Initialization
+and validation failures, warnings and panic reports remain enabled.
+
+| Build | Startup detail | Scratch remapping tests |
+|---|---|---|
+| `cargo build` / `cargo build --release` | Concise guest-entry message | None; no scratch pages reserved |
+| `cargo build --features diagnostics` | CPU, memory, register and management checkpoints | None |
+| `cargo build --release --features tlb-update-test` | Detailed acceptance records | 32 Online and 16 Parked remaps |
+| `cargo build --features tlb-update-timeout-test` | Detailed failure-test records | Delayed CPU2 acknowledgement; guest deliberately blocked |
+
+All hardware acceptance features enable `diagnostics` automatically. Selecting
+`--release` alone does not enable diagnostics or acceptance workloads. Host unit
+tests use `#[cfg(test)]` and are excluded from ordinary images.
+
 Run the host unit tests:
 
 ```sh
@@ -171,19 +185,11 @@ no `lmb=` or `bootmem=` arguments are accepted or required.
 
 ### 5. Check the result
 
-A successful run should print:
-
-- DTB version, size, and board model;
-- discovered RAM, reservations, MMIO translations, CPUs, and console;
-- normalized `RESERVED` and `USABLE` RAM plus MMIO regions;
-- inherited EL2 register state; and
-- the private-environment checkpoints:
-
-```text
-Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active
-Phase 7 checkpoint 3: register, stack, and image validation passed
-Phase 9 Guest Preparation & Execution Verification: PASSED
-```
+An ordinary image prints `tvisor: entering one-vCPU Linux guest`, followed by
+the guest console. Enable `--features diagnostics` to also see platform,
+per-CPU, register, memory and private-environment checkpoints. Successful
+scratch-remap records appear only in TLB acceptance images. Validation failures
+remain visible with diagnostics disabled.
 
 The final halt is intentional. Reset or power-cycle the board before another
 test; there is no return path to the U-Boot prompt.
@@ -197,7 +203,7 @@ test; there is no return path to the U-Boot prompt.
 - [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
 - [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
 - [Phase 11.5 all-core startup and concurrent resource acceptance](docs/phase11_5_status.md)
-- [Phase 11.6 EL2 mapping updates and pending hardware acceptance](docs/phase11_6_status.md)
+- [Phase 11.6 EL2 mapping updates and completed physical SMP regression](docs/phase11_6_status.md)
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)

@@ -414,7 +414,7 @@ pub fn run_vcpu_with_mmio(
 }
 
 pub fn run_guest() -> Result<(), GuestRunError> {
-    println!("Phase 10: Preparing Linux guest execution environment...");
+    tvisor_util::diagnostic_println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
     let mut vm_ctl = VmCtl::new(1);
     let mut need_deactivate = false;

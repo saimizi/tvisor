@@ -2,7 +2,8 @@
 """Phase 11.6 mapping, failure, concurrency and final physical-SMP regression.
 
 All board access uses the existing daemon IPC. Cold boots and probe thresholds
-come from the standard stability runner; every boot adds actual SMP gate checks.
+come from the standard stability runner. SMP modes require physical gate checks;
+quiet mode verifies the ordinary image and absence of acceptance output.
 """
 import argparse
 from pathlib import Path
@@ -18,13 +19,20 @@ class ExpectedMappingTimeout(Exception):
 
 class MappingAcceptance(Acceptance):
     def __init__(self, directory, mode):
-        if mode == 'overnight':
+        if mode == 'quiet':
+            # Quiet-image regression checks guest execution and absence of
+            # acceptance output; it does not claim UART-based SMP evidence.
+            Run.__init__(self, directory, 600, 'quick')
+            self.acceptance_mode = 'quiet'
+        elif mode == 'overnight':
             Run.__init__(self, directory, 21600, 'overnight')
+            if self.manifest.get('diagnostics_enabled') is False:
+                raise RuntimeError('Physical SMP acceptance requires a bundle prepared with --diagnostics')
             self.acceptance_mode = 'quick'  # inherited per-boot resource validation
         else:
             super().__init__(directory, 'stress' if mode == 'stress' else 'bringup')
         self.test_mode = mode
-        if mode == 'quick':
+        if mode in ('quick', 'quiet'):
             self.before_boots, self.after_boots, self.expected_boots = 2, 1, 4
             self.soak = 600
         elif mode not in ('overnight',):
@@ -45,6 +53,15 @@ class MappingAcceptance(Acceptance):
 
     def boot(self, name, image, diagnostic):
         super().boot(name, image, diagnostic)
+        if self.test_mode == 'quiet':
+            text = self.fresh_log()
+            if 'tvisor: entering one-vCPU Linux guest' not in text:
+                raise RuntimeError('Missing ordinary guest entry')
+            for marker in ['Phase 11.6 remap PASS', 'Phase 11.1 CPU', 'Phase 11.5 all-core management PASS', 'Phase 11.6 physical SMP gate', 'Found RAM region:']:
+                if marker in text:
+                    raise RuntimeError('Quiet build emitted acceptance diagnostics: ' + marker)
+            self.event('quiet_build_boot_pass')
+            return
         self.assess_resources()
         text = self.fresh_log()
         if 'Phase 11.6 physical SMP gate online_mask=0xf parked_mask=0xe ' not in text:
@@ -52,7 +69,8 @@ class MappingAcceptance(Acceptance):
         for cpu in range(1, 4):
             if f'Phase 11.6 CPU{cpu} Parked responsive; retained in mapping membership' not in text:
                 raise RuntimeError('Missing responsive parked member')
-        expected = 48 if self.test_mode == 'mapping' else 2
+        # Older frozen bundles performed two startup remaps in normal images.
+        expected = self.manifest.get('expected_remaps', 48 if self.test_mode == 'mapping' else 2)
         epochs = [int(value) for value in re.findall(r'^Phase 11.6 remap PASS epoch=(\d+) members=0xf .* old_reusable=true$', text, re.M)]
         if epochs != list(range(1, expected + 1)):
             raise RuntimeError('Incomplete scratch remap epochs: ' + str(epochs))
@@ -61,7 +79,7 @@ class MappingAcceptance(Acceptance):
         self.event('physical_smp_mapping_gate_pass', remaps=expected, retained_members=15, parked_workers=14)
 
     def run(self):
-        if self.test_mode in ('quick', 'overnight'):
+        if self.test_mode in ('quick', 'quiet', 'overnight'):
             return Run.run(self)
         if self.test_mode == 'stress':
             return super().run()
@@ -86,7 +104,7 @@ class MappingAcceptance(Acceptance):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory')
-    parser.add_argument('--mode', choices=['bringup', 'mapping', 'mapping-timeout', 'stress', 'quick', 'overnight'], required=True)
+    parser.add_argument('--mode', choices=['bringup', 'mapping', 'mapping-timeout', 'stress', 'quiet', 'quick', 'overnight'], required=True)
     parser.add_argument('--authorize-hardware', action='store_true')
     args = parser.parse_args()
     if not args.authorize_hardware:

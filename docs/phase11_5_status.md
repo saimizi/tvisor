@@ -135,7 +135,7 @@ Prepare a new bundle without rebuilding Linux:
 
 ```sh
 python3 scripts/checks/phase115_prepare.py --fixture EXISTING_QUICK_BUNDLE \
-  --output NEW_BUNDLE --kind normal
+  --output NEW_BUNDLE --kind normal --diagnostics
 ```
 
 `--kind stress` selects the optimized stress feature; `--kind timeout` selects

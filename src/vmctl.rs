@@ -785,7 +785,7 @@ impl VmCtl {
         let (image_ipa, image_extent) = layout.image();
         let (dtb_ipa, dtb_capacity) = layout.dtb();
 
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 10: loading Linux Image: linux_image={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
             linux_image,
             image.len(),
@@ -902,7 +902,7 @@ impl VmCtl {
         let vcpu = self
             .vcpu_mut(vcpu_id)
             .expect("new Linux vCPU must be present");
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
             vcpu.context().elr_el2,
             vcpu.context().x[0]

@@ -63,7 +63,7 @@ fn wait_for_secondary(id: usize, deadline: StartupDeadline, start: u64) -> Resul
         deadline.elapsed(start, physical_counter()),
         deadline.ticks()
     );
-    tvisor_util::println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.3 generation={} wait={:?} state={:?}",
         GENERATION,
         result,
@@ -72,7 +72,8 @@ fn wait_for_secondary(id: usize, deadline: StartupDeadline, start: u64) -> Resul
     if matches!(
         record.mailbox.state(GENERATION),
         Ok(CpuState::Parked | CpuState::Failed)
-    ) {
+    ) && (cfg!(feature = "diagnostics") || result.is_err())
+    {
         report_checkpoint(record);
     }
     result
@@ -474,7 +475,7 @@ fn validate_platform(
     tvisor_util::println!(
         "Phase 11.3 TEST ONLY: secondary-startup-timeout-test; parking delayed 4 seconds"
     );
-    tvisor_util::println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.3 backend=bcm2711-armstub MIDR={:#x} MPIDR={:#x}",
         midr,
         mpidr
@@ -652,7 +653,7 @@ fn release_and_wait(
             )
         }
         .map_err(BootError::Release)?;
-        tvisor_util::println!(
+        tvisor_util::diagnostic_println!(
             "Phase 11.5 requested CPU{} generation=1 released_mask={:#x}",
             id,
             RELEASE_ATTEMPTED.load(Ordering::Acquire)

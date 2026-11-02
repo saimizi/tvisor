@@ -179,9 +179,10 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         println!("Linux Image handoff was already initialized differently");
         halt();
     }
-    println!(
+    tvisor_util::diagnostic_println!(
         "Linux Image handoff: source={} bytes={}",
-        image_source, image.size
+        image_source,
+        image.size
     );
 
     let live_dtb: PhysRegion = (*fdt).into();
@@ -205,7 +206,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
             halt();
         }
     };
-    println!(
+    tvisor_util::diagnostic_println!(
         "GICv2 DTB discovery:\n GICD={}\n GICC={}\n GICH={}\n GICV={}",
         gic.distributor(),
         gic.cpu_interface(),

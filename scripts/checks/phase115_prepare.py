@@ -26,6 +26,7 @@ def main():
     parser.add_argument('--kind', choices=['normal', 'stress', 'timeout', 'mapping', 'mapping-timeout'], required=True)
     parser.add_argument('--mode', choices=['quick', 'overnight'], default='quick')
     parser.add_argument('--phase', choices=['11.5', '11.6'], default='11.5')
+    parser.add_argument('--diagnostics', action='store_true', help='Enable verbose SMP checkpoints for normal-image acceptance')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
@@ -53,6 +54,8 @@ def main():
     build = ['cargo', 'build', '--locked', '--offline', '--target', 'aarch64-unknown-none']
     if feature:
         build += ['--features', feature]
+    elif args.diagnostics:
+        build += ['--features', 'diagnostics']
     if profile == 'release':
         build += ['--release']
     if args.dry_run:
@@ -78,6 +81,7 @@ def main():
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
     manifest = dict(original)
     manifest.update(mode=args.mode, runner_sha256=sha(runner), files=[], created=dt.datetime.now(dt.timezone.utc).isoformat(),
+                    diagnostics_enabled=bool(feature or args.diagnostics), expected_remaps=48 if args.kind == 'mapping' else 0,
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(),
                     dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo)),
                     purpose='Phase ' + args.phase + ' ' + args.kind, build_command=build, build_profile=profile,
@@ -107,7 +111,13 @@ def main():
     (output / 'source-status.txt').write_bytes(subprocess.check_output(['git', 'status', '--short'], cwd=repo))
     for checker in ['secondary_entry', 'secondary_entry_negative']:
         command(['python3', str(repo / 'scripts/checks' / (checker + '.py')), str(output / manifest['tvisor'])], checker + '.log')
-    if args.phase == '11.6':
+    diagnostics_check = ['python3', str(repo / 'scripts/checks/diagnostics.py'), str(output / manifest['tvisor'])]
+    if feature or args.diagnostics:
+        diagnostics_check += ['--enabled']
+    if args.kind in ('mapping', 'mapping-timeout'):
+        diagnostics_check += ['--scratch']
+    command(diagnostics_check, 'diagnostics.log')
+    if args.kind in ('mapping', 'mapping-timeout'):
         command(['python3', str(repo / 'scripts/checks/tlb_sync.py'), str(output / manifest['tvisor'])], 'tlb-sync.log')
     command(['llvm-readelf', '-l', str(output / manifest['tvisor'])], 'elf-layout.txt')
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

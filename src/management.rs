@@ -150,7 +150,7 @@ pub fn initialize_boot() -> Result<(), &'static str> {
     ] {
         crate::mm::validate_device_identity(region).map_err(|_| "invalid boot GIC mapping")?;
     }
-    tvisor_util::println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.4 boot GIC TYPER={:#x} banked targets={:x?}",
         unsafe { core::ptr::read_volatile(gic.gicd_typer() as *const u32) },
         gic.banked_target_words()
@@ -166,6 +166,7 @@ pub fn initialize_boot() -> Result<(), &'static str> {
         },
     )?;
     initialize_local(false)?;
+    #[cfg(feature = "diagnostics")]
     report(0);
     Ok(())
 }
@@ -255,6 +256,7 @@ pub fn activate_secondary() -> Result<(), &'static str> {
         if !ready {
             return Err("management initialization poll limit");
         }
+        #[cfg(feature = "diagnostics")]
         report(id);
         let value = 0x1150 + id as u64;
         let mut ping = request(id, Operation::Ping, value)?;
@@ -294,7 +296,10 @@ pub fn activate_secondary() -> Result<(), &'static str> {
             }
             core::hint::spin_loop();
         }
-        tvisor_util::println!("Phase 11.5 CPU{} Online management bidirectional PASS", id);
+        tvisor_util::diagnostic_println!(
+            "Phase 11.5 CPU{} Online management bidirectional PASS",
+            id
+        );
     }
     for id in 1..MAX_CPUS {
         if required & (1 << id) != 0 {
@@ -305,10 +310,11 @@ pub fn activate_secondary() -> Result<(), &'static str> {
             }
         }
     }
-    tvisor_util::println!(
+    let _hcr = check_routing()?;
+    tvisor_util::diagnostic_println!(
         "Phase 11.5 all-core management PASS required_mask={:#x} HCR={:#x}",
         required,
-        check_routing()?
+        _hcr
     );
     #[cfg(feature = "management-irq-test")]
     acceptance::before_linux()?;
@@ -369,6 +375,7 @@ pub fn dispatch(gic: &GicV2, ack: InterruptAck, guest: bool, guest_masked: bool)
             value: request.argument,
             failed: !crate::all_core_test::submit(id, request.argument),
         },
+        #[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
         Operation::TlbQuiesce if id != 0 => Reply {
             value: request.argument,
             failed: crate::tlb::UPDATES.admit(id, request.argument).is_err(),
@@ -513,6 +520,7 @@ pub fn worker(id: usize, generation: u64) -> ! {
     loop {
         unsafe { asm!("msr daifset, #2", options(nostack, preserves_flags)) };
         stop_if_requested();
+        #[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
         if crate::tlb::UPDATES.pending(id) {
             unsafe { asm!("msr daifclr, #2", options(nostack, preserves_flags)) };
             crate::tlb::worker(id);
@@ -541,10 +549,11 @@ pub fn worker(id: usize, generation: u64) -> ! {
         };
     }
 }
+#[cfg(feature = "diagnostics")]
 fn report(id: usize) {
     let c = &CPUS[id];
     let _ = c.ready.load(Ordering::Acquire);
-    tvisor_util::println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.4 CPU{} GIC target={:#x} CTLR={:#x} PMR={:#x} BPR={} security/group={} management SGI={}",
         id,
         c.target.load(Ordering::Relaxed),
@@ -565,9 +574,11 @@ pub fn guest_entry() {
         tvisor_util::el2_policy::GUEST_HCR,
         "guest HCR profile not installed"
     );
+    #[cfg(feature = "diagnostics")]
     static REPORTED: AtomicBool = AtomicBool::new(false);
+    #[cfg(feature = "diagnostics")]
     if !REPORTED.swap(true, Ordering::Relaxed) {
-        tvisor_util::println!(
+        tvisor_util::diagnostic_println!(
             "Phase 11.4 guest IRQ routing HCR={:#x} IMO=1 FMO=0 AMO=0 TGE=0 E2H=0 VI=0 VF=0",
             hcr
         );
@@ -587,6 +598,7 @@ pub fn verify_stage2_profiles(
 
 /// Caller holds the mapping-update gate, so Park/FatalStop cannot race this
 /// snapshot. Parked CPUs remain members because they retain EL2 translations.
+#[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 pub fn validate_mapping_members(members: u64) -> Result<(), &'static str> {
     if members != crate::secondary::required_mask() | 1 {
         return Err("mapping membership changed");

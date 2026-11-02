@@ -158,6 +158,20 @@ macro_rules! println {
     };
 }
 
+/// Optional startup/acceptance detail. Disabled builds do not evaluate arguments.
+/// Keep validation, initialization and error reporting outside this macro.
+#[cfg(feature = "diagnostics")]
+#[macro_export]
+macro_rules! diagnostic_println {
+    ($($arg:tt)*) => { $crate::println!($($arg)*) };
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[macro_export]
+macro_rules! diagnostic_println {
+    ($($arg:tt)*) => {{}};
+}
+
 /// Enables diagnostic output through a DTB-discovered Mini UART register
 /// window. No MMIO is accessed before this function is called.
 pub fn debug_init(mini_uart_register_base: usize) {

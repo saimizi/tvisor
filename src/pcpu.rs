@@ -8,7 +8,6 @@ use tvisor_util::{
     aarch64_reg::{MpidrEl1, Sp},
     cpu_topology::{CpuTopology, MAX_CPUS, MPIDR_AFFINITY_MASK},
     pcpu::{PcpuContext, PcpuSlot, STACK_ALLOCATION_SIZE, StackLayout, stack_layout},
-    println,
 };
 
 type PcpuState = PcpuContext<Vcpu>;
@@ -113,7 +112,7 @@ pub fn prepare_secondary_cpus(
         prepare_slot(stack.logical_id, stack.affinity, stack.layout)
             .map_err(SecondaryPrepareError::State)?;
     }
-    println!(
+    tvisor_util::diagnostic_println!(
         "Phase 11.1 secondary stack allocations: {} enabled CPUs, {} pages each including guard",
         stacks.len(),
         tvisor_util::pcpu::STACK_ALLOCATION_PAGES
@@ -231,7 +230,7 @@ pub fn assert_boot_cpu_idle() {
 
 pub fn report_prepared() {
     assert_boot_cpu_idle();
-    for (id, slot) in PCPU_SLOTS.iter().enumerate() {
+    for (_id, slot) in PCPU_SLOTS.iter().enumerate() {
         // SAFETY: workers are not released in 11.1. Only the boot CPU is active,
         // and this checkpoint is outside the guest world-switch assembly.
         let context = slot.context_ptr();
@@ -242,14 +241,14 @@ pub fn report_prepared() {
                     .is_null()
             );
             if slot.is_prepared() {
-                println!(
+                tvisor_util::diagnostic_println!(
                     "Phase 11.1 CPU{} prepared: affinity={:#x} context={:#x} stack=[{:#x}, {:#x}) active_vcpu=null{}",
-                    id,
+                    _id,
                     (*context).affinity,
                     context as u64,
                     (*context).stack_bottom,
                     (*context).stack_top,
-                    if id == 0 {
+                    if _id == 0 {
                         " TPIDR_EL2 installed"
                     } else {
                         " (not released)"

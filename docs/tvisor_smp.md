@@ -499,7 +499,7 @@ EL2 mappings still frozen; mapping updates belong to 11.6.
 ## 11.6: Mapping changes, TLB synchronization and final regression
 
 The [Phase 11.6 implementation and verification report](phase11_6_status.md)
-describes the scratch-only update protocol and pending hardware acceptance.
+describes the scratch-only update protocol and completed physical SMP regression.
 
 An EL2-table mutex is necessary for writers but insufficient for CPUs using old
 translations. Keep maps immutable until this protocol has its own milestone.
