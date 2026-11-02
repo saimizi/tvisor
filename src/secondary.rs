@@ -5,6 +5,7 @@ use tvisor_util::{
     el2_policy::{HostEl2Config, HostEl2ConfigStorage},
     pcpu::{PcpuContext, PcpuSlot},
     secondary_startup::StartupView,
+    startup_resources::StartupResources,
 };
 use tvisor_util::{
     secondary_boot::{self, BootError, BootStatus, StartupDeadline},
@@ -429,10 +430,10 @@ pub fn start_all(
         if required == 0 {
             return Err(BootError::Preparation("no eligible secondary"));
         }
-        prepare_all_cpus(required, policy).map_err(BootError::Preparation)?;
-        validate_and_freeze(required, policy).map_err(BootError::Preparation)?;
+        let resources = prepare_all_cpus(required, policy).map_err(BootError::Preparation)?;
+        validate_and_freeze(&resources).map_err(BootError::Preparation)?;
         let line = cache_line_size();
-        publish_all_startups(required, policy, contract, line).map_err(BootError::Preparation)?;
+        publish_all_startups(&resources, contract, line).map_err(BootError::Preparation)?;
         secondary_boot::begin_release(&BOOT_STATE)?;
         release_and_wait(required, contract, deadline, line)?;
         verify_all_parked(required)?;
@@ -520,43 +521,38 @@ fn validate_platform(
     }
     Ok((entry_contract, deadline))
 }
+/// Boot-local validation inputs, constructed once from canonical state. The
+/// descriptors own no memory and never become additional persistent CPU state.
 fn prepare_all_cpus(
     required: u64,
     policy: tvisor_util::el2_policy::HostTranslation,
-) -> Result<(), &'static str> {
+) -> Result<[Option<StartupResources>; MAX_CPUS], &'static str> {
     HOST_EL2_CONFIG.publish(policy)?;
     let config = HOST_EL2_CONFIG.get().ok_or("host config unavailable")?;
-    for id in 1..MAX_CPUS {
+    let topology = crate::smp::topology().ok_or("missing topology")?;
+    let mut resources = [None; MAX_CPUS];
+    for (id, resource) in resources.iter_mut().enumerate().skip(1) {
         if required & (1 << id) == 0 {
             continue;
         }
-        let address = tvisor_util::secondary_entry::validate_spin_table_target(
-            crate::smp::topology().ok_or("missing topology")?.cpus(),
-            id,
-        )
-        .map_err(|_| "invalid target")?;
+        let address = tvisor_util::secondary_entry::validate_spin_table_target(topology.cpus(), id)
+            .map_err(|_| "invalid target")?;
         crate::mm::map_firmware_release_cell(tvisor_util::system_info::PhysAddr::new(address))
             .map_err(|_| "release mapping failed")?;
-        startup_resources(id, policy)?;
+        *resource = Some(startup_resources(id, policy)?);
         crate::pcpu::slot(id)
             .ok_or("missing slot")?
             .publish_startup(GENERATION, config)?;
     }
-    Ok(())
+    Ok(resources)
 }
 fn validate_and_freeze(
-    required: u64,
-    policy: tvisor_util::el2_policy::HostTranslation,
+    resources: &[Option<StartupResources>; MAX_CPUS],
 ) -> Result<(), &'static str> {
     let stacks = crate::pcpu::prepared_stacks()?;
     crate::mm::validate_and_freeze_startups(|tables| {
-        for id in 1..MAX_CPUS {
-            if required & (1 << id) == 0 {
-                continue;
-            }
-            let resources = startup_resources(id, policy)
-                .map_err(|_| tvisor_util::startup_resources::ResourceError::Layout)?;
-            tvisor_util::startup_resources::validate_resources(tables, &resources)?;
+        for resource in resources.iter().flatten() {
+            tvisor_util::startup_resources::validate_resources(tables, resource)?;
         }
         tvisor_util::startup_resources::validate_stacks(tables, &stacks)?;
         Ok(())
@@ -571,49 +567,53 @@ fn cache_line_size() -> u64 {
     4u64 << ((ctr >> 16) & 15)
 }
 fn publish_all_startups(
-    required: u64,
-    policy: tvisor_util::el2_policy::HostTranslation,
+    resources: &[Option<StartupResources>; MAX_CPUS],
     contract: tvisor_util::secondary_entry::EntryContract,
     line: u64,
 ) -> Result<(), &'static str> {
+    use tvisor_util::{
+        secondary_hardware::publication_barrier,
+        startup_publication::{
+            publish_cpu_startup, publish_shared_startup, shared_regions, validate_publication,
+        },
+    };
     if boot_status() != BootStatus::Preparing || !crate::mm::startup_tables_frozen() {
         return Err("publication outside frozen preparation");
     }
     let topology = crate::smp::topology().ok_or("missing topology")?;
-    // Precheck every range/identity before the first cache-maintenance operation.
-    for id in 1..MAX_CPUS {
-        if required & (1 << id) == 0 {
+    let shared = resources
+        .iter()
+        .flatten()
+        .next()
+        .ok_or("no startup resources")?;
+    // Every identity and rounded cache range is checked before any maintenance.
+    // All members must name the same shared regions; slots and config are
+    // validated subregions of writable, so its single clean covers them too.
+    for (id, resource) in resources.iter().enumerate() {
+        let Some(resource) = resource else {
             continue;
+        };
+        if shared_regions(resource) != shared_regions(shared) {
+            return Err("inconsistent shared startup regions");
         }
-        let resources = startup_resources(id, policy)?;
-        tvisor_util::startup_publication::validate_publication(
+        validate_publication(
             topology.cpus(),
             id,
             contract,
             startup(id, GENERATION).ok_or("missing startup")?,
-            &resources,
+            resource,
             line,
         )
         .map_err(|_| "invalid publication")?;
     }
-    for id in 1..MAX_CPUS {
-        if required & (1 << id) == 0 {
-            continue;
+    // SAFETY: all mappings are validated/frozen and every generation is already
+    // published. CPU0 remains the sole executor until the final barrier below.
+    unsafe {
+        publish_shared_startup(shared, line).map_err(|_| "shared publication failed")?;
+        for resource in resources.iter().flatten() {
+            publish_cpu_startup(resource.stack, line).map_err(|_| "stack publication failed")?;
         }
-        let resources = startup_resources(id, policy)?;
-        // SAFETY: all resources were checked under the table freeze; CPU0 is
-        // the sole executor until every publication below has completed.
-        unsafe {
-            tvisor_util::startup_publication::publish_startup(
-                topology.cpus(),
-                id,
-                contract,
-                startup(id, GENERATION).ok_or("missing startup")?,
-                &resources,
-                line,
-            )
-        }
-        .map_err(|_| "publication failed")?;
+        publication_barrier().map_err(|_| "publication completion failed")?;
     }
     Ok(())
 }

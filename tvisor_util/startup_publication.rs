@@ -43,10 +43,9 @@ pub unsafe fn clean_range(start: u64, end: u64, line: u64) -> Result<(), Publica
     }
     Ok(())
 }
-fn regions(r: &StartupResources) -> Result<[PhysRegion; 6], PublicationError> {
-    let stack = PhysRegion::from_bounds(PhysAddr::new(r.stack.bottom), PhysAddr::new(r.stack.top))
-        .map_err(|_| PublicationError::Preconditions)?;
-    Ok([r.code, r.vectors, r.rodata, r.writable, r.tables, stack])
+/// Slots and shared config are contained in writable, validated before release.
+pub fn shared_regions(r: &StartupResources) -> [PhysRegion; 5] {
+    [r.code, r.vectors, r.rodata, r.writable, r.tables]
 }
 pub fn validate_publication(
     cpus: &[CpuDescriptor],
@@ -90,30 +89,47 @@ pub fn validate_publication(
     {
         return Err(PublicationError::Preconditions);
     }
-    for region in regions(r)?
-        .into_iter()
-        .chain(core::iter::once(r.release_page))
-    {
+    for region in shared_regions(r).into_iter().chain([
+        PhysRegion::from_bounds(PhysAddr::new(r.stack.bottom), PhysAddr::new(r.stack.top))
+            .map_err(|_| PublicationError::Preconditions)?,
+        r.release_page,
+    ]) {
         cache_range(region.start().value(), region.end().value(), line)?;
     }
     Ok(())
 }
 /// # Safety
-/// CPU0 must have validated and frozen all startup mappings. The caller must
-/// finish publication for every required CPU before beginning any release.
-pub unsafe fn publish_startup(
-    cpus: &[CpuDescriptor],
-    id: usize,
-    contract: EntryContract,
-    record: StartupView<'_>,
+/// CPU0 must have prevalidated every required startup and frozen all mappings.
+/// The caller must publish every private stack and complete the barrier before
+/// any release. No overlapping slot/config cleans are needed: writable covers
+/// both, and that containment is independently validated here.
+pub unsafe fn publish_shared_startup(
     r: &StartupResources,
     line: u64,
 ) -> Result<(), PublicationError> {
-    validate_publication(cpus, id, contract, record, r, line)?;
-    for region in regions(r)? {
+    if !r.writable.contains_region(r.slots) || !r.writable.contains_region(r.config) {
+        return Err(PublicationError::Preconditions);
+    }
+    let regions = shared_regions(r);
+    for region in regions {
+        cache_range(region.start().value(), region.end().value(), line)?;
+    }
+    for region in regions {
         unsafe { clean_range(region.start().value(), region.end().value(), line)? };
     }
-    unsafe { publication_barrier() }
+    Ok(())
+}
+/// # Safety
+/// This stack must have validated Normal RW/NX mappings with an unmapped guard.
+/// Complete the publication barrier after all required private stacks are clean.
+pub unsafe fn publish_cpu_startup(
+    stack: crate::pcpu::StackLayout,
+    line: u64,
+) -> Result<(), PublicationError> {
+    if crate::pcpu::stack_layout(stack.guard_start).ok() != Some(stack) {
+        return Err(PublicationError::Preconditions);
+    }
+    unsafe { clean_range(stack.bottom, stack.top, line) }
 }
 /// # Safety
 /// Only CPU0 in the aggregate Releasing phase, after *all* publication barriers.
@@ -238,22 +254,32 @@ mod tests {
             },
         })
     }
-    fn resources(f: &Fixture, id: usize, cell: u64) -> StartupResources {
-        let r = f.get(7).unwrap();
+    fn resources_for(r: StartupView<'_>, id: usize, cell: u64) -> StartupResources {
+        let slots = region(r.slot_address() - id as u64 * 384, 4 * 384);
+        let config = region(r.config_address(), 128);
+        let start = slots.start().value().min(config.start().value()) & !4095;
+        let end = (slots.end().value().max(config.end().value()) + 4095) & !4095;
         StartupResources {
             code: region(0x100000, 4096),
             vectors: region(0x101000, 4096),
             rodata: region(0x102000, 4096),
-            writable: region(0x103000, 4096),
+            writable: region(start, end - start),
             tables: region(0x800000, 16 * 4096),
-            slots: region(r.slot_address() - id as u64 * 384, 4 * 384),
+            slots,
             context: region(r.slot_address(), 64),
-            config: region(r.config_address(), 128),
+            config,
             release_page: region(cell & !4095, 4096),
             stack: crate::pcpu::stack_layout(r.identity.stack_bottom - 4096).unwrap(),
             entry: 0x100000,
             root: 0x800000,
         }
+    }
+    fn resources(f: &Fixture, id: usize, cell: u64) -> StartupResources {
+        resources_for(f.get(7).unwrap(), id, cell)
+    }
+    fn cleans(region: PhysRegion) -> std::vec::Vec<Event> {
+        let (start, end) = cache_range(region.start().value(), region.end().value(), 64).unwrap();
+        (start..end).step_by(64).map(Event::Clean).collect()
     }
     fn fixture(id: usize) -> std::boxed::Box<Fixture> {
         Fixture::new(id, id as u64, 0x201000 + id as u64 * 0x20000, 0x800000, 7)
@@ -284,33 +310,105 @@ mod tests {
         assert!(cache_range(64, 64, 64).is_err());
     }
     #[test]
-    fn all_publications_complete_before_any_release_and_exact_cell_sequence_is_preserved() {
+    fn shared_regions_once_and_private_stacks_once_complete_before_any_release() {
+        use crate::{
+            el2_policy::{HostEl2ConfigStorage, HostTranslation},
+            pcpu::PcpuSlot,
+        };
         for cell in [0, 0xe0] {
             test_io::reset();
             let cpus = cpus(cell);
-            let fixtures = [fixture(1), fixture(2), fixture(3)];
-            let attempted = AtomicU64::new(0);
-            let mut expected = std::vec::Vec::new();
-            for (i, f) in fixtures.iter().enumerate() {
-                let r = resources(f, i + 1, cell + (i as u64) * 8);
-                unsafe { publish_startup(&cpus, i + 1, contract(), f.get(7).unwrap(), &r, 64) }
+            let slots = [const { PcpuSlot::<()>::new() }; 4];
+            let config = HostEl2ConfigStorage::new();
+            config
+                .publish(HostTranslation::new(0x800000, 4).unwrap())
+                .unwrap();
+            let config = config.get().unwrap();
+            for id in 1..4 {
+                slots[id]
+                    .prepare(
+                        id,
+                        id as u64,
+                        crate::pcpu::stack_layout(0x200000 + id as u64 * 0x20000).unwrap(),
+                    )
                     .unwrap();
-                for range in regions(&r).unwrap() {
-                    let (start, end) =
-                        cache_range(range.start().value(), range.end().value(), 64).unwrap();
-                    expected.extend((start..end).step_by(64).map(Event::Clean));
-                }
-                expected.push(Event::Barrier);
+                slots[id].publish_startup(7, config).unwrap();
             }
+            let resources: [Option<StartupResources>; 4] = core::array::from_fn(|id| {
+                if id == 0 {
+                    None
+                } else {
+                    Some(resources_for(
+                        slots[id].startup_view(7, config).unwrap(),
+                        id,
+                        cell + (id as u64 - 1) * 8,
+                    ))
+                }
+            });
+            // Check the complete set before starting any maintenance.
+            for id in 1..4 {
+                validate_publication(
+                    &cpus,
+                    id,
+                    contract(),
+                    slots[id].startup_view(7, config).unwrap(),
+                    resources[id].as_ref().unwrap(),
+                    64,
+                )
+                .unwrap();
+            }
+            let shared = resources[1].as_ref().unwrap();
+            unsafe {
+                publish_shared_startup(shared, 64).unwrap();
+                for r in resources.iter().flatten() {
+                    publish_cpu_startup(r.stack, 64).unwrap();
+                }
+                publication_barrier().unwrap();
+            }
+            let mut expected = std::vec::Vec::new();
+            for region in shared_regions(shared) {
+                expected.extend(cleans(region));
+            }
+            for r in resources.iter().flatten() {
+                expected.extend(cleans(
+                    PhysRegion::from_bounds(
+                        PhysAddr::new(r.stack.bottom),
+                        PhysAddr::new(r.stack.top),
+                    )
+                    .unwrap(),
+                ));
+            }
+            let addresses: std::collections::BTreeSet<_> = expected
+                .iter()
+                .map(|e| match e {
+                    Event::Clean(a) => *a,
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(
+                addresses.len(),
+                expected.len(),
+                "no publication cache line is cleaned twice"
+            );
+            for region in [shared.slots, shared.config] {
+                for event in cleans(region) {
+                    assert!(
+                        expected.contains(&event),
+                        "writable clean must cover slots/config"
+                    );
+                }
+            }
+            expected.push(Event::Barrier);
             assert_eq!(IO.with(|io| io.borrow().events.clone()), expected);
-            for (i, f) in fixtures.iter().enumerate() {
-                let address = cell + i as u64 * 8;
+            let attempted = AtomicU64::new(0);
+            for id in 1..4 {
+                let address = cell + (id as u64 - 1) * 8;
                 assert_eq!(
                     unsafe {
                         release_secondary(
                             &cpus,
                             contract(),
-                            f.get(7).unwrap(),
+                            slots[id].startup_view(7, config).unwrap(),
                             0x100000,
                             64,
                             &attempted,
@@ -327,27 +425,41 @@ mod tests {
                     Event::Barrier,
                     Event::Sev,
                 ]);
+                assert!(
+                    !expected.contains(&Event::Clean(resources[id].unwrap().stack.guard_start))
+                );
             }
             assert_eq!(attempted.load(Ordering::Acquire), 14);
             assert_eq!(IO.with(|io| io.borrow().events.clone()), expected);
-            for f in &fixtures {
-                assert!(!expected.contains(&Event::Clean(
-                    f.get(7).unwrap().identity.stack_bottom - 4096
-                )));
-            }
         }
     }
     #[test]
     fn every_publication_failure_prevents_release_and_is_terminal() {
-        for position in [1, 64, 1024, 2305] {
+        let f = fixture(1);
+        let r = resources(&f, 1, 0xe0);
+        let shared_count = shared_regions(&r)
+            .into_iter()
+            .map(|r| cleans(r).len())
+            .sum::<usize>();
+        for position in [
+            1,
+            shared_count,
+            shared_count + 1,
+            shared_count + 1024,
+            shared_count + 1025,
+        ] {
             test_io::reset();
-            let f = fixture(1);
-            let r = resources(&f, 1, 0xe0);
             let state = AtomicU64::new(0);
             secondary_boot::begin_boot_once(&state).unwrap();
             IO.with(|io| io.borrow_mut().fail_at = Some(position));
-            let result =
-                unsafe { publish_startup(&cpus(0xe0), 1, contract(), f.get(7).unwrap(), &r, 64) };
+            let result = (|| {
+                validate_publication(&cpus(0xe0), 1, contract(), f.get(7).unwrap(), &r, 64)?;
+                unsafe {
+                    publish_shared_startup(&r, 64)?;
+                    publish_cpu_startup(r.stack, 64)?;
+                    publication_barrier()
+                }
+            })();
             assert!(result.is_err(), "failure at {position}");
             secondary_boot::finalize_boot(&state, Err(BootError::Preparation("publication")))
                 .unwrap_err();
@@ -384,9 +496,32 @@ mod tests {
                 10 => cpus[2].logical_id = Some(1),
                 _ => cpus[2].affinity = 1,
             }
-            assert!(unsafe { publish_startup(&cpus, 1, c, v, &r, line) }.is_err());
+            assert!(validate_publication(&cpus, 1, c, v, &r, line).is_err());
             assert!(IO.with(|io| io.borrow().events.is_empty()));
         }
+    }
+    #[test]
+    fn shared_publication_requires_actual_slot_config_coverage_and_all_valid_ranges() {
+        for case in 0..4 {
+            test_io::reset();
+            let f = fixture(1);
+            let mut r = resources(&f, 1, 0xe0);
+            match case {
+                0 => r.slots = region(0x900000, 1536),
+                1 => r.config = region(0x900000, 128),
+                2 => r.tables = region(u64::MAX - 8, 8),
+                _ => {}
+            }
+            assert!(
+                unsafe { publish_shared_startup(&r, if case == 3 { 12 } else { 64 }) }.is_err()
+            );
+            assert!(IO.with(|io| io.borrow().events.is_empty()));
+        }
+        test_io::reset();
+        let mut stack = crate::pcpu::stack_layout(0x200000).unwrap();
+        stack.bottom += 16;
+        assert!(unsafe { publish_cpu_startup(stack, 64) }.is_err());
+        assert!(IO.with(|io| io.borrow().events.is_empty()));
     }
     #[test]
     fn nonzero_cell_and_last_moment_recheck_prevent_the_store() {
