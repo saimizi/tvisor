@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::println;
+use crate::diagnostic_println;
 use dtoolkit::fdt::Fdt;
 use dtoolkit::standard::{NodeStandard, Status};
 use dtoolkit::{Node, Property, ToCellInt};
@@ -104,7 +104,7 @@ fn discover_bcm2711_firmware_carveout(
     )
     .map_err(|_| PlatformError::InvalidMemory)?;
 
-    println!("Found BCM2711 firmware carve-out: {}", carveout);
+    diagnostic_println!("Found BCM2711 firmware carve-out: {}", carveout);
     map.insert_ram(carveout)
         .map_err(|error| memory_error(CapacityKind::Ram, error))?;
     map.insert_reserved(carveout)
@@ -143,7 +143,7 @@ fn discover_ram(fdt: Fdt<'_>, map: &mut MemoryMap) -> Result<(), PlatformError> 
                 .map_err(|_| PlatformError::InvalidMemory)?;
             let region = PhysRegion::new(PhysAddr::new(start), size)
                 .map_err(|_| PlatformError::InvalidMemory)?;
-            println!("Found RAM region: {}", region);
+            diagnostic_println!("Found RAM region: {}", region);
             map.insert_ram(region)
                 .map_err(|error| memory_error(CapacityKind::Ram, error))?;
             found = true;
@@ -166,7 +166,7 @@ fn discover_reservations(
     for reservation in fdt.memory_reservations() {
         let region = PhysRegion::new(PhysAddr::new(reservation.address()), reservation.size())
             .map_err(|_| PlatformError::InvalidReservation)?;
-        println!("Found Reserved Memory Region: {}", region);
+        diagnostic_println!("Found Reserved Memory Region: {}", region);
         map.insert_reserved(region)
             .map_err(|error| memory_error(CapacityKind::Reserved, error))?;
     }
@@ -203,7 +203,7 @@ fn discover_reservations(
                         .map_err(|_| PlatformError::InvalidReservation)?;
                     let region = PhysRegion::new(PhysAddr::new(start), size)
                         .map_err(|_| PlatformError::InvalidReservation)?;
-                    println!("Found reserved-memory fixed region: {}", region);
+                    diagnostic_println!("Found reserved-memory fixed region: {}", region);
                     map.insert_reserved(region)
                         .map_err(|error| memory_error(CapacityKind::Reserved, error))?;
                 }
@@ -247,7 +247,7 @@ fn discover_reservations(
                     .map_err(|_| PlatformError::InvalidReservation)?;
                 let region = PhysRegion::new(PhysAddr::new(start), size)
                     .map_err(|_| PlatformError::InvalidReservation)?;
-                println!("Found reserved-memory dynamic alloc range: {}", region);
+                diagnostic_println!("Found reserved-memory dynamic alloc range: {}", region);
                 map.insert_reserved(region)
                     .map_err(|error| memory_error(CapacityKind::Reserved, error))?;
             }
@@ -260,11 +260,11 @@ fn discover_reservations(
     let dtb_size = u64::try_from(fdt.data().len()).map_err(|_| PlatformError::InvalidDtbRegion)?;
     let dtb_region =
         page_rounded_region(dtb_address, dtb_size).map_err(|_| PlatformError::InvalidDtbRegion)?;
-    println!("Reserving live DTB region: {}", dtb_region);
+    diagnostic_println!("Reserving live DTB region: {}", dtb_region);
     map.insert_reserved(dtb_region)
         .map_err(|error| memory_error(CapacityKind::Reserved, error))?;
 
-    println!("Reserving tvisor image: {}", tvisor_image);
+    diagnostic_println!("Reserving tvisor image: {}", tvisor_image);
     map.insert_reserved(tvisor_image)
         .map_err(|error| memory_error(CapacityKind::Reserved, error))
 }
@@ -281,7 +281,7 @@ fn discover_mmio(fdt: Fdt<'_>, map: &mut MemoryMap) -> Result<(), PlatformError>
         .map_err(|_| PlatformError::InvalidSocRanges)?
         .ok_or(PlatformError::MissingSocRanges)?;
     for range in ranges {
-        let child_start = range
+        let _child_start = range
             .child_bus_address::<u64>()
             .map_err(|_| PlatformError::InvalidSocRanges)?;
         let start = range
@@ -293,9 +293,11 @@ fn discover_mmio(fdt: Fdt<'_>, map: &mut MemoryMap) -> Result<(), PlatformError>
         let region = PhysRegion::new(PhysAddr::new(start), size)
             .map_err(|_| PlatformError::InvalidSocRanges)?;
 
-        println!(
+        diagnostic_println!(
             "SOC translation: child {:#x} -> parent {:#x} size {:#x}",
-            child_start, start, size
+            _child_start,
+            start,
+            size
         );
         map.insert_mmio(region)
             .map_err(|error| memory_error(CapacityKind::Mmio, error))?;

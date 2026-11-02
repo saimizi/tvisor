@@ -80,6 +80,7 @@ pub fn initialize(heap_pages: Option<usize>) -> Result<InitializedHeap, HeapInit
     })
 }
 
+#[cfg(feature = "diagnostics")]
 pub fn stats() -> Result<HeapStats, HeapError> {
     GLOBAL_HEAP.stats()
 }

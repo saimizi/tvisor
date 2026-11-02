@@ -1021,6 +1021,11 @@ Only after this gate passes should development move to tvisor physical SMP.
 
 ## 16. Phase 11: add tvisor physical SMP
 
+The [physical SMP design](tvisor_smp.md) defines the initial architecture,
+shared-state audit, startup prerequisites, and milestones 11.0 through 11.6.
+Begin with CPU/startup discovery and parking-memory ownership verification;
+secondary release remains gated on that evidence and concurrency preparation.
+
 ### Goal
 
 Start and manage the Raspberry Pi 4's secondary physical CPUs after the

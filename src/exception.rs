@@ -1,4 +1,4 @@
-//! Phase 6 EL2 exception entry and reporting.
+//! EL2 exception entry and reporting.
 //!
 //! AArch64 defines an exception vector table as sixteen fixed 128-byte slots.
 //! The CPU selects one slot from the exception type (synchronous, IRQ, FIQ, or
@@ -10,7 +10,8 @@
 //! temporary, records the slot number, and branches to one shared assembly
 //! handler.  The shared handler saves the remaining general-purpose and EL2
 //! exception registers and passes the completed frame to the Rust reporter.
-//! Phase 6 resumes only from its deliberate `BRK #0x600` test.  The reporter
+//! Current-EL management IRQs and the deliberate `BRK #0x600` test resume.
+//! SIMD/FP state is preserved around the Rust dispatcher. The reporter
 //! advances `ELR_EL2` past that instruction, after which assembly restores the
 //! saved state and executes `eret`; every unexpected exception remains fatal.
 
@@ -19,7 +20,7 @@ use core::arch::{asm, global_asm};
 use tvisor_util::println;
 
 #[repr(C, align(16))]
-/// Complete processor state captured by the Phase 6 EL2 exception entry.
+/// Complete processor state captured by the EL2 exception entry.
 ///
 /// The field order and offsets are an ABI shared with the assembly handler
 /// below, so changes must be reflected in its load/store offsets.
@@ -42,15 +43,21 @@ pub struct ExceptionFrame {
     /// Fault Address Register: the faulting virtual address for exception
     /// classes that define it; its value is not meaningful for every class.
     pub far_el2: u64,
+    pub q: [[u64; 2]; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<ExceptionFrame>() == 288);
+const _: () = assert!(core::mem::size_of::<ExceptionFrame>() == 816);
 const _: () = assert!(core::mem::align_of::<ExceptionFrame>() == 16);
+const _: () = assert!(core::mem::offset_of!(ExceptionFrame, q) == 288);
+const _: () = assert!(core::mem::offset_of!(ExceptionFrame, fpcr) == 800);
+const _: () = assert!(core::mem::offset_of!(ExceptionFrame, fpsr) == 808);
 
 global_asm!(
     r#"
     .macro VECTOR_SLOT id
-        sub sp, sp, #288
+        sub sp, sp, #816
         stp x16, x17, [sp, #128]
         mov x16, #\id
         str x16, [sp, #248]
@@ -122,8 +129,28 @@ __el2_exception_common:
     str x9, [sp, #272]
     mrs x9, far_el2
     str x9, [sp, #280]
+    stp q0, q1, [sp, #288]
+    stp q2, q3, [sp, #320]
+    stp q4, q5, [sp, #352]
+    stp q6, q7, [sp, #384]
+    stp q8, q9, [sp, #416]
+    stp q10, q11, [sp, #448]
+    stp q12, q13, [sp, #480]
+    stp q14, q15, [sp, #512]
+    stp q16, q17, [sp, #544]
+    stp q18, q19, [sp, #576]
+    stp q20, q21, [sp, #608]
+    stp q22, q23, [sp, #640]
+    stp q24, q25, [sp, #672]
+    stp q26, q27, [sp, #704]
+    stp q28, q29, [sp, #736]
+    stp q30, q31, [sp, #768]
+    mrs x9, fpcr
+    str x9, [sp, #800]
+    mrs x9, fpsr
+    str x9, [sp, #808]
     mov x0, sp
-    bl phase6_exception_handler
+    bl el2_exception_handler
     cbz x0, 1f
 
     // Restore the possibly updated exception-return state before restoring
@@ -133,6 +160,26 @@ __el2_exception_common:
     ldr x16, [sp, #264]
     msr spsr_el2, x16
 
+    ldp q0, q1, [sp, #288]
+    ldp q2, q3, [sp, #320]
+    ldp q4, q5, [sp, #352]
+    ldp q6, q7, [sp, #384]
+    ldp q8, q9, [sp, #416]
+    ldp q10, q11, [sp, #448]
+    ldp q12, q13, [sp, #480]
+    ldp q14, q15, [sp, #512]
+    ldp q16, q17, [sp, #544]
+    ldp q18, q19, [sp, #576]
+    ldp q20, q21, [sp, #608]
+    ldp q22, q23, [sp, #640]
+    ldp q24, q25, [sp, #672]
+    ldp q26, q27, [sp, #704]
+    ldp q28, q29, [sp, #736]
+    ldp q30, q31, [sp, #768]
+    ldr x9, [sp, #800]
+    msr fpcr, x9
+    ldr x9, [sp, #808]
+    msr fpsr, x9
     ldp x0,  x1,  [sp, #0]
     ldp x2,  x3,  [sp, #16]
     ldp x4,  x5,  [sp, #32]
@@ -149,7 +196,7 @@ __el2_exception_common:
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
     ldp x16, x17, [sp, #128]
-    add sp, sp, #288
+    add sp, sp, #816
     eret
 1:
     wfe
@@ -162,29 +209,42 @@ const ESR_EC_SHIFT: u32 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
 const ESR_EC_BRK_AARCH64: u64 = 0x3c;
 const ESR_BRK_COMMENT_MASK: u64 = 0xffff;
-const PHASE6_BRK_COMMENT: u64 = 0x600;
+const TEST_BREAKPOINT_IMMEDIATE: u64 = 0x600;
 
 #[unsafe(no_mangle)]
-extern "C" fn phase6_exception_handler(frame: &mut ExceptionFrame) -> u64 {
-    println!("Phase 6 EL2 exception");
-    println!(" vector={}", frame.vector);
-    println!(" ESR_EL2={:#018x}", frame.esr_el2);
-    println!(" ELR_EL2={:#018x}", frame.elr_el2);
-    println!("SPSR_EL2={:#018x}", frame.spsr_el2);
-    println!(" FAR_EL2={:#018x}", frame.far_el2);
-
+extern "C" fn el2_exception_handler(frame: &mut ExceptionFrame) -> u64 {
+    if matches!(frame.vector, 1 | 5) && crate::management::current_irq() {
+        return 1;
+    }
     let exception_class = (frame.esr_el2 >> ESR_EC_SHIFT) & ESR_EC_MASK;
     let brk_comment = frame.esr_el2 & ESR_BRK_COMMENT_MASK;
     if frame.vector == CURRENT_EL_SPX_SYNC_VECTOR
         && exception_class == ESR_EC_BRK_AARCH64
-        && brk_comment == PHASE6_BRK_COMMENT
+        && brk_comment == TEST_BREAKPOINT_IMMEDIATE
     {
+        println!("EL2 test breakpoint exception");
+        println!(" vector={}", frame.vector);
+        println!(" ESR_EL2={:#018x}", frame.esr_el2);
+        println!(" ELR_EL2={:#018x}", frame.elr_el2);
+        println!("SPSR_EL2={:#018x}", frame.spsr_el2);
+        println!(" FAR_EL2={:#018x}", frame.far_el2);
+
         frame.elr_el2 = frame.elr_el2.wrapping_add(4);
         println!("Returning after deliberate synchronous exception");
         return 1;
     }
 
-    println!("Unexpected exception; halting");
+    crate::pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 2,
+        syndrome: frame.esr_el2,
+        pc: frame.elr_el2,
+        address: frame.far_el2,
+    });
+    crate::management::notify_fatal();
+    let _ = tvisor_util::debug_util::emergency_print(format_args!(
+        "Unexpected exception; halting vector={} ESR_EL2={:#x} ELR_EL2={:#x} FAR_EL2={:#x}\n",
+        frame.vector, frame.esr_el2, frame.elr_el2, frame.far_el2,
+    ));
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }

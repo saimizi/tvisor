@@ -322,6 +322,61 @@ impl<'a, const N: usize> TableSet<'a, N> {
         Err(TranslationError::CorruptTable)
     }
 
+    /// Replace one existing Normal RW/NX page without allocating tables.
+    /// # Safety
+    /// All users must be quiescent. `synchronize` must clean/publish the entry,
+    /// broadcast the EL2 TLBI, and complete DSB/ISB after each store. Any error
+    /// is terminal; a broken entry must not be rolled back without that protocol.
+    pub unsafe fn replace_data_page(
+        &mut self,
+        va: u64,
+        old_pa: u64,
+        new_pa: u64,
+        mut synchronize: impl FnMut(*mut u64) -> Result<(), TranslationError>,
+    ) -> Result<(), TranslationError> {
+        let mapping = Mapping {
+            va,
+            pa: new_pa,
+            size: PAGE_SIZE as u64,
+            memory_type: MemoryType::Normal,
+            writable: true,
+            executable: false,
+        };
+        self.validate_mapping(mapping)?;
+        self.validate_mapping(Mapping {
+            pa: old_pa,
+            ..mapping
+        })?;
+        if !is_page_aligned(old_pa as usize) || old_pa == new_pa {
+            return Err(TranslationError::InvalidateParameter);
+        }
+        let mut table = 0;
+        for level in 1..3 {
+            let d = self.storage.pages[table].entries[index_for(level, va)];
+            if d & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
+                return Err(TranslationError::ConflictingEntry);
+            }
+            table = self.table_index(d & ADDRESS_MASK)?;
+        }
+        let index = index_for(3, va);
+        let expected = leaf_descriptor(
+            3,
+            old_pa,
+            Mapping {
+                pa: old_pa,
+                ..mapping
+            },
+        );
+        if self.storage.pages[table].entries[index] != expected {
+            return Err(TranslationError::ConflictingEntry);
+        }
+        let entry = core::ptr::addr_of_mut!(self.storage.pages[table].entries[index]);
+        unsafe { core::ptr::write_volatile(entry, 0) };
+        synchronize(entry)?;
+        unsafe { core::ptr::write_volatile(entry, leaf_descriptor(3, new_pa, mapping)) };
+        synchronize(entry)
+    }
+
     fn validate_mapping(&self, mapping: Mapping) -> Result<(), TranslationError> {
         if mapping.size == 0 {
             return Err(TranslationError::EmptyMapping);
@@ -591,5 +646,121 @@ mod tests {
             tables.map(mapping(1, 0, PAGE_SIZE as u64)),
             Err(TranslationError::UnalignedMapping)
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_update_tests {
+    use super::*;
+    fn data(va: u64, pa: u64) -> Mapping {
+        Mapping {
+            va,
+            pa,
+            size: 4096,
+            memory_type: MemoryType::Normal,
+            writable: true,
+            executable: false,
+        }
+    }
+    #[test]
+    fn break_then_make_each_require_maintenance_and_never_allocate_tables() {
+        let mut storage = TableStorage::<4>::zeroed();
+        let mut t = TableSet::new(&mut storage, 0x800000, 44).unwrap();
+        let va = crate::tlb_update::SCRATCH_VA;
+        t.map(data(va, 0x900000)).unwrap();
+        let used = t.used_pages();
+        let mut observed = std::vec::Vec::new();
+        unsafe {
+            t.replace_data_page(va, 0x900000, 0x901000, |p| {
+                observed.push(core::ptr::read_volatile(p));
+                Ok(())
+            })
+        }
+        .unwrap();
+        assert_eq!(
+            observed,
+            [0, leaf_descriptor(3, 0x901000, data(va, 0x901000))]
+        );
+        assert_eq!(t.walk(va).unwrap().unwrap().pa, 0x901000);
+        assert_eq!(t.used_pages(), used);
+    }
+    #[test]
+    fn failure_after_break_or_make_retains_that_state_without_rollback() {
+        for fail in [1, 2] {
+            let mut storage = TableStorage::<4>::zeroed();
+            let mut t = TableSet::new(&mut storage, 0x800000, 44).unwrap();
+            let va = crate::tlb_update::SCRATCH_VA;
+            t.map(data(va, 0x900000)).unwrap();
+            let mut calls = 0;
+            assert!(
+                unsafe {
+                    t.replace_data_page(va, 0x900000, 0x901000, |_| {
+                        calls += 1;
+                        if calls == fail {
+                            Err(TranslationError::Unexpected)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+                .is_err()
+            );
+            assert_eq!(calls, fail);
+            assert_eq!(
+                t.walk(va).unwrap().map(|m| m.pa),
+                if fail == 1 { None } else { Some(0x901000) }
+            );
+        }
+    }
+    #[test]
+    fn wrong_old_page_attributes_blocks_and_bad_new_address_do_not_write() {
+        let va = crate::tlb_update::SCRATCH_VA;
+        for case in 0..6 {
+            let mut storage = TableStorage::<4>::zeroed();
+            let mut t = TableSet::new(&mut storage, 0x800000, 44).unwrap();
+            let mut m = data(va, 0x900000);
+            match case {
+                0 => m.writable = false,
+                1 => m.executable = true,
+                2 => m.memory_type = MemoryType::Device,
+                3 => {
+                    m.pa = 0;
+                    m.size = 1 << 21;
+                }
+                _ => {}
+            }
+            t.map(m).unwrap();
+            let before = t.walk(va).unwrap();
+            let mut calls = 0;
+            assert!(
+                unsafe {
+                    t.replace_data_page(
+                        va,
+                        if case == 4 { 0x902000 } else { 0x900000 },
+                        if case == 5 { 1 << 44 } else { 0x901000 },
+                        |_| {
+                            calls += 1;
+                            Ok(())
+                        },
+                    )
+                }
+                .is_err()
+            );
+            assert_eq!(calls, 0);
+            assert_eq!(t.walk(va).unwrap(), before);
+        }
+    }
+    #[test]
+    fn the_boot_gate_remains_frozen_after_scratch_updates() {
+        let mut storage = TableStorage::<4>::zeroed();
+        let mut t = TableSet::new(&mut storage, 0x800000, 44).unwrap();
+        t.map(data(crate::tlb_update::SCRATCH_VA, 0x900000))
+            .unwrap();
+        let mut gate = crate::startup_resources::BootTables::new(t);
+        assert!(unsafe { gate.replace_scratch_page(0x900000, 0x901000, |_| Ok(())) }.is_err());
+        gate.validate_and_freeze(|_| Ok(())).unwrap();
+        unsafe { gate.replace_scratch_page(0x900000, 0x901000, |_| Ok(())) }.unwrap();
+        assert!(gate.edit().is_err());
+        assert!(gate.is_frozen());
     }
 }

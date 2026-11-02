@@ -42,7 +42,58 @@ rustup target add aarch64-unknown-none
 The Raspberry Pi must boot through a U-Boot configuration that enters tvisor
 at EL2 and provides a working DTB through the `fdt_addr` environment variable.
 
+## Secondary firmware handoff
+
+The supported Raspberry Pi 4 Model B spin-table backend requires the following entry contract
+between firmware and tvisor's `__secondary_entry`:
+
+| Property | Required state at entry |
+|---|---|
+| Exception level | AArch64 EL2 |
+| MMU | Disabled (`SCTLR_EL2.M = 0`) |
+| Data cache | Disabled (`SCTLR_EL2.C = 0`) |
+| Data endianness | Little-endian (`SCTLR_EL2.EE = 0`) |
+| CPU coherency | Established according to the supported platform/firmware contract |
+| Entry address | Physical address published in the DT-described spin-table release cell |
+
+The trampoline checks EL2 and the MMU/data-cache/endianness bits before reading
+the startup record or installing a stack. Unsupported state enters a holding
+loop. It also identifies Cortex-A72 before checking `CPUECTLR_EL1.SMPEN`.
+Coherency is a platform precondition: SMPEN is a defensive maintenance check,
+not proof of coherency, and the trampoline does not establish coherency itself.
+The boot CPU validates and publishes the physical entry and startup resources
+before releasing the secondary. The trampoline finds the matching per-CPU slot
+by full affinity and loads stack bounds from `PcpuContext`; synchronization and
+diagnostics live in that slot, with EL2 configuration shared separately. See the
+[per-slot startup design](docs/phase11_3_slot_refactor.md).
+CPU lifecycle and optional readiness waits are separate: a timeout does not
+change the CPU state. Phase 11.3 still treats a failed startup wait as a terminal
+guest-boot policy decision; see the [lifecycle design](docs/phase11_3_lifecycle_refactor.md).
+Phase 11.4 adds per-CPU GIC setup and host management SGIs after that checkpoint,
+allowing CPU1 to handle requests while CPU0 runs Linux. See the
+[implementation and validation status](docs/phase11_4_status.md).
+
+Disabled data cache alone does not prove a clean cache history. Firmware must
+also ensure safe instruction fetch and no conflicting dirty cache state; the
+trampoline does not require the instruction cache to be disabled. See the
+[backend contract](docs/phase11_3_backend_contract.md) and
+[entry review](docs/phase11_3_entry_review.md) for these obligations.
+
 ## Build and host tests
+
+Ordinary debug and release builds keep startup diagnostics quiet. Initialization
+and validation failures, warnings and panic reports remain enabled.
+
+| Build | Startup detail | Scratch remapping tests |
+|---|---|---|
+| `cargo build` / `cargo build --release` | Concise guest-entry message | None; no scratch pages reserved |
+| `cargo build --features diagnostics` | CPU, memory, register and management checkpoints | None |
+| `cargo build --release --features tlb-update-test` | Detailed acceptance records | 32 Online and 16 Parked remaps |
+| `cargo build --features tlb-update-timeout-test` | Detailed failure-test records | Delayed CPU2 acknowledgement; guest deliberately blocked |
+
+All hardware acceptance features enable `diagnostics` automatically. Selecting
+`--release` alone does not enable diagnostics or acceptance workloads. Host unit
+tests use `#[cfg(test)]` and are excluded from ordinary images.
 
 Run the host unit tests:
 
@@ -134,19 +185,11 @@ no `lmb=` or `bootmem=` arguments are accepted or required.
 
 ### 5. Check the result
 
-A successful run should print:
-
-- DTB version, size, and board model;
-- discovered RAM, reservations, MMIO translations, CPUs, and console;
-- normalized `RESERVED` and `USABLE` RAM plus MMIO regions;
-- inherited EL2 register state; and
-- the private-environment checkpoints:
-
-```text
-Phase 7 checkpoint 2: tvisor EL2 stage-1 page tables active
-Phase 7 checkpoint 3: register, stack, and image validation passed
-Phase 9 Guest Preparation & Execution Verification: PASSED
-```
+An ordinary image prints `tvisor: entering one-vCPU Linux guest`, followed by
+the guest console. Enable `--features diagnostics` to also see platform,
+per-CPU, register, memory and private-environment checkpoints. Successful
+scratch-remap records appear only in TLB acceptance images. Validation failures
+remain visible with diagnostics disabled.
 
 The final halt is intentional. Reset or power-cycle the board before another
 test; there is no return path to the U-Boot prompt.
@@ -154,6 +197,13 @@ test; there is no return path to the U-Boot prompt.
 ## Documentation
 
 - [Development plan](docs/development_plan.md)
+- [Phase 11 physical SMP design](docs/tvisor_smp.md)
+- [IRQ ownership, HCR profiles and handling policy (proposal)](docs/irq_handling.md)
+- [Phase 11.4 centralized HCR policy follow-up](docs/phase11_4_hcr_policy.md)
+- [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
+- [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
+- [Phase 11.5 all-core startup and concurrent resource acceptance](docs/phase11_5_status.md)
+- [Phase 11.6 EL2 mapping updates and completed physical SMP regression](docs/phase11_6_status.md)
 - [System-information model](docs/system_information_model.md)
 - [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
 - [Address translation](docs/address_translation.md)

@@ -15,11 +15,20 @@ use tvisor_util::gicv2;
 use tvisor_util::system_info::{ConsoleInfo, ConsoleKind, PhysAddr, PhysRegion};
 use tvisor_util::{halt, println};
 
+#[cfg(feature = "all-core-stress-test")]
+mod all_core_test;
 mod boot;
 mod exception;
 mod guest;
 mod heap;
+mod management;
+#[cfg(all(feature = "all-core-stress-test", feature = "management-irq-test"))]
+compile_error!("acceptance features must be run separately");
 mod mm;
+mod pcpu;
+mod secondary;
+mod smp;
+mod tlb;
 mod vcpu;
 mod vmctl;
 
@@ -29,6 +38,8 @@ global_asm!(
     .global main
     .type main, %function
 main:
+    msr daifset, #0xf
+    isb
     // U-Boot's `go` command jumps into the bytes loaded by TFTP and does not
     // process the ELF NOBITS segment. Initialize Rust's zero-initialized
     // statics before entering any Rust code.
@@ -126,6 +137,12 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         halt();
     }
 
+    // Validate DT startup memory ownership before allocator takeover.
+    if let Err(error) = smp::discover(*fdt) {
+        println!("Physical CPU startup discovery failed: {}", error);
+        halt();
+    }
+
     let image = match unsafe { image_from_uboot_args(argc, argv) } {
         Ok(image) => image,
         Err(error) => {
@@ -162,9 +179,10 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
         println!("Linux Image handoff was already initialized differently");
         halt();
     }
-    println!(
+    tvisor_util::diagnostic_println!(
         "Linux Image handoff: source={} bytes={}",
-        image_source, image.size
+        image_source,
+        image.size
     );
 
     let live_dtb: PhysRegion = (*fdt).into();
@@ -188,7 +206,7 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
             halt();
         }
     };
-    println!(
+    tvisor_util::diagnostic_println!(
         "GICv2 DTB discovery:\n GICD={}\n GICC={}\n GICH={}\n GICV={}",
         gic.distributor(),
         gic.cpu_interface(),
@@ -221,6 +239,22 @@ extern "C" fn rust_main(argc: isize, argv: *const *const u8) -> ! {
 
 #[panic_handler]
 pub fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
+    pcpu::record_fatal(tvisor_util::failure::Failure {
+        kind: 1,
+        syndrome: 0,
+        pc: 0,
+        address: 0,
+    });
+    management::notify_fatal();
+    let _ = tvisor_util::debug_util::emergency_print(format_args!("PANIC: {}\n", info));
     halt()
 }
+
+#[cfg(all(
+    feature = "all-core-timeout-test",
+    feature = "secondary-startup-timeout-test"
+))]
+compile_error!("timeout acceptance features must be run separately");
+
+#[cfg(all(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
+compile_error!("mapping acceptance features must run separately");

@@ -785,7 +785,7 @@ impl VmCtl {
         let (image_ipa, image_extent) = layout.image();
         let (dtb_ipa, dtb_capacity) = layout.dtb();
 
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 10: loading Linux Image: linux_image={} bytes={} entry={:#018x} extent={} DTB={:#018x}",
             linux_image,
             image.len(),
@@ -797,7 +797,7 @@ impl VmCtl {
         let gic = gicv2::global().expect("GICv2 must be discovered before guest preparation");
         unsafe {
             gic.enable_virtual_timer_ppi()?;
-            gic.enable_spi(guest::get_host_console_irq())?;
+            gic.gicd_enable_irq(guest::get_host_console_irq())?;
         }
 
         tvisor_util::debug_util::enable_rx_interrupt()
@@ -892,6 +892,8 @@ impl VmCtl {
         let guest_stage2_root_pa = self.guest_stage2_page_table_root().unwrap().value();
         let guest_stage2_regs =
             guest_stage2_register_values(self.vm_id(), guest_stage2_root_pa, pa_range)?;
+        #[cfg(feature = "management-irq-test")]
+        crate::management::verify_stage2_profiles(&guest_stage2_regs);
         unsafe { guest::activate_guest_stage2(&guest_stage2_regs) };
         *need_deactivate = true;
 
@@ -900,7 +902,7 @@ impl VmCtl {
         let vcpu = self
             .vcpu_mut(vcpu_id)
             .expect("new Linux vCPU must be present");
-        println!(
+        tvisor_util::diagnostic_println!(
             "Phase 10: entering Linux at EL1: PC={:#018x} x0={:#018x}",
             vcpu.context().elr_el2,
             vcpu.context().x[0]

@@ -59,20 +59,19 @@ pub const VTCR_EL2_SH0_INNER: u64 = 0b11 << 12;
 pub const VTCR_EL2_TG0_4KB: u64 = 0b00 << 14;
 pub const VTCR_EL2_RES1: u64 = 1 << 31;
 
-pub const HCR_EL2_VM: u64 = 1 << 0;
-pub const HCR_EL2_SWIO: u64 = 1 << 1;
-/// Route physical IRQ exceptions taken while running the guest to EL2.
-pub const HCR_EL2_IMO: u64 = 1 << 4;
-pub const HCR_EL2_TSC: u64 = 1 << 19;
-pub const HCR_EL2_RW: u64 = 1 << 31;
-pub const HCR_EL2_STAGE2_VALUE: u64 =
-    HCR_EL2_RW | HCR_EL2_TSC | HCR_EL2_SWIO | HCR_EL2_IMO | HCR_EL2_VM;
+// Compatibility names; bit definitions and both execution profiles belong to
+// el2_policy. Guest activation must include every shared host policy control.
+pub use crate::el2_policy::{
+    HCR_IMO as HCR_EL2_IMO, HCR_RW as HCR_EL2_RW, HCR_SWIO as HCR_EL2_SWIO, HCR_TSC as HCR_EL2_TSC,
+    HCR_VM as HCR_EL2_VM,
+};
+pub const HCR_EL2_STAGE2_VALUE: u64 = crate::el2_policy::GUEST_HCR;
 
 pub const CPTR_EL2_TFP: u64 = 1 << 10;
-pub const CPTR_EL2_RES1: u64 = (0b11 << 12) | 0x3ff;
+pub const CPTR_EL2_RES1: u64 = crate::el2_policy::CPTR_RES1;
 /// CPTR_EL2 value used while tvisor executes at EL2. TFP remains clear because
 /// Rust and compiler-generated routines may use FP/Advanced SIMD instructions.
-pub const CPTR_EL2_STAGE2_VALUE: u64 = CPTR_EL2_RES1;
+pub const CPTR_EL2_STAGE2_VALUE: u64 = crate::el2_policy::HOST_CPTR;
 
 /// Virtual MPIDR_EL1 for vCPU 0 on a virtual uniprocessor system.
 /// Bit 31 = RES1 (1)
@@ -190,6 +189,11 @@ mod tests {
         assert_eq!(regs.hcr_el2 & HCR_EL2_VM, HCR_EL2_VM);
         assert_eq!(regs.hcr_el2 & HCR_EL2_RW, HCR_EL2_RW);
         assert_eq!(regs.hcr_el2 & HCR_EL2_IMO, HCR_EL2_IMO);
+        assert_eq!(regs.hcr_el2, crate::el2_policy::GUEST_HCR);
+        assert_eq!(
+            regs.hcr_el2 & crate::el2_policy::HOST_HCR,
+            crate::el2_policy::HOST_HCR
+        );
         assert_eq!(regs.cptr_el2 & CPTR_EL2_TFP, 0);
         assert_eq!(regs.vmpidr_el2, 0xC000_0000);
     }

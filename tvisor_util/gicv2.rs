@@ -14,6 +14,9 @@ pub enum GicV2Error {
     InvalidIRQ(u32),
     InvalidSPI(u32),
     Unexpected,
+    InvalidTarget(u8),
+    ManagementUnavailable,
+    CpuInterfaceNotReady,
 }
 
 impl Error for GicV2Error {}
@@ -24,8 +27,80 @@ impl Display for GicV2Error {
             GicV2Error::InvalidIRQ(irq) => write!(f, "InvalidIRQ({})", irq),
             GicV2Error::InvalidSPI(irq) => write!(f, "InvalidSPI({})", irq),
             GicV2Error::Unexpected => write!(f, "Unexpected"),
+            GicV2Error::InvalidTarget(mask) => write!(f, "InvalidTarget({mask:#x})"),
+            GicV2Error::ManagementUnavailable => {
+                f.write_str("Non-secure management SGI unavailable")
+            }
+            GicV2Error::CpuInterfaceNotReady => f.write_str("GIC CPU interface readback failed"),
         }
     }
+}
+
+/// Physical host management interrupt. Firmware must leave this SGI available
+/// to Non-secure EL2; EL2 never attempts to reclassify a Secure interrupt.
+pub const MANAGEMENT_SGI: u32 = 1;
+
+/// Full GICC_IAR token, including the originating CPU interface for SGIs.
+/// Special IDs 1020..1023 are observations, never completable interrupts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InterruptAck(u32);
+impl InterruptAck {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if raw & GICH_LR_INTID_MASK < 1020 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+    pub const fn intid(&self) -> u32 {
+        self.0 & GICH_LR_INTID_MASK
+    }
+    pub const fn source(&self) -> Option<u8> {
+        if self.intid() < 16 {
+            Some(((self.0 >> 10) & 7) as u8)
+        } else {
+            None
+        }
+    }
+    pub const fn raw(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Discovered banked ITARGETSR value. A logical CPU ID is never a GIC mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuTarget(u8);
+impl CpuTarget {
+    pub const fn new(mask: u8) -> Result<Self, GicV2Error> {
+        if mask.count_ones() == 1 {
+            Ok(Self(mask))
+        } else {
+            Err(GicV2Error::InvalidTarget(mask))
+        }
+    }
+    pub const fn mask(self) -> u8 {
+        self.0
+    }
+    pub const fn interface(self) -> u8 {
+        self.0.trailing_zeros() as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuInterfaceState {
+    pub target: CpuTarget,
+    pub security_extensions: bool,
+    pub group1: bool,
+    pub distributor_control: u32,
+    pub control: u32,
+    pub priority_mask: u32,
+    pub binary_point: u32,
+}
+
+/// TargetListFilter=0, explicit discovered target, SGI 1. NSATT is RES0/ignored
+/// for Non-secure writes: the receiver's established Group-1 ownership governs.
+pub const fn management_sgir(target: CpuTarget) -> u32 {
+    ((target.mask() as u32) << 16) | MANAGEMENT_SGI
 }
 
 /// Physical GICv2 regions, in the DTB `reg` order: GICD, GICC, GICH, GICV.
@@ -439,44 +514,126 @@ impl GicV2 {
         }
     }
 
-    /// Enables a banked virtual timer PPI (27) from the GICv2 Non-secure register view.
-    pub unsafe fn enable_virtual_timer_ppi(&self) -> Result<(), GicV2Error> {
-        // Explicitly classify PPI 27 as Non-Secure interrupt (Group 1)
-        self.gicd_igroupr_n_set(VIRTUAL_TIMER_PPI, true)?;
-
-        // Enable Group 1 forwarding
+    /// Boot CPU only, before releasing a secondary. Configures the one owned
+    /// SPI once. SGI/PPI and CPU-interface setup is separate and banked.
+    pub unsafe fn initialize_distributor(
+        &self,
+        uart_spi: u32,
+        boot: CpuTarget,
+    ) -> Result<(), GicV2Error> {
+        if !(32..self.num_interrupts()).contains(&uart_spi) {
+            return Err(GicV2Error::InvalidSPI(uart_spi));
+        }
+        self.gicd_disable_irq(uart_spi)?;
+        self.configure_nonsecure_priority(uart_spi, 0x80)?;
+        self.gicd_itargetsr_set(uart_spi, boot.mask());
+        self.gicd_icfgr_n_set(uart_spi, false)?;
         self.gicd_ctlr_bitflag_set(GICD_CTLR_ENABLE_GRP1_NS);
-
-        // Allow all normal priorities through the CPU interface
-        self.gicc_pmr_set(0xff);
-
-        self.gicc_ctlr_bitflag_set(GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS);
-        self.gicd_enable_irq(VIRTUAL_TIMER_PPI)?;
-
+        if unsafe { read8(self.gicd_itargetsr() + uart_spi as usize) } != boot.mask() {
+            return Err(GicV2Error::CpuInterfaceNotReady);
+        }
         Ok(())
     }
 
-    /// Enables a Non-secure Group 1 shared peripheral interrupt on CPU0.
-    /// This is used for host-owned EL2 devices; it is never exposed directly
-    /// to a guest.
-    pub unsafe fn enable_spi(&self, spi: u32) -> Result<(), GicV2Error> {
-        if !(32..self.num_interrupts()).contains(&spi) {
-            return Err(GicV2Error::InvalidSPI(spi));
+    pub fn banked_target_words(&self) -> [u32; 8] {
+        core::array::from_fn(|i| unsafe { read32(self.gicd_itargetsr() + i * 4) })
+    }
+    pub fn local_target(&self) -> Result<CpuTarget, GicV2Error> {
+        // Read the banked register words and fold their four target fields.
+        // Unimplemented fields may read zero; every nonzero field must name
+        // the same single interface. Never derive the mask from logical ID.
+        let mut mask = 0u32;
+        for word in self.banked_target_words() {
+            mask |= word;
         }
+        mask |= mask >> 16;
+        mask |= mask >> 8;
+        CpuTarget::new(mask as u8)
+    }
 
-        self.gicd_ctlr_bitflag_set(GICD_CTLR_ENABLE_GRP1_NS);
-        self.gicc_pmr_set(0xff);
-        self.gicc_ctlr_bitflag_set(GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS);
-        self.gicd_igroupr_n_set(spi, true)?;
-        self.gicd_ipriorityr_set(spi, 0x80);
-        self.gicd_itargetsr_set(spi, 0x01);
-        // The DTB describes the Mini UART as level-high. Clear the
-        // trigger-type bit explicitly instead of relying on U-Boot's
-        // inherited distributor configuration.
-        self.gicd_icfgr_n_set(spi, false)?;
-        self.gicd_enable_irq(spi)?;
-
+    fn configure_nonsecure_priority(&self, irq: u32, priority: u8) -> Result<(), GicV2Error> {
+        // IHI0048B 4.3.4: IGROUPR is Secure-only when Security Extensions
+        // exist, so its Non-secure RAZ view cannot prove Group 1 ownership.
+        // 4.3.11: Group-0 priority fields are RAZ/WI to Non-secure accesses.
+        // A nonzero priority readback establishes this interrupt is accessible
+        // as Non-secure; this never changes interrupt group classification.
+        self.gicd_ipriorityr_set(irq, priority);
+        let actual = unsafe { read8(self.gicd_ipriorityr() + irq as usize) };
+        if actual != priority {
+            return Err(GicV2Error::ManagementUnavailable);
+        }
         Ok(())
+    }
+
+    /// Owner CPU only, with IRQ masked and verified Device identity mappings.
+    /// Vectors, private stack and management mailboxes must be ready before
+    /// the caller unmasks IRQ. Worker PPIs/timers and GICH remain disabled.
+    pub unsafe fn initialize_cpu_interface(
+        &self,
+        worker: bool,
+    ) -> Result<CpuInterfaceState, GicV2Error> {
+        let target = self.local_target()?;
+        // Supported firmware contract leaves SGI 1 enabled in the NS view.
+        // Group-0 enable bits are RAZ/WI to NS (IHI0048B 4.3.5).
+        if unsafe { read32(self.gicd_typer()) } & (1 << 10) != 0
+            && !self.gicd_isenabler_n_get(MANAGEMENT_SGI)?
+        {
+            return Err(GicV2Error::ManagementUnavailable);
+        }
+        if worker {
+            unsafe { write32(self.gicd_icenabler(), 0xffff_0000) };
+            self.gich_hcr_set(0);
+        }
+        self.configure_nonsecure_priority(MANAGEMENT_SGI, 0x40)?;
+        self.gicd_enable_irq(MANAGEMENT_SGI)?;
+        self.gicc_pmr_set(0xff);
+        unsafe { write32(self.cpu_interface_base() + GICC_BPR, 0) };
+        // Non-secure view: bit 9 is EOImodeNS. Preserve firmware-owned bits.
+        self.gicc_ctlr_bitflag_set(GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS);
+        unsafe { complete_mmio() };
+        let state = CpuInterfaceState {
+            target,
+            security_extensions: unsafe { read32(self.gicd_typer()) } & (1 << 10) != 0,
+            group1: self.gicd_igroupr_n_get(MANAGEMENT_SGI)?,
+            distributor_control: unsafe { read32(self.gicd_ctlr()) },
+            control: unsafe { read32(self.gicc_ctlr()) },
+            priority_mask: unsafe { read32(self.gicc_pmr()) },
+            binary_point: unsafe { read32(self.cpu_interface_base() + GICC_BPR) },
+        };
+        if state.control & (GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS)
+            != GICC_CTLR_ENABLE_GRP1_NS | GICC_CTLR_EOIMODE_NS
+            || state.distributor_control & GICD_CTLR_ENABLE_GRP1_NS == 0
+            || state.priority_mask & 0xff < 0x80
+            // Writing zero saturates to the implementation minimum: up to
+            // four in the NS view (IHI0048B 4.4.3).
+            || state.binary_point & 7 > 4
+            || !self.gicd_isenabler_n_get(MANAGEMENT_SGI)?
+        {
+            return Err(GicV2Error::CpuInterfaceNotReady);
+        }
+        Ok(state)
+    }
+
+    /// Boot CPU only; distributor routing was installed before CPU1 release.
+    pub unsafe fn enable_virtual_timer_ppi(&self) -> Result<(), GicV2Error> {
+        self.configure_nonsecure_priority(VIRTUAL_TIMER_PPI, 0x80)?;
+        self.gicd_enable_irq(VIRTUAL_TIMER_PPI)?;
+        if !self.gicd_isenabler_n_get(VIRTUAL_TIMER_PPI)? {
+            return Err(GicV2Error::ManagementUnavailable);
+        }
+        Ok(())
+    }
+
+    pub unsafe fn send_management(&self, target: CpuTarget) {
+        // Publish normal-memory request data before issuing the Device write.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb ishst", options(nostack, preserves_flags))
+        };
+        unsafe {
+            write32(self.distributor_base() + GICD_SGIR, management_sgir(target));
+            complete_mmio();
+        }
     }
 
     pub unsafe fn restore_virtual_cpu(&self, state: &VirtualGicV2State) {
@@ -493,20 +650,24 @@ impl GicV2 {
         self.gich_hcr_set(0);
     }
 
-    pub unsafe fn acknowledge(&self) -> u32 {
-        self.gicc_iar_get() & GICH_LR_INTID_MASK
+    pub unsafe fn acknowledge(&self) -> Option<InterruptAck> {
+        InterruptAck::from_raw(self.gicc_iar_get())
     }
 
-    /// Drops priority only; guest GICV_EOIR deactivates the hardware LR.
-    pub unsafe fn end_interrupt(&self, id: u32) {
-        self.gicc_eoir_set(id);
+    /// Drops priority only; a guest hardware timer LR owns deactivation.
+    pub unsafe fn end_interrupt(&self, ack: &InterruptAck) {
+        self.gicc_eoir_set(ack.raw());
     }
 
-    /// Completes a host-owned interrupt after `end_interrupt`. EOImodeNS is
-    /// enabled, so EOIR only drops priority; physical sources which are not
-    /// represented by a hardware List Register must be deactivated here.
-    pub unsafe fn deactivate_interrupt(&self, id: u32) {
-        self.gicc_dir_set(id);
+    /// Completes a physical host interrupt with the same unmodified raw token.
+    /// Consuming the token prevents accidental second completion by this path.
+    pub unsafe fn complete_host_interrupt(&self, ack: InterruptAck) {
+        unsafe {
+            complete_mmio();
+            self.end_interrupt(&ack);
+            self.gicc_dir_set(ack.raw());
+            complete_mmio();
+        }
     }
 }
 
@@ -518,10 +679,10 @@ pub fn global() -> Option<&'static GicV2> {
     GLOBAL_GIC.get()
 }
 
-// Covers GICD_ITARGETSR31, needed to route any valid SPI to CPU0.
-pub const REQUIRED_GICD_SIZE: u64 = 0xc80;
+// Covers GICD_SGIR as well as every valid SPI target/configuration register.
+pub const REQUIRED_GICD_SIZE: u64 = 0xf04;
 pub const REQUIRED_GICC_SIZE: u64 = 0x1004; // GICC_DIR at 0x1000
-pub const REQUIRED_GICH_SIZE: u64 = 0x104; // GICH_LR0 at 0x100
+pub const REQUIRED_GICH_SIZE: u64 = 0x108; // GICH_LR1 at 0x104
 pub const REQUIRED_GICV_SIZE: u64 = 0x1004; // GICV_DIR at 0x1000, if needed
 
 const GICD_CTLR: usize = 0x000;
@@ -533,7 +694,9 @@ const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
 const GICD_ICFGR: usize = 0xc00;
 const GICC_CTLR: usize = 0x000;
+const GICD_SGIR: usize = 0xf00;
 const GICC_PMR: usize = 0x004;
+const GICC_BPR: usize = 0x008;
 const GICC_IAR: usize = 0x00c;
 const GICC_EOIR: usize = 0x010;
 const GICC_DIR: usize = 0x1000;
@@ -552,6 +715,19 @@ const GICH_LR_STATE_MASK: u32 = 0b11 << 28;
 const GICH_LR_PRIORITY_SHIFT: u32 = 23;
 const GICH_LR_PHYSICAL_ID_SHIFT: u32 = 10;
 const GICH_LR_INTID_MASK: u32 = 0x3ff;
+
+#[inline]
+unsafe fn complete_mmio() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags))
+    };
+}
+
+#[inline]
+unsafe fn read8(address: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(address as *const u8) }
+}
 
 #[inline]
 unsafe fn read32(address: usize) -> u32 {
@@ -589,7 +765,7 @@ impl VirtualGicV2State {
 }
 
 pub fn queue_timer_ppi(state: &mut VirtualGicV2State, ppi: u32) -> Result<(), ()> {
-    if state.timer_in_flight() || ppi > GICH_LR_INTID_MASK {
+    if state.timer_in_flight() || !(16..32).contains(&ppi) {
         return Err(());
     }
     state.timer_lr =
@@ -602,7 +778,7 @@ pub fn queue_timer_ppi(state: &mut VirtualGicV2State, ppi: u32) -> Result<(), ()
 /// LR group bit must remain clear. Unlike the timer LR, it has no physical
 /// interrupt to deactivate when the guest EOIs it.
 pub fn queue_uart_spi(state: &mut VirtualGicV2State, spi: u32) -> Result<(), ()> {
-    if state.uart_in_flight() || spi > GICH_LR_INTID_MASK {
+    if state.uart_in_flight() || !(32..1020).contains(&spi) {
         return Err(());
     }
     state.uart_lr = GICH_LR_PENDING | lr_priority(0x80) | spi;
@@ -620,6 +796,86 @@ pub const fn is_timer_ppi(id: u32, ppi: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_sgi_source_survives_and_special_ids_are_not_completable() {
+        for source in 0..8 {
+            let raw = (source << 10) | MANAGEMENT_SGI;
+            let ack = InterruptAck::from_raw(raw).unwrap();
+            assert_eq!(ack.intid(), MANAGEMENT_SGI);
+            assert_eq!(ack.source(), Some(source as u8));
+            assert_eq!(ack.raw(), raw);
+        }
+        for id in 1020..=1023 {
+            assert!(InterruptAck::from_raw((7 << 10) | id).is_none());
+        }
+        assert_eq!(InterruptAck::from_raw(27).unwrap().source(), None);
+    }
+    #[test]
+    fn nonsequential_target_masks_and_host_only_interrupts() {
+        for interface in 0..8 {
+            let target = CpuTarget::new(1 << interface).unwrap();
+            assert_eq!(target.interface(), interface);
+            assert_eq!(management_sgir(target), ((1u32 << interface) << 16) | 1);
+        }
+        for mask in [0, 3, 5, 0xff] {
+            assert!(CpuTarget::new(mask).is_err());
+        }
+        let mut state = VirtualGicV2State::default();
+        for id in [0, MANAGEMENT_SGI, 15, 1020, 1023] {
+            assert!(queue_uart_spi(&mut state, id).is_err());
+            assert!(queue_timer_ppi(&mut state, id).is_err());
+            assert_eq!(state, VirtualGicV2State::default());
+        }
+    }
+    #[test]
+    fn banked_configuration_and_secure_ownership_fail_closed() {
+        use crate::system_info::{PhysAddr, PhysRegion};
+        let mut d = std::vec![0u32;1024];
+        let c = std::vec![0u32;1025];
+        let h = std::vec![0u32;128];
+        let v = std::vec![0u32;1025];
+        let region = |p: *const u32, n| PhysRegion::new(PhysAddr::new(p as u64), n).unwrap();
+        let info = GicV2Info::new(
+            region(d.as_ptr(), 4096),
+            region(c.as_ptr(), 4100),
+            region(h.as_ptr(), 512),
+            region(v.as_ptr(), 4100),
+        )
+        .unwrap();
+        let gic = GicV2::new(info);
+        d[GICD_TYPER / 4] = 31;
+        for i in 0..8 {
+            d[GICD_ITARGETSR / 4 + i] = 0x08080808;
+        }
+        d[GICD_ITARGETSR / 4] = 0;
+        d[GICD_ITARGETSR / 4 + 1] = 0x00080000;
+        let boot = gic.local_target().unwrap();
+        assert_eq!(boot.mask(), 8);
+        unsafe {
+            gic.initialize_distributor(33, boot).unwrap();
+        }
+        assert_eq!((d[(GICD_ITARGETSR + 32) / 4] >> 8) & 255, 8);
+        let state = unsafe { gic.initialize_cpu_interface(true).unwrap() };
+        assert_eq!(state.target.mask(), 8);
+        assert_eq!(state.control & 0x201, 0x201);
+        let ack = InterruptAck::from_raw((5 << 10) | 1).unwrap();
+        unsafe { gic.complete_host_interrupt(ack) };
+        assert_eq!(c[GICC_EOIR / 4], (5 << 10) | 1);
+        assert_eq!(c[GICC_DIR / 4], (5 << 10) | 1);
+        // Model a Security Extensions implementation whose SGI remains Secure.
+        d[GICD_TYPER / 4] |= 1 << 10;
+        d[GICD_IGROUPR / 4] = 0;
+        d[GICD_ISENABLER / 4] = 0;
+        assert_eq!(
+            unsafe { gic.initialize_cpu_interface(true) },
+            Err(GicV2Error::ManagementUnavailable)
+        );
+        assert_eq!(d[GICD_IGROUPR / 4], 0); // no attempted reclassification
+        // IGROUPR can stay RAZ even for accessible Group-1 interrupts.
+        d[GICD_ISENABLER / 4] = 1 << MANAGEMENT_SGI;
+        assert!(unsafe { gic.initialize_cpu_interface(true) }.is_ok());
+    }
 
     #[test]
     fn timer_lr_is_reusable_after_invalid_state() {

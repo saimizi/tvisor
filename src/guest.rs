@@ -1,7 +1,5 @@
 //! Guest platform initialization, Stage-2 translation setup, and Linux launch.
 
-use alloc::format;
-use alloc::string::String;
 use core::fmt;
 use spin::Once;
 
@@ -20,6 +18,7 @@ use tvisor_util::system_info::PhysRegion;
 use tvisor_util::virtual_timer::VIRTUAL_TIMER_PPI;
 
 static LINUX_IMAGE_SOURCE: Once<PhysRegion> = Once::new();
+static DUPLICATE_TIMER_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HOST_CONSOLE_IRQ: Once<u32> = Once::new();
 
 /// Why Linux execution returned to EL2 instead of continuing its normal run.
@@ -146,6 +145,7 @@ pub unsafe fn invalidate_icache_all() {
 /// invalidates prior guest TLB entries for VMID 1, and synchronizes context with `isb`.
 #[inline]
 pub unsafe fn activate_guest_stage2(regs: &GuestStage2RegisterValues) {
+    assert_eq!(regs.hcr_el2, tvisor_util::el2_policy::GUEST_HCR);
     unsafe {
         // 1. Ensure descriptor writes are visible to hardware table walkers
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
@@ -185,15 +185,27 @@ pub unsafe fn activate_guest_stage2(regs: &GuestStage2RegisterValues) {
             options(nostack, preserves_flags),
         );
     }
+    assert_hcr_profile(tvisor_util::el2_policy::GUEST_HCR);
+}
+
+fn assert_hcr_profile(expected: u64) {
+    let actual: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, hcr_el2", out(reg) actual, options(nomem, nostack, preserves_flags));
+    }
+    assert_eq!(actual, expected, "EL2 HCR policy readback mismatch");
 }
 
 /// Deactivates Stage-2 translation and cleanly invalidates the guest VM context.
 ///
 /// Crucially, `tlbi vmalls12e1is` is executed while `VTTBR_EL2` still has the guest's
 /// VMID installed so that invalidation targets the correct VMID. Stage-2 translation
-/// and `VTTBR_EL2` are only cleared after invalidation is fully synchronized.
+/// is disabled and `VTTBR_EL2` cleared only after invalidation is synchronized.
+/// Restore HOST_HCR, removing guest-only SWIO/TSC as well as VM while keeping
+/// host IRQ routing. Ordinary IRQ/emulated exits retain GUEST_HCR and do not
+/// call this function. The caller must keep IRQs masked during the transition.
 #[inline]
-unsafe fn deactivate_guest_stage2() {
+pub(crate) unsafe fn deactivate_guest_stage2() {
     unsafe {
         // 1. Invalidate all Stage 1 & 2 translations for the current VMID while VTTBR_EL2 is active
         core::arch::asm!("tlbi vmalls12e1is", options(nostack, preserves_flags));
@@ -201,20 +213,39 @@ unsafe fn deactivate_guest_stage2() {
         // 2. Complete invalidation across Inner Shareable domain and synchronize
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
 
-        // 3. Disable only Stage-2 translation, preserving the other HCR_EL2
-        // controls selected by tvisor. CPTR_EL2 is deliberately left at its
-        // valid Phase-9 value because it contains architecturally RES1 fields
-        // and must not be cleared with xzr.
+        // 3. Install the explicit host profile. Do not inherit guest/firmware
+        // controls. Leave CPTR_EL2 at its valid shared host/guest policy value.
         core::arch::asm!(
-            "mrs x9, HCR_EL2",
-            "bic x9, x9, #1",
-            "msr HCR_EL2, x9",
+            "msr HCR_EL2, {host_hcr}",
             "isb",
             "msr VTTBR_EL2, xzr",
             "isb",
-            out("x9") _,
+            host_hcr = in(reg) tvisor_util::el2_policy::HOST_HCR,
             options(nostack, preserves_flags),
         );
+    }
+    assert_hcr_profile(tvisor_util::el2_policy::HOST_HCR);
+}
+
+#[derive(Debug)]
+enum ExitError {
+    UnexpectedIrq(u32),
+    UnexpectedException(VcpuExitReason),
+    InvalidRange(&'static str),
+    InvalidIpa(u64),
+    ConsoleTransmit,
+}
+impl fmt::Display for ExitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedIrq(irq) => write!(f, "Unexpected IRQ {irq}"),
+            Self::UnexpectedException(reason) => write!(f, "Unexpected exception:{reason}"),
+            Self::InvalidRange(name) => write!(f, "Invalid {name} range"),
+            Self::InvalidIpa(ipa) => write!(f, "Invalid IPA:{ipa:x}"),
+            Self::ConsoleTransmit => {
+                f.write_str("Virtual PL011 transmit could not reach host console")
+            }
+        }
     }
 }
 
@@ -222,8 +253,27 @@ fn handle_irq(
     vcpu: &mut Vcpu,
     gic: &gicv2::GicV2,
     dispatcher: &mut MmioDispatcher,
-) -> Result<(), String> {
-    let irq = unsafe { gic.acknowledge() };
+) -> Result<(), ExitError> {
+    let Some(ack) = (unsafe { gic.acknowledge() }) else {
+        return Ok(());
+    };
+    let irq = ack.intid();
+    if irq == gicv2::MANAGEMENT_SGI {
+        let before = *vcpu.gic();
+        let handled =
+            crate::management::dispatch(gic, ack, true, vcpu.context().spsr_el2 & (1 << 7) != 0);
+        assert_eq!(
+            *vcpu.gic(),
+            before,
+            "management SGI changed guest GIC state"
+        );
+        crate::management::stop_if_requested();
+        return if handled {
+            Ok(())
+        } else {
+            Err(ExitError::UnexpectedIrq(irq))
+        };
+    }
     let mut result = Ok(());
     'end: {
         if gicv2::is_timer_ppi(irq, VIRTUAL_TIMER_PPI) {
@@ -236,10 +286,11 @@ fn handle_irq(
                 // timer interrupt. Drop the physical interrupt priority and let the guest complete
                 // the existing LR through GICV_EOIR/GICV_DIR, which also completes the associated
                 // PPI.
-                println!("Warning: queue_timer_ppi fails");
+                // Duplicate timer delivery needs no formatted IRQ-side logging.
+                DUPLICATE_TIMER_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
 
-            unsafe { gic.end_interrupt(irq) };
+            unsafe { gic.end_interrupt(&ack) };
             break 'end;
         }
 
@@ -249,15 +300,12 @@ fn handle_irq(
             while let Some(byte) = tvisor_util::debug_util::read_byte() {
                 let _ = dispatcher.enqueue_pl011_rx(byte);
             }
-            unsafe { gic.end_interrupt(irq) };
-            unsafe { gic.deactivate_interrupt(irq) };
+            unsafe { gic.complete_host_interrupt(ack) };
             break 'end;
         }
 
-        result = Err(format!("Unexpected IRQ {}", irq));
-        if irq != gicv2::SPURIOUS_IRQ {
-            unsafe { gic.end_interrupt(irq) };
-        }
+        result = Err(ExitError::UnexpectedIrq(irq));
+        unsafe { gic.complete_host_interrupt(ack) };
     }
 
     result
@@ -266,17 +314,17 @@ fn handle_irq(
 fn handle_synchronous_exception(
     vcpu: &mut Vcpu,
     dispatcher: &mut MmioDispatcher,
-) -> Result<(), String> {
+) -> Result<(), ExitError> {
     let mut result = Ok(());
     let reason = vcpu.exit().decode_reason(vcpu.context());
     let VcpuExitReason::Stage2DataAbort { ipa, .. } = reason else {
-        return Err(format!("Unexpected exception:{}", reason));
+        return Err(ExitError::UnexpectedException(reason));
     };
 
     let mut is_trapped_mmio = false;
     let gicd_start = GUEST_GICD.start();
     let Some(gicd_end) = GUEST_GICD.end() else {
-        return Err(String::from("Invalid GICD range"));
+        return Err(ExitError::InvalidRange("GICD"));
     };
 
     if (gicd_start..gicd_end).contains(&ipa) {
@@ -285,7 +333,7 @@ fn handle_synchronous_exception(
 
     let pl011_start = GUEST_PL011.start();
     let Some(pl011_end) = GUEST_PL011.end() else {
-        return Err(String::from("Invalid PL011 REG range"));
+        return Err(ExitError::InvalidRange("PL011 REG"));
     };
 
     if (pl011_start..pl011_end).contains(&ipa) {
@@ -293,7 +341,7 @@ fn handle_synchronous_exception(
     }
 
     if !is_trapped_mmio {
-        return Err(format!("Invalid IPA:{:x}", ipa));
+        return Err(ExitError::InvalidIpa(ipa));
     }
 
     let exit = *vcpu.exit();
@@ -303,9 +351,7 @@ fn handle_synchronous_exception(
         .unwrap_or_else(|error| panic!("Virtual MMIO emulation failed: {error}"));
     if let Some(byte) = transmit {
         if tvisor_util::debug_util::write_byte(byte).is_err() {
-            result = Err(String::from(
-                "Virtual PL011 transmit could not reach host console",
-            ));
+            result = Err(ExitError::ConsoleTransmit);
         }
     }
 
@@ -329,12 +375,22 @@ pub fn run_vcpu_with_mmio(
         // The guest accesses GICV directly; save/restore GICH state around
         // every world switch so its List Register and CPU-interface policy
         // remain owned by this vCPU rather than the host.
+        crate::management::guest_entry();
         unsafe { gic.restore_virtual_cpu(vcpu.gic()) };
+        crate::pcpu::assert_boot_cpu_idle();
         let vector = unsafe { __vcpu_run(vcpu) };
+        crate::pcpu::assert_boot_cpu_idle();
         unsafe { gic.save_virtual_cpu(vcpu.gic_mut()) };
         // IRQ
         if vector == 9 {
-            if let Err(err) = handle_irq(vcpu, gic, dispatcher) {
+            let result = handle_irq(vcpu, gic, dispatcher);
+            // The IRQ handler only records this condition. Diagnose it after
+            // acknowledgement/completion, with no allocator/table lock held.
+            let duplicates = DUPLICATE_TIMER_IRQS.swap(0, core::sync::atomic::Ordering::Relaxed);
+            if duplicates != 0 {
+                println!("Warning: queue_timer_ppi fails (count={})", duplicates);
+            }
+            if let Err(err) = result {
                 println!("{}", err);
                 return vector;
             } else {
@@ -358,7 +414,7 @@ pub fn run_vcpu_with_mmio(
 }
 
 pub fn run_guest() -> Result<(), GuestRunError> {
-    println!("Phase 10: Preparing Linux guest execution environment...");
+    tvisor_util::diagnostic_println!("Phase 10: Preparing Linux guest execution environment...");
     let initial_stats = mm::allocator_stats().expect("get allocator stats");
     let mut vm_ctl = VmCtl::new(1);
     let mut need_deactivate = false;
