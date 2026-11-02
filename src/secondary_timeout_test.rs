@@ -1,7 +1,7 @@
 //! Opt-in hardware acceptance instrumentation, absent from normal builds.
 //! Delay only after coherent entry, local validation and checkpoint writes.
 //! Never change mappings, registers, release routing or publication maintenance.
-use super::{BOOT_ATTEMPT, physical_counter, report_checkpoint, startup};
+use super::{BOOT_STATE, physical_counter, report_checkpoint, startup};
 use core::sync::atomic::Ordering;
 use tvisor_util::{
     println,
@@ -49,7 +49,7 @@ pub(super) fn observe_terminal_failure() {
         println!("Phase 11.3 timeout-test FAIL: no retained record");
         return;
     };
-    if BOOT_ATTEMPT.status() != BootStatus::WaitFailed
+    if super::boot_status() != BootStatus::WaitFailed
         || record.mailbox.state(1) != Ok(CpuState::Starting)
         || record.mailbox.entry_is_claimed(1) != Ok(true)
     {
@@ -58,7 +58,7 @@ pub(super) fn observe_terminal_failure() {
     }
     println!(
         "Phase 11.3 timeout-test before late park: boot={:?} state={:?} entry_claimed={:?}",
-        BOOT_ATTEMPT.status(),
+        super::boot_status(),
         record.mailbox.state(1),
         record.mailbox.entry_is_claimed(1)
     );
@@ -94,7 +94,10 @@ pub(super) fn observe_terminal_failure() {
         })
         .is_ok();
     // This probes only the one-shot gate; it never calls start_all/release again.
-    let retry_rejected = matches!(BOOT_ATTEMPT.begin(), Err(BootError::AlreadyAttempted));
+    let retry_rejected = matches!(
+        tvisor_util::secondary_boot::begin_boot_once(&BOOT_STATE),
+        Err(BootError::AlreadyAttempted)
+    );
     let retained = startup(TEST_CPU, 1)
         .is_some_and(|again| record.slot_address() == again.slot_address())
         && crate::pcpu::validate_secondary_context(
@@ -108,21 +111,22 @@ pub(super) fn observe_terminal_failure() {
         fn __secondary_entry();
     }
     let cells_unchanged = crate::smp::verify_release_set(
-        super::RELEASED.load(Ordering::Acquire),
+        super::RELEASE_ATTEMPTED.load(Ordering::Acquire),
         __secondary_entry as *const () as u64,
     )
     .is_ok();
     #[cfg(feature = "all-core-timeout-test")]
     let group_preserved = startup(1, 1).is_some_and(|s| s.mailbox.state(1) == Ok(CpuState::Parked))
         && startup(3, 1).is_some_and(|s| s.mailbox.state(1) == Ok(CpuState::Prepared))
-        && super::RELEASED.load(Ordering::Acquire) == 6;
+        && super::RELEASE_ATTEMPTED.load(Ordering::Acquire) == 6;
     #[cfg(not(feature = "all-core-timeout-test"))]
     let group_preserved = true;
     println!(
         "Phase 11.5 timeout-test CPU{} group_preserved={}",
         TEST_CPU, group_preserved
     );
-    let guest_blocked = BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
+    let guest_blocked =
+        super::boot_status() == BootStatus::WaitFailed && super::ensure_guest_authorized().is_err();
     let passed = group_preserved
         && late_wait_succeeded
         && guest_blocked
@@ -130,7 +134,7 @@ pub(super) fn observe_terminal_failure() {
         && retained
         && cells_unchanged
         && record.failures.load(Ordering::Relaxed) == 0
-        && BOOT_ATTEMPT.status() == BootStatus::WaitFailed;
+        && super::boot_status() == BootStatus::WaitFailed;
     println!(
         "Phase 11.3 timeout-test retained slot={:#x} context={:#x} stack=[{:#x}, {:#x}) root={:#x}",
         record.slot_address(),
@@ -142,7 +146,7 @@ pub(super) fn observe_terminal_failure() {
     println!(
         "Phase 11.3 timeout-test {}: boot={:?} state={:?} late_wait_succeeded={} guest_blocked={} retry_rejected={} retained={} cells_unchanged={}",
         if passed { "PASS" } else { "FAIL" },
-        BOOT_ATTEMPT.status(),
+        super::boot_status(),
         record.mailbox.state(1),
         late_wait_succeeded,
         guest_blocked,

@@ -540,20 +540,24 @@ pub fn validate_device_identity(region: PhysRegion) -> Result<(), PrepareError> 
     Ok(())
 }
 
+/// Validate every required mapping and seal under one exclusive table lock.
 pub fn validate_and_freeze_startups(
-    resources: [Option<tvisor_util::startup_resources::StartupResources>;
-        tvisor_util::cpu_topology::MAX_CPUS],
-    stacks: &FixedList<tvisor_util::pcpu::StackLayout, { tvisor_util::cpu_topology::MAX_CPUS }>,
-) -> Result<
-    [Option<tvisor_util::startup_resources::FrozenStartup>; tvisor_util::cpu_topology::MAX_CPUS],
-    PrepareError,
-> {
-    let mut guard = TVISOR_TABLES.lock();
-    guard
+    validate: impl FnOnce(
+        &TableSet<'static, MAX_TABLE_PAGES>,
+    ) -> Result<(), tvisor_util::startup_resources::ResourceError>,
+) -> Result<(), PrepareError> {
+    TVISOR_TABLES
+        .lock()
         .as_mut()
         .ok_or(PrepareError::Validation)?
-        .freeze_startups(resources, stacks.into_iter().copied())
+        .validate_and_freeze(validate)
         .map_err(|_| PrepareError::Validation)
+}
+pub fn startup_tables_frozen() -> bool {
+    TVISOR_TABLES
+        .lock()
+        .as_ref()
+        .is_some_and(|tables| tables.is_frozen())
 }
 
 fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {

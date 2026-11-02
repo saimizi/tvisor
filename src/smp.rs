@@ -80,16 +80,10 @@ fn read_release_cell(address: PhysAddr) -> Result<u64, StartupContractError> {
     if par & 1 != 0 || par & PA_PAGE_MASK != address.value() & PA_PAGE_MASK {
         return Err(StartupContractError::ReleaseCellNotIdentityMapped);
     }
-    let value: u64;
-    // SAFETY: discovery validated the complete cell in reserved physical RAM;
-    // AT confirms an identity read mapping. The boot handoff check requires
-    // little-endian accesses. Assembly also handles a cell at physical zero
-    // without constructing/dereferencing a null Rust pointer.
-    unsafe {
-        asm!("ldr {value}, [{address}]", value = out(reg) value,
-             address = in(reg) address.value(), options(nostack, readonly, preserves_flags));
-    }
-    Ok(value)
+    // SAFETY: discovery validated owned aligned RAM and AT confirmed identity
+    // mapping. The assembly helper supports PA zero without a Rust reference.
+    unsafe { tvisor_util::secondary_hardware::read_release_cell(address.value()) }
+        .map_err(|_| StartupContractError::ReleaseCellNotIdentityMapped)
 }
 
 /// Read-only preflight; the irreversible helper rechecks immediately before store.
@@ -114,23 +108,20 @@ pub fn verify_release_set(released: u64, entry: u64) -> Result<(), &'static str>
     let topology = topology().ok_or("topology unavailable")?;
     for cell in contract.release_cells() {
         let value = read_release_cell(cell.start()).map_err(|_| "release-cell readback failed")?;
-        let expected = if topology.cpus().iter().any(|c| {
-            c.logical_id.is_some_and(|id| released & (1 << id) != 0)
-                && c.startup
-                    == tvisor_util::cpu_topology::StartupMethod::SpinTable {
-                        release_address: cell.start().value(),
-                    }
-        }) {
-            entry
-        } else {
-            0
-        };
         println!(
             "Phase 11.5 release readback cell={:#x} value={:#x}",
             cell.start().value(),
             value
         );
-        if value != expected {
+        if tvisor_util::startup_publication::verify_release_value(
+            topology.cpus(),
+            released,
+            cell.start().value(),
+            entry,
+            value,
+        )
+        .is_err()
+        {
             return Err("unexpected release-cell value");
         }
     }
@@ -145,72 +136,5 @@ impl core::fmt::Display for DiscoveryError {
             Self::Contract(error) => write!(f, "startup contract rejected: {error:?}"),
             error => write!(f, "{error:?}"),
         }
-    }
-}
-
-/// Hardware callbacks for the consuming, validated publication pipeline.
-/// Private construction keeps arbitrary unvalidated addresses out of this path.
-pub struct HardwarePublication {
-    release_start: Option<u64>,
-}
-impl HardwarePublication {
-    pub fn release_start(&self) -> Option<u64> {
-        self.release_start
-    }
-    /// # Safety
-    /// Only use with a frozen publication plan for the active identity-mapped
-    /// EL2 regime, retained resources, and reserved Normal writable release page.
-    pub unsafe fn new() -> Self {
-        Self {
-            release_start: None,
-        }
-    }
-}
-core::arch::global_asm!(include_str!("secondary_publication.S"));
-unsafe extern "C" {
-    fn __secondary_clean_line(address: u64);
-    fn __secondary_publication_barrier();
-    fn __secondary_read_cell(address: u64) -> u64;
-    fn __secondary_store_cell(address: u64, value: u64) -> u64;
-    fn __secondary_send_event();
-}
-impl tvisor_util::startup_publication::PublicationIo for HardwarePublication {
-    fn clean(
-        &mut self,
-        address: u64,
-    ) -> Result<(), tvisor_util::startup_publication::PublicationError> {
-        unsafe {
-            __secondary_clean_line(address);
-        }
-        Ok(())
-    }
-    fn complete(&mut self) -> Result<(), tvisor_util::startup_publication::PublicationError> {
-        unsafe {
-            __secondary_publication_barrier();
-        }
-        Ok(())
-    }
-    fn read_cell(
-        &mut self,
-        address: u64,
-    ) -> Result<u64, tvisor_util::startup_publication::PublicationError> {
-        Ok(u64::from_le(unsafe { __secondary_read_cell(address) }))
-    }
-    fn store_le64(
-        &mut self,
-        address: u64,
-        value: u64,
-    ) -> Result<(), tvisor_util::startup_publication::PublicationError> {
-        // Assembly supports PA zero without constructing a Rust reference.
-        unsafe {
-            self.release_start = Some(__secondary_store_cell(address, value.to_le()));
-        }
-        Ok(())
-    }
-    fn send_event(&mut self) -> Result<(), tvisor_util::startup_publication::PublicationError> {
-        unsafe {
-            __secondary_send_event();
-        }
-        Ok(())
     }
 }

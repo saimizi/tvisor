@@ -368,8 +368,8 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 boot GIC setup failed: {}", error);
             break 'wait;
         }
-        let permit = match crate::secondary::start_all(*fdt, policy) {
-            Ok(permit) => permit,
+        match crate::secondary::start_all(*fdt, policy) {
+            Ok(()) => (),
             Err(error) => {
                 println!(
                     "Phase 11.3 startup failed: {}; terminal={:?}; resources retained until reset",
@@ -388,7 +388,11 @@ extern "C" fn post_switch_page_tables(
         println!(
             "Phase 11.5 all required secondaries validated and Online; entering one-vCPU Linux guest"
         );
-        match permit.run(crate::guest::run_guest) {
+        if let Err(error) = crate::secondary::ensure_guest_authorized() {
+            println!("Secondary boot gate rejected guest: {}", error);
+            break 'wait;
+        }
+        match crate::guest::run_guest() {
             Ok(()) => println!("Linux guest exited cleanly; halting"),
             Err(error) => println!("Linux guest execution failed: {}", error),
         }

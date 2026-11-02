@@ -28,6 +28,9 @@ impl<T> BootTables<T> {
             frozen: false,
         }
     }
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
     pub fn view(&self) -> &T {
         &self.tables
     }
@@ -64,53 +67,6 @@ pub struct StartupResources {
     pub stack: StackLayout,
     pub entry: u64,
     pub root: u64,
-}
-/// Proof that this table set passed resource validation and was frozen.
-/// No public constructor, Clone, mutation or thaw operation.
-pub struct FrozenStartup {
-    resources: StartupResources,
-}
-impl FrozenStartup {
-    pub fn resources(&self) -> &StartupResources {
-        &self.resources
-    }
-}
-impl<const N: usize> BootTables<TableSet<'_, N>> {
-    /// Validate the complete release set before sealing once. No capability is
-    /// returned if any member fails; none can be added after the first release.
-    pub fn freeze_startups<const C: usize>(
-        &mut self,
-        resources: [Option<StartupResources>; C],
-        stacks: impl IntoIterator<Item = StackLayout>,
-    ) -> Result<[Option<FrozenStartup>; C], ResourceError> {
-        if resources.iter().all(Option::is_none) {
-            return Err(ResourceError::Layout);
-        }
-        self.validate_and_freeze(|tables| {
-            for r in resources.iter().flatten() {
-                validate_resources(tables, r)?;
-            }
-            for stack in stacks {
-                validate_stack(tables, stack).map_err(|_| ResourceError::Mapping)?;
-            }
-            Ok(())
-        })?;
-        Ok(resources.map(|r| r.map(|resources| FrozenStartup { resources })))
-    }
-    pub fn freeze_startup(
-        &mut self,
-        resources: StartupResources,
-        stacks: impl IntoIterator<Item = StackLayout>,
-    ) -> Result<FrozenStartup, ResourceError> {
-        self.validate_and_freeze(|tables| {
-            validate_resources(tables, &resources)?;
-            for stack in stacks {
-                validate_stack(tables, stack).map_err(|_| ResourceError::Mapping)?;
-            }
-            Ok(())
-        })?;
-        Ok(FrozenStartup { resources })
-    }
 }
 /// Reject partially reserved pages rather than give writable access to memory
 /// whose ownership is not established. PA zero is a valid firmware page.
@@ -150,6 +106,26 @@ pub fn validate_range<const N: usize>(
         {
             return Err(ResourceError::Mapping);
         }
+    }
+    Ok(())
+}
+/// Validate all private stacks, including disjoint guards, under the table lock.
+pub fn validate_stacks<const T: usize, const C: usize>(
+    tables: &TableSet<'_, T>,
+    stacks: &crate::system_info::FixedList<StackLayout, C>,
+) -> Result<(), ResourceError> {
+    for (i, stack) in stacks.iter().enumerate() {
+        if crate::pcpu::stack_layout(stack.guard_start).ok() != Some(*stack)
+            || stacks
+                .iter()
+                .take(i)
+                .any(|other| stack.guard_start < other.top && other.guard_start < stack.top)
+        {
+            return Err(ResourceError::Layout);
+        }
+    }
+    for stack in stacks {
+        validate_stack(tables, *stack).map_err(|_| ResourceError::Mapping)?;
     }
     Ok(())
 }
@@ -287,21 +263,27 @@ mod tests {
         t
     }
     #[test]
-    fn group_validation_is_atomic_and_seals_before_any_capability_escapes() {
+    fn failed_batch_validation_keeps_editing_open_then_freezes_once() {
         let r = resources();
         let mut bad = r;
         bad.entry = 0;
         let mut storage = TableStorage::<16>::zeroed();
         let mut boot = BootTables::new(tables(&mut storage, &r, None));
         assert!(
-            boot.freeze_startups([Some(r), Some(bad)], [r.stack])
-                .is_err()
+            boot.validate_and_freeze(|t| {
+                validate_resources(t, &r)?;
+                validate_resources(t, &bad)
+            })
+            .is_err()
         );
         assert!(boot.edit().is_ok());
-        let proofs = boot.freeze_startups([Some(r), None], [r.stack]).unwrap();
-        assert!(proofs[0].is_some() && proofs[1].is_none());
+        boot.validate_and_freeze(|t| validate_resources(t, &r))
+            .unwrap();
         assert!(boot.edit().is_err());
-        assert!(boot.freeze_startups([Some(r)], [r.stack]).is_err());
+        assert_eq!(
+            boot.validate_and_freeze(|_| Ok(())),
+            Err(ResourceError::Frozen)
+        );
     }
     #[test]
     fn validates_real_page_tables_and_freezes_all_mutation() {
@@ -437,5 +419,29 @@ mod tests {
         partial.insert_reserved(region(0xe0, 8)).unwrap();
         partial.finalize().unwrap();
         assert_eq!(release_page(&partial, 0xe0), Err(ResourceError::Ownership));
+    }
+}
+
+#[cfg(test)]
+mod stack_set_tests {
+    use super::*;
+    use crate::{el2_stage1_translation::TableStorage, system_info::FixedList};
+    #[test]
+    fn duplicate_and_partially_overlapping_stack_ownership_is_rejected_before_mapping_checks() {
+        let mut storage = TableStorage::<16>::zeroed();
+        let tables = TableSet::new(&mut storage, 0x800000, 44).unwrap();
+        for second in [0x900000, 0x901000] {
+            let mut stacks = FixedList::<StackLayout, 2>::new();
+            stacks
+                .push(crate::pcpu::stack_layout(0x900000).unwrap())
+                .unwrap();
+            stacks
+                .push(crate::pcpu::stack_layout(second).unwrap())
+                .unwrap();
+            assert_eq!(
+                validate_stacks(&tables, &stacks),
+                Err(ResourceError::Layout)
+            );
+        }
     }
 }

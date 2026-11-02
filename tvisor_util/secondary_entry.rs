@@ -1,4 +1,4 @@
-//! Preflight validation for the first one-CPU spin-table startup attempt.
+//! Preflight validation for enabled secondary spin-table startup targets.
 //! Validation describes prerequisites; it does not itself release a CPU.
 use crate::cpu_topology::{CpuDescriptor, StartupMethod};
 
@@ -28,6 +28,14 @@ pub fn secondary_mask(cpus: &[CpuDescriptor]) -> Result<u64, EntryError> {
         if id >= crate::cpu_topology::MAX_CPUS || seen & (1 << id) != 0 {
             return Err(EntryError::InvalidTarget);
         }
+        if cpu.affinity & !crate::cpu_topology::MPIDR_AFFINITY_MASK != 0
+            || cpus
+                .iter()
+                .filter(|other| other.enabled && !core::ptr::eq(*other, cpu))
+                .any(|other| other.affinity == cpu.affinity)
+        {
+            return Err(EntryError::InvalidTarget);
+        }
         seen |= 1 << id;
     }
     if seen & 1 == 0 {
@@ -52,7 +60,7 @@ pub fn select_secondary(cpus: &[CpuDescriptor]) -> Result<usize, EntryError> {
 }
 
 /// Validate the backend/target portion of release preflight. Resource readiness
-/// is enforced separately by the consuming FrozenStartup/PublishedStartup path;
+/// is enforced separately by boot-locked resource validation and table freeze;
 /// this helper alone never authorizes a firmware write.
 pub fn validate_spin_table_release(
     cpus: &[CpuDescriptor],
@@ -78,7 +86,16 @@ pub fn validate_spin_table_target(
         .iter()
         .find(|cpu| cpu.logical_id == Some(target))
         .ok_or(EntryError::MissingTarget)?;
-    if target == 0 || !cpu.enabled {
+    if target == 0
+        || target >= crate::cpu_topology::MAX_CPUS
+        || !cpu.enabled
+        || cpu.affinity & !crate::cpu_topology::MPIDR_AFFINITY_MASK != 0
+        || cpus.iter().any(|other| {
+            !core::ptr::eq(other, cpu)
+                && other.enabled
+                && (other.logical_id == Some(target) || other.affinity == cpu.affinity)
+        })
+    {
         return Err(EntryError::InvalidTarget);
     }
     let StartupMethod::SpinTable { release_address } = cpu.startup else {
