@@ -368,6 +368,7 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 boot GIC setup failed: {}", error);
             break 'wait;
         }
+        crate::tlb::prepare().expect("scratch mapping preparation failed");
         match crate::secondary::start_all(*fdt, policy) {
             Ok(()) => (),
             Err(error) => {
@@ -383,10 +384,23 @@ extern "C" fn post_switch_page_tables(
             println!("Phase 11.4 management activation failed: {}", error);
             break 'wait;
         }
+        #[cfg(feature = "tlb-update-timeout-test")]
+        if let Err(error) = crate::tlb::timeout_acceptance() {
+            println!("Phase 11.6 fault image: {}", error);
+            break 'wait;
+        }
+        #[cfg(feature = "tlb-update-test")]
+        crate::tlb::before_guest().expect("EL2 mapping acceptance failed");
+        #[cfg(not(feature = "tlb-update-test"))]
+        {
+            crate::tlb::remap().expect("Online mapping update failed");
+            crate::tlb::park_workers().expect("worker parking failed");
+            crate::tlb::remap().expect("Parked mapping update failed");
+        }
         #[cfg(feature = "all-core-stress-test")]
         crate::all_core_test::before_guest().expect("all-core boot stress failed");
         println!(
-            "Phase 11.5 all required secondaries validated and Online; entering one-vCPU Linux guest"
+            "Phase 11.6 all required secondaries validated and Parked; entering one-vCPU Linux guest"
         );
         if let Err(error) = crate::secondary::ensure_guest_authorized() {
             println!("Secondary boot gate rejected guest: {}", error);

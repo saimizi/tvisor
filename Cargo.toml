@@ -17,6 +17,11 @@ all-core-timeout-test = ["baremetal"]
 # Hardware acceptance: concurrent EL2 allocations, logging and management traffic.
 all-core-stress-test = ["baremetal"]
 
+# Hardware acceptance: reserved EL2 scratch remaps on Online and Parked CPUs.
+tlb-update-test = ["baremetal"]
+# Hardware acceptance: CPU2 delays its software quiescence; deliberately no guest.
+tlb-update-timeout-test = ["baremetal"]
+
 [lib]
 name = "tvisor_util"
 crate-type = ["rlib"]

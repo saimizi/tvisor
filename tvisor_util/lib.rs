@@ -59,3 +59,5 @@ pub fn halt() -> ! {
 pub mod allocation_check;
 
 pub mod secondary_hardware;
+
+pub mod tlb_update;

@@ -45,6 +45,7 @@ class Run:
         self.pass_count = 0
         self.fault = None
         self.current_log = None
+        self.ram_boot_attempted = False
         self.events = open(self.directory / 'events.jsonl', 'a', buffering=1)
         self.started = utc()
         self.phase = "baseline-boots"
@@ -138,23 +139,38 @@ class Run:
     def off(self):
         state = self.rpc('get_power_state')
         if state['state'] != 'off':
-            self.rpc('power_off', mode='force', confirmation=True,
-                     reason='Authorized tvisor regression test: RAM-only guest, power-cycle/cleanup')
+            mode = 'force'
+            if not self.ram_boot_attempted:
+                observed = self.rpc('get_board_state', active_probe=False, observe_duration_ms=500)['state']
+                if observed == 'linux_login':
+                    result = self.rpc('linux_login', timeout_ms=15000)
+                    if not result['success']:
+                        raise RuntimeError('Cannot safely log in for SD-OS cleanup')
+                    mode = 'graceful'
+                elif observed == 'linux_shell':
+                    mode = 'graceful'
+                elif observed not in ('uboot_prompt', 'uboot_countdown'):
+                    raise RuntimeError('Unknown powered-on workload; refusing forced cleanup')
+            self.rpc('power_off', mode=mode, confirmation=True,
+                     reason='Authorized tvisor regression cleanup; graceful shutdown unless known RAM-only/U-Boot')
         if self.rpc('get_power_state')['state'] != 'off':
             raise RuntimeError('Relay did not verify off')
+        self.ram_boot_attempted = False
 
     def boot(self, name, image, diagnostic):
         self.verify_artifacts()
         self.event('boot_start', name=name, image=image)
         self.off()
-        result = self.rpc('power_on_uboot', timeout_ms=45000)
-        if not result['success']:
-            raise RuntimeError('Failed to enter U-Boot')
         if self.current_log:
             self.current_log.close()
         self.current_log = open(self.directory / (name + '.uart.log'), 'w', buffering=1)
         self.cursor = None
         self.generation = None
+        # Keep UART evidence even if the controller fails before reaching the
+        # prompt. Final cleanup captures the buffer into this boot's own log.
+        result = self.rpc('power_on_uboot', timeout_ms=45000)
+        if not result['success']:
+            raise RuntimeError('Failed to enter U-Boot')
         self.capture(check=False)
         board = self.rpc('run_uboot_command', command='bdinfo; printenv fdt_addr',
                          timeout_ms=5000, expected_patterns=None, allow_reboot=False)['output']
@@ -170,6 +186,7 @@ class Run:
         self.rpc('run_uboot_command', command='setenv guest_size ${filesize}',
                  timeout_ms=3000, expected_patterns=None, allow_reboot=False)
         self.capture(check=False)
+        self.ram_boot_attempted = True
         self.rpc('run_uboot_command', optional=True,
                  command='setenv autostart yes; bootelf 0x04000000 fdt=${fdt_addr} image=0x30100000,${guest_size}',
                  timeout_ms=1000, expected_patterns=None, allow_reboot=False)

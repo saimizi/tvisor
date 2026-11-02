@@ -11,6 +11,7 @@ pub enum Operation {
     Park = 3,
     FatalStop = 4,
     RunTest = 5,
+    TlbQuiesce = 6,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -96,6 +97,7 @@ impl Channel {
             3 => Operation::Park,
             4 => Operation::FatalStop,
             5 => Operation::RunTest,
+            6 => Operation::TlbQuiesce,
             _ => unreachable!(),
         };
         Some(Request {

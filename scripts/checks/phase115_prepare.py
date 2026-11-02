@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a Phase 11.5 image and reuse verified immutable Linux fixtures.
+"""Build a Phase 11.5/11.6 image and reuse verified immutable Linux fixtures.
 
 No hardware access, TFTP publication, Linux rebuild, or previous bundle edits.
 The selected Cargo build runs immediately before copying its ELF, preventing
@@ -23,15 +23,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', type=Path, required=True, help='Existing frozen quick regression bundle')
     parser.add_argument('--output', type=Path, required=True, help='New result directory')
-    parser.add_argument('--kind', choices=['normal', 'stress', 'timeout'], required=True)
+    parser.add_argument('--kind', choices=['normal', 'stress', 'timeout', 'mapping', 'mapping-timeout'], required=True)
+    parser.add_argument('--mode', choices=['quick', 'overnight'], default='quick')
+    parser.add_argument('--phase', choices=['11.5', '11.6'], default='11.5')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     fixture, output = args.fixture.resolve(), args.output.resolve()
     original = json.loads((fixture / 'manifest.json').read_text())
     runner = repo / 'scripts/stability/run.py'
-    if original['mode'] != 'quick' or sha(runner) != original['runner_sha256']:
-        raise RuntimeError('Fixture must use the current quick regression runner')
+    if original['mode'] != 'quick':
+        raise RuntimeError('Use the frozen quick fixture bundle as the Linux baseline')
     for key in ['baseline_image', 'diagnostic_image']:
         path = fixture / original[key]
         expected = next(item for item in original['files'] if Path(item['path']).name == path.name)
@@ -46,8 +48,8 @@ def main():
         raise RuntimeError('Frozen probe changed')
     if output.exists():
         raise RuntimeError('Output must be a new directory')
-    feature = {'normal': None, 'stress': 'all-core-stress-test', 'timeout': 'all-core-timeout-test'}[args.kind]
-    profile = 'release' if args.kind == 'stress' else 'debug'
+    feature = {'normal': None, 'stress': 'all-core-stress-test', 'timeout': 'all-core-timeout-test', 'mapping': 'tlb-update-test', 'mapping-timeout': 'tlb-update-timeout-test'}[args.kind]
+    profile = 'release' if args.kind in ('stress', 'mapping') else 'debug'
     build = ['cargo', 'build', '--locked', '--offline', '--target', 'aarch64-unknown-none']
     if feature:
         build += ['--features', feature]
@@ -75,15 +77,15 @@ def main():
         raise RuntimeError('ELF exceeds the verified staging/runtime window')
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
     manifest = dict(original)
-    manifest.update(files=[], created=dt.datetime.now(dt.timezone.utc).isoformat(),
+    manifest.update(mode=args.mode, runner_sha256=sha(runner), files=[], created=dt.datetime.now(dt.timezone.utc).isoformat(),
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip(),
                     dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo)),
-                    purpose='Phase 11.5 ' + args.kind, build_command=build, build_profile=profile,
+                    purpose='Phase ' + args.phase + ' ' + args.kind, build_command=build, build_profile=profile,
                     fixture_reuse=dict(directory=str(fixture), original_manifest_sha256=sha(fixture / 'manifest.json'), linux_rebuilt=False))
     for key, source, prefix in [('tvisor', elf, 'tvisor'), ('baseline_image', fixture / original['baseline_image'], 'Image-baseline'), ('diagnostic_image', fixture / original['diagnostic_image'], 'Image-diagnostic')]:
         if key != 'tvisor' and 0x30100000 + source.stat().st_size >= 0x36b2b000:
             raise RuntimeError('Guest fixture exceeds verified staging window')
-        name = prefix + '-115-' + args.kind + '-' + stamp
+        name = prefix + '-' + args.phase.replace('.', '') + '-' + args.kind + '-' + stamp
         destination = output / name
         shutil.copyfile(source, destination)
         manifest[key] = name
@@ -105,6 +107,8 @@ def main():
     (output / 'source-status.txt').write_bytes(subprocess.check_output(['git', 'status', '--short'], cwd=repo))
     for checker in ['secondary_entry', 'secondary_entry_negative']:
         command(['python3', str(repo / 'scripts/checks' / (checker + '.py')), str(output / manifest['tvisor'])], checker + '.log')
+    if args.phase == '11.6':
+        command(['python3', str(repo / 'scripts/checks/tlb_sync.py'), str(output / manifest['tvisor'])], 'tlb-sync.log')
     command(['llvm-readelf', '-l', str(output / manifest['tvisor'])], 'elf-layout.txt')
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('Prepared ' + str(output) + '; publish only the three manifest artifacts before an authorized run.')

@@ -560,6 +560,76 @@ pub fn startup_tables_frozen() -> bool {
         .is_some_and(|tables| tables.is_frozen())
 }
 
+/// Boot-only: reserve both backing pages and the complete scratch table path.
+/// Failure retains allocations; no runtime table-page allocation is permitted.
+pub fn prepare_tlb_scratch(value: u64) -> Result<[u64; 2], &'static str> {
+    let a = allocate_page().map_err(|_| "scratch page allocation")?;
+    let b = allocate_page().map_err(|_| "scratch page allocation")?;
+    unsafe {
+        core::ptr::write_bytes(a.value() as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(b.value() as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_volatile(a.value() as *mut u64, value);
+    }
+    with_tables(|tables| {
+        if tables.walk(tvisor_util::tlb_update::SCRATCH_VA)?.is_some() {
+            return Err(PrepareError::Validation);
+        }
+        tables.map(Mapping {
+            va: tvisor_util::tlb_update::SCRATCH_VA,
+            pa: a.value(),
+            size: PAGE_SIZE as u64,
+            memory_type: MemoryType::Normal,
+            writable: true,
+            executable: false,
+        })?;
+        Ok(())
+    })
+    .map_err(|_| "scratch mapping preparation")?;
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi alle2",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+    Ok([a.value(), b.value()])
+}
+core::arch::global_asm!(include_str!("tlb_sync.S"));
+unsafe extern "C" {
+    fn __el2_scratch_sync(entry: *mut u64);
+}
+pub fn replace_tlb_scratch(epoch: u64, old: u64, new: u64) -> Result<(), &'static str> {
+    if !crate::tlb::ready_to_write(epoch) || !crate::tlb::owns(old) || !crate::tlb::owns(new) {
+        return Err("invalid scratch update authority");
+    }
+    let mut guard = TVISOR_TABLES.lock();
+    let tables = guard.as_mut().ok_or("host tables unavailable")?;
+    // SAFETY: the serialized epoch has quiesced all retaining CPUs. Only the
+    // reserved L3 scratch leaf changes; no mutable table handle escapes.
+    unsafe {
+        tables.replace_scratch_page(old, new, |entry| {
+            __el2_scratch_sync(entry);
+            Ok(())
+        })
+    }
+    .map_err(|_| "scratch descriptor replacement failed")
+}
+
+#[cfg(feature = "tlb-update-timeout-test")]
+pub fn tlb_scratch_pa() -> Option<u64> {
+    Some(
+        TVISOR_TABLES
+            .lock()
+            .as_ref()?
+            .view()
+            .walk(tvisor_util::tlb_update::SCRATCH_VA)
+            .ok()??
+            .pa,
+    )
+}
+
 fn validate_live_dtb(region: PhysRegion) -> Result<(), AllocatorInitError> {
     if region.size() < 8 {
         return Err(AllocatorInitError::InvalidDtb);

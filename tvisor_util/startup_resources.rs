@@ -68,6 +68,27 @@ pub struct StartupResources {
     pub entry: u64,
     pub root: u64,
 }
+impl<const N: usize> BootTables<TableSet<'_, N>> {
+    /// Narrow runtime exception to the boot freeze: only the reserved scratch
+    /// leaf may change. This never exposes an editable table or thaws the gate.
+    /// # Safety
+    /// Caller owns the all-member update protocol and its architectural sync.
+    pub unsafe fn replace_scratch_page(
+        &mut self,
+        old: u64,
+        new: u64,
+        sync: impl FnMut(*mut u64) -> Result<(), crate::el2_stage1_translation::TranslationError>,
+    ) -> Result<(), ResourceError> {
+        if !self.frozen {
+            return Err(ResourceError::Frozen);
+        }
+        unsafe {
+            self.tables
+                .replace_data_page(crate::tlb_update::SCRATCH_VA, old, new, sync)
+        }
+        .map_err(|_| ResourceError::Mapping)
+    }
+}
 /// Reject partially reserved pages rather than give writable access to memory
 /// whose ownership is not established. PA zero is a valid firmware page.
 pub fn release_page(map: &MemoryMap, cell: u64) -> Result<PhysRegion, ResourceError> {

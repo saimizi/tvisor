@@ -28,6 +28,7 @@ mod mm;
 mod pcpu;
 mod secondary;
 mod smp;
+mod tlb;
 mod vcpu;
 mod vmctl;
 
@@ -253,3 +254,6 @@ pub fn panic(info: &core::panic::PanicInfo) -> ! {
     feature = "secondary-startup-timeout-test"
 ))]
 compile_error!("timeout acceptance features must be run separately");
+
+#[cfg(all(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
+compile_error!("mapping acceptance features must run separately");

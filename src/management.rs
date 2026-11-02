@@ -369,7 +369,11 @@ pub fn dispatch(gic: &GicV2, ack: InterruptAck, guest: bool, guest_masked: bool)
             value: request.argument,
             failed: !crate::all_core_test::submit(id, request.argument),
         },
-        Operation::Park if id != 0 => {
+        Operation::TlbQuiesce if id != 0 => Reply {
+            value: request.argument,
+            failed: crate::tlb::UPDATES.admit(id, request.argument).is_err(),
+        },
+        Operation::Park if id != 0 && crate::tlb::UPDATES.try_membership_change() => {
             let mailbox = &crate::pcpu::PCPU_SLOTS[id].startup.mailbox;
             let result = if mailbox.lifecycle() == tvisor_util::secondary_mailbox::CpuState::Parked
             {
@@ -377,13 +381,15 @@ pub fn dispatch(gic: &GicV2, ack: InterruptAck, guest: bool, guest_masked: bool)
             } else {
                 unsafe { mailbox.management_park(cpu.generation.load(Ordering::Relaxed)) }
             };
+            crate::tlb::UPDATES.finish_membership_change();
             Reply {
                 value: 0,
                 failed: result.is_err(),
             }
         }
-        Operation::FatalStop => {
+        Operation::FatalStop if crate::tlb::UPDATES.try_membership_change() => {
             cpu.stopped.store(true, Ordering::Release);
+            crate::tlb::UPDATES.finish_membership_change();
             Reply {
                 value: 0,
                 failed: false,
@@ -507,6 +513,11 @@ pub fn worker(id: usize, generation: u64) -> ! {
     loop {
         unsafe { asm!("msr daifset, #2", options(nostack, preserves_flags)) };
         stop_if_requested();
+        if crate::tlb::UPDATES.pending(id) {
+            unsafe { asm!("msr daifclr, #2", options(nostack, preserves_flags)) };
+            crate::tlb::worker(id);
+            continue;
+        }
         #[cfg(feature = "all-core-stress-test")]
         if crate::all_core_test::pending(id) {
             unsafe { asm!("msr daifclr, #2", options(nostack, preserves_flags)) };
@@ -572,4 +583,37 @@ pub fn verify_stage2_profiles(
     regs: &tvisor_util::guest_stage2_translation::GuestStage2RegisterValues,
 ) {
     acceptance::stage2_profiles(regs).expect("HCR transition acceptance failed");
+}
+
+/// Caller holds the mapping-update gate, so Park/FatalStop cannot race this
+/// snapshot. Parked CPUs remain members because they retain EL2 translations.
+pub fn validate_mapping_members(members: u64) -> Result<(), &'static str> {
+    if members != crate::secondary::required_mask() | 1 {
+        return Err("mapping membership changed");
+    }
+    if physical_smp_masks().0 != members {
+        return Err("mapping member unavailable");
+    }
+    Ok(())
+}
+
+/// Observed initialized/retaining CPUs and their Parked subset, rather than
+/// topology-derived expectations. Caller serializes lifecycle changes.
+pub fn physical_smp_masks() -> (u64, u64) {
+    use tvisor_util::secondary_mailbox::CpuState;
+    let mut online = 0;
+    let mut parked = 0;
+    for (id, cpu) in CPUS.iter().enumerate() {
+        if target(id).is_none() || cpu.stopped.load(Ordering::Acquire) {
+            continue;
+        }
+        let state = crate::pcpu::PCPU_SLOTS[id].startup.mailbox.lifecycle();
+        if id == 0 || matches!(state, CpuState::Online | CpuState::Parked) {
+            online |= 1 << id;
+            if id != 0 && state == CpuState::Parked {
+                parked |= 1 << id;
+            }
+        }
+    }
+    (online, parked)
 }
