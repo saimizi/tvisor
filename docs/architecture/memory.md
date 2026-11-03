@@ -46,9 +46,15 @@ reserved RAM, MMIO and holes; they cannot be allocated or freed. Managed pages
 are InUse or Unused. Bitmap set counts provide consistent allocator statistics.
 RAM above the aperture is not supported by this allocator.
 
-[mm.rs](../../src/mm.rs) serializes initialization, bitmap views, allocation,
-freeing and statistics through one IRQ-save lock. Returned pages have exclusive
-ownership; freeing validates alignment, ownership and double-free conditions.
+The allocator owns both bitmaps and its initialization state. The global
+instance is constructed at compile time; runtime initialization fills its
+storage in place. Operations reject use before a
+successful initialization, and repeated initialization cannot reset live pages.
+[mm.rs](../../src/mm.rs) owns the global allocator inside one IRQ-save lock,
+which serializes initialization, allocation, freeing and statistics. The boot
+path validates the live DTB exclusion before initializing the allocator.
+Returned pages have exclusive ownership; freeing validates alignment, ownership
+and double-free conditions.
 Initial secondary stack allocation rolls back only before mapping/publication.
 
 The [Rust heap](../../tvisor_util/heap_allocator.rs) wraps `linked_list_allocator`

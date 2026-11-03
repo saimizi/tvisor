@@ -314,7 +314,7 @@ mod tests {
     }
     #[test]
     fn allocator_cannot_allocate_or_release_reserved_startup_memory() {
-        use crate::page_allocator::{AllocatorError, PageAllocator, PageBitmap, PageState};
+        use crate::page_allocator::{AllocatorError, PageAllocator, PageState};
         let bytes = tree(&[(0, 0xd8)], &[(0, 0x1000), (0x8000, 0x1000)]).to_dtb();
         let fdt = Fdt::new(&bytes).unwrap();
         let contract = discover(&bytes, 0).unwrap();
@@ -327,15 +327,10 @@ mod tests {
         }
         map.finalize().unwrap();
         contract.verify_memory_map(fdt, &map).unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<2>::zeroed(), PageBitmap::<2>::zeroed());
-        let mut allocator = PageAllocator::new(
-            map.ram(),
-            map.usable_ram(),
-            map.usable_ram(),
-            &mut managed,
-            &mut in_use,
-        )
-        .unwrap();
+        let mut allocator = PageAllocator::<2>::uninitialized();
+        allocator
+            .initialize(map.ram(), map.usable_ram(), map.usable_ram())
+            .unwrap();
         for _ in 0..14 {
             let page = allocator.allocate().unwrap().value();
             assert_ne!(page, 0);

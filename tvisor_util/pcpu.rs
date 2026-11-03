@@ -247,8 +247,11 @@ pub struct SecondaryStack {
 /// a partial allocation failure before any guard is excluded or CPU published.
 pub fn allocate_secondary_stacks<const B: usize>(
     topology: &CpuTopology,
-    allocator: &mut PageAllocator<'_, B>,
+    allocator: &mut PageAllocator<B>,
 ) -> Result<FixedList<SecondaryStack, MAX_CPUS>, AllocatorError> {
+    if !allocator.is_initialized() {
+        return Err(AllocatorError::NotInitialized);
+    }
     let mut stacks = FixedList::new();
     let result = (|| {
         for cpu in topology
@@ -448,10 +451,7 @@ mod tests {
     }
     #[test]
     fn allocates_only_enabled_secondaries_and_retains_every_guard_page() {
-        use crate::{
-            page_allocator::{PageBitmap, PageState},
-            system_info::PhysRegion,
-        };
+        use crate::{page_allocator::PageState, system_info::PhysRegion};
         let mut ram = FixedList::<_, 1>::new();
         ram.push(PhysRegion::new(PhysAddr::new(0), 64 * 4096).unwrap())
             .unwrap();
@@ -459,14 +459,16 @@ mod tests {
         usable
             .push(PhysRegion::new(PhysAddr::new(4096), 63 * 4096).unwrap())
             .unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<8>::zeroed(), PageBitmap::<8>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &usable, &usable, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<8>::uninitialized();
+        allocator.initialize(&ram, &usable, &usable).unwrap();
         let stacks =
             allocate_secondary_stacks(&topology(&[true, false, true, true]), &mut allocator)
                 .unwrap();
         assert_eq!(stacks.len(), 2);
-        assert_eq!(allocator.stats().in_use_pages, 2 * STACK_ALLOCATION_PAGES);
+        assert_eq!(
+            allocator.stats().unwrap().in_use_pages,
+            2 * STACK_ALLOCATION_PAGES
+        );
         assert_eq!(stacks.get(0).unwrap().affinity, 2);
         assert_eq!(stacks.get(0).unwrap().logical_id, 1);
         assert_eq!(stacks.get(1).unwrap().affinity, 3);
@@ -482,36 +484,38 @@ mod tests {
     }
     #[test]
     fn boot_only_topology_does_not_allocate_any_secondary_stack() {
-        use crate::{page_allocator::PageBitmap, system_info::PhysRegion};
+        use crate::system_info::PhysRegion;
         let mut ram = FixedList::<_, 1>::new();
         ram.push(PhysRegion::new(PhysAddr::new(0), 4096).unwrap())
             .unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &ram, &ram, &mut managed, &mut in_use).unwrap();
-        let before = allocator.stats();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        assert_eq!(
+            allocate_secondary_stacks(&topology(&[true, false, false, false]), &mut allocator),
+            Err(AllocatorError::NotInitialized)
+        );
+        allocator.initialize(&ram, &ram, &ram).unwrap();
+        let before = allocator.stats().unwrap();
         assert!(
             allocate_secondary_stacks(&topology(&[true, false, false, false]), &mut allocator)
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(allocator.stats(), before);
+        assert_eq!(allocator.stats().unwrap(), before);
     }
     #[test]
     fn partial_allocation_failure_rolls_back_before_mapping_or_publication() {
-        use crate::{page_allocator::PageBitmap, system_info::PhysRegion};
+        use crate::system_info::PhysRegion;
         let mut ram = FixedList::<_, 1>::new();
         ram.push(PhysRegion::new(PhysAddr::new(0), 20 * 4096).unwrap())
             .unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<4>::zeroed(), PageBitmap::<4>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &ram, &ram, &mut managed, &mut in_use).unwrap();
-        let before = allocator.stats();
+        let mut allocator = PageAllocator::<4>::uninitialized();
+        allocator.initialize(&ram, &ram, &ram).unwrap();
+        let before = allocator.stats().unwrap();
         assert_eq!(
             allocate_secondary_stacks(&topology(&[true, true, true]), &mut allocator),
             Err(AllocatorError::Exhausted)
         );
-        assert_eq!(allocator.stats(), before);
+        assert_eq!(allocator.stats().unwrap(), before);
         assert!(allocator.allocate_contiguous(20).is_ok());
     }
 }

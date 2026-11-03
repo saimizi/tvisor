@@ -261,19 +261,19 @@ mod tests {
     fn physical_pages_have_unique_live_owners_under_contention() {
         use crate::{
             PAGE_SIZE,
-            page_allocator::{PageAllocator, PageBitmap},
+            page_allocator::PageAllocator,
             system_info::{FixedList, PhysAddr, PhysRegion},
         };
         use core::sync::atomic::{AtomicBool, Ordering};
-        let mut managed = PageBitmap::<16>::zeroed();
-        let mut used = PageBitmap::<16>::zeroed();
         let mut regions = FixedList::<_, 1>::new();
         regions
             .push(PhysRegion::new(PhysAddr::new(0), (128 * PAGE_SIZE) as u64).unwrap())
             .unwrap();
-        let allocator = IrqSpinLock::<_, MockIrq>::new(
-            PageAllocator::new(&regions, &regions, &regions, &mut managed, &mut used).unwrap(),
-        );
+        let allocator = IrqSpinLock::<_, MockIrq>::new(PageAllocator::<16>::uninitialized());
+        allocator
+            .lock()
+            .initialize(&regions, &regions, &regions)
+            .unwrap();
         let owners: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -295,13 +295,13 @@ mod tests {
                         guard
                             .free(page.checked_add(PAGE_SIZE as u64).unwrap())
                             .unwrap();
-                        let stats = guard.stats();
+                        let stats = guard.stats().unwrap();
                         assert_eq!(stats.in_use_pages + stats.unused_pages, 128);
                     }
                 });
             }
         });
-        let stats = allocator.lock().stats();
+        let stats = allocator.lock().stats().unwrap();
         assert_eq!(stats.in_use_pages, 0);
         assert_eq!(stats.unused_pages, 128);
     }
