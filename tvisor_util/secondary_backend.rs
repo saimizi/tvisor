@@ -68,7 +68,7 @@ impl Bcm2711SpinTableBackend {
         }
         Ok(Self { _private: () })
     }
-    /// Justified by phase11_3_backend_contract.md for this selected trust profile,
+    /// Justified by docs/architecture/platform.md for this selected trust profile,
     /// not a measurement of another CPU's live state or firmware authentication.
     pub fn contract(&self) -> EntryContract {
         EntryContract {
