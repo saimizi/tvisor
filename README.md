@@ -1,222 +1,67 @@
 # tvisor
 
-Tvisor is an experimental, educational AArch64 hypervisor for the Raspberry
-Pi 4. It is written in Rust as a `no_std` bare-metal program and is currently
-launched from U-Boot at EL2.
+Tvisor is an experimental, educational AArch64 hypervisor written in Rust for
+the Raspberry Pi 4 Model B. U-Boot launches it at EL2; tvisor takes ownership
+of the machine and runs a single-vCPU Linux guest with 512 MiB of RAM on CPU0.
+All four physical CPUs enter tvisor-owned EL2 contexts. Secondary CPUs provide
+host management services and remain responsive while parked.
 
-The project is building the execution environment needed to take control from
-U-Boot and eventually run guest virtual machines. The current implementation:
+The implementation includes Device Tree discovery, guarded per-CPU stacks,
+shared physical and heap allocation, management SGIs, guest stage-2 translation,
+a virtual PL011 console, GICv2 timer delivery, and synchronized EL2 scratch-page
+updates in acceptance builds. Ordinary images keep EL2 mappings frozen and do
+not run scratch-remapping workloads.
 
-- validates the architectural state inherited from U-Boot;
-- discovers the Raspberry Pi platform from the working Device Tree Blob
-  (DTB);
-- initializes the DTB-selected mini UART for diagnostics;
-- records RAM, firmware reservations, MMIO windows, CPUs, and console data;
-- derives permanent reservations and post-takeover usable RAM before heap
-  initialization;
-- installs a private stack, exception vectors, and linker-owned EL2 stage-1
-  page tables;
-- initializes a global physical-page allocator to reclaim eligible U-Boot RAM
-  after takeover;
-- initializes a wrapped, fixed-size Rust heap after takeover; and
-- runs a controlled single-vCPU EL1 payload under stage-2 translation.
+## Build and run
 
-After validating the handoff, tvisor takes ownership of EL2 and does not
-return to U-Boot. Booting a full guest operating system remains future work.
-
-## Requirements
-
-The host development machine needs:
-
-- Rust with the `aarch64-unknown-none` target;
-- an AArch64-capable `nm` implementation;
-- a TFTP server reachable by the Raspberry Pi; and
-- a serial connection to the Raspberry Pi 4 U-Boot console.
-
-Install the Rust target with:
+Install Rust with the bare-metal target, then build from the repository root:
 
 ```sh
 rustup target add aarch64-unknown-none
+cargo build --locked
 ```
 
-The Raspberry Pi must boot through a U-Boot configuration that enters tvisor
-at EL2 and provides a working DTB through the `fdt_addr` environment variable.
-
-## Secondary firmware handoff
-
-The supported Raspberry Pi 4 Model B spin-table backend requires the following entry contract
-between firmware and tvisor's `__secondary_entry`:
-
-| Property | Required state at entry |
-|---|---|
-| Exception level | AArch64 EL2 |
-| MMU | Disabled (`SCTLR_EL2.M = 0`) |
-| Data cache | Disabled (`SCTLR_EL2.C = 0`) |
-| Data endianness | Little-endian (`SCTLR_EL2.EE = 0`) |
-| CPU coherency | Established according to the supported platform/firmware contract |
-| Entry address | Physical address published in the DT-described spin-table release cell |
-
-The trampoline checks EL2 and the MMU/data-cache/endianness bits before reading
-the startup record or installing a stack. Unsupported state enters a holding
-loop. It also identifies Cortex-A72 before checking `CPUECTLR_EL1.SMPEN`.
-Coherency is a platform precondition: SMPEN is a defensive maintenance check,
-not proof of coherency, and the trampoline does not establish coherency itself.
-The boot CPU validates and publishes the physical entry and startup resources
-before releasing the secondary. The trampoline finds the matching per-CPU slot
-by full affinity and loads stack bounds from `PcpuContext`; synchronization and
-diagnostics live in that slot, with EL2 configuration shared separately. See the
-[per-slot startup design](docs/phase11_3_slot_refactor.md).
-CPU lifecycle and optional readiness waits are separate: a timeout does not
-change the CPU state. Phase 11.3 still treats a failed startup wait as a terminal
-guest-boot policy decision; see the [lifecycle design](docs/phase11_3_lifecycle_refactor.md).
-Phase 11.4 adds per-CPU GIC setup and host management SGIs after that checkpoint,
-allowing CPU1 to handle requests while CPU0 runs Linux. See the
-[implementation and validation status](docs/phase11_4_status.md).
-
-Disabled data cache alone does not prove a clean cache history. Firmware must
-also ensure safe instruction fetch and no conflicting dirty cache state; the
-trampoline does not require the instruction cache to be disabled. See the
-[backend contract](docs/phase11_3_backend_contract.md) and
-[entry review](docs/phase11_3_entry_review.md) for these obligations.
-
-## Build and host tests
-
-Ordinary debug and release builds keep startup diagnostics quiet. Initialization
-and validation failures, warnings and panic reports remain enabled.
-
-| Build | Startup detail | Scratch remapping tests |
-|---|---|---|
-| `cargo build` / `cargo build --release` | Concise guest-entry message | None; no scratch pages reserved |
-| `cargo build --features diagnostics` | CPU, memory, register and management checkpoints | None |
-| `cargo build --release --features tlb-update-test` | Detailed acceptance records | 32 Online and 16 Parked remaps |
-| `cargo build --features tlb-update-timeout-test` | Detailed failure-test records | Delayed CPU2 acknowledgement; guest deliberately blocked |
-
-All hardware acceptance features enable `diagnostics` automatically. Selecting
-`--release` alone does not enable diagnostics or acceptance workloads. Host unit
-tests use `#[cfg(test)]` and are excluded from ordinary images.
-
-Run the host unit tests:
+The ELF is `target/aarch64-unknown-none/debug/tvisor`. Run native library tests
+using the installed compiler's host target:
 
 ```sh
-cargo test-host
+host_target=$(rustc -vV | sed -n 's/^host: //p')
+cargo test --locked --lib --target "$host_target"
 ```
 
-Build the debug ELF for the bare-metal AArch64 target:
-
-```sh
-cargo build --target aarch64-unknown-none
-```
-
-The resulting ELF is:
-
-```text
-target/aarch64-unknown-none/debug/tvisor
-```
-
-The linker script [scripts/rpi.ld](scripts/rpi.ld) currently links tvisor at
-physical address `0x0400_0000`. Source changes can move the `main` entry point,
-so determine it from every new build:
-
-```sh
-nm -n target/aarch64-unknown-none/debug/tvisor | grep ' main$'
-```
-
-## Test on Raspberry Pi 4
-
-The following procedure uses U-Boot's `go` command. Replace addresses and
-network settings with values verified for the current board and boot session.
-
-### 1. Publish the ELF through TFTP
-
-For a TFTP root at `/srv/tftp`:
-
-```sh
-sudo cp target/aarch64-unknown-none/debug/tvisor /srv/tftp/tvisor
-```
-
-### 2. Enter a fresh U-Boot session
-
-Reset the board before each tvisor run and interrupt the autoboot countdown.
-Repeatedly running tvisor without resetting U-Boot first is not a supported
-test sequence.
-
-At the prompt, inspect the current platform and U-Boot allocation state:
-
-```text
-U-Boot> bdinfo
-U-Boot> printenv fdt_addr
-```
-
-`bdinfo` and LMB remain useful deployment evidence for validating the fixed
-load window, but tvisor does not accept them as runtime inputs. Do not assume
-that the DTB, stack, or relocated U-Boot addresses remain the same after
-changing firmware, U-Boot, the DTB, or the boot sequence.
-
-### 3. Download tvisor
-
-The direct `go` workflow downloads the ELF at its linked base:
-
-```text
-U-Boot> setenv autostart no
-U-Boot> tftpboot 0x04000000 <tftp-server-ip>:tvisor
-```
-
-U-Boot sets `filesize` to the downloaded file size.
-
-The downloaded size does not include linker `NOLOAD` storage. Confirm that the
-complete runtime interval reported by `__image_start` and `__image_end` fits
-the board's validated load window:
-
-```sh
-nm -n target/aarch64-unknown-none/debug/tvisor | grep -E '__image_(start|end)$'
-```
-
-### 4. Run tvisor
-
-Use the `main` address reported by `nm`:
-
-```text
-U-Boot> go <main-address> fdt=${fdt_addr}
-```
-
-The complete tvisor runtime footprint must not overlap live U-Boot or firmware
-state. Initial EL2 tables come from tvisor's linker-owned EL2 stage-1 page-table arena, so
-no `lmb=` or `bootmem=` arguments are accepted or required.
-
-### 5. Check the result
-
-An ordinary image prints `tvisor: entering one-vCPU Linux guest`, followed by
-the guest console. Enable `--features diagnostics` to also see platform,
-per-CPU, register, memory and private-environment checkpoints. Successful
-scratch-remap records appear only in TLB acceptance images. Validation failures
-remain visible with diagnostics disabled.
-
-The final halt is intentional. Reset or power-cycle the board before another
-test; there is no return path to the U-Boot prompt.
+Use the [build guide](docs/setup/build.md) for release/diagnostic configurations
+and the Linux guest build. Follow the [Raspberry Pi guide](docs/setup/raspberry-pi4.md)
+to validate load addresses, load both the ELF and Linux `Image`, and launch with
+the required `fdt=` and `image=<address>,<file-size>` arguments. Every run needs
+a fresh U-Boot boot; there is no return path to its prompt.
 
 ## Documentation
 
-- [Development plan](docs/development_plan.md)
-- [Phase 11 physical SMP design](docs/tvisor_smp.md)
-- [IRQ ownership, HCR profiles and handling policy (proposal)](docs/irq_handling.md)
-- [Phase 11.4 centralized HCR policy follow-up](docs/phase11_4_hcr_policy.md)
-- [Phase 11.3 implementation and validation handoff](docs/phase11_3_status.md)
-- [Phase 11.4 GICv2 and management-interrupt implementation](docs/phase11_4_status.md)
-- [Phase 11.5 all-core startup and concurrent resource acceptance](docs/phase11_5_status.md)
-- [Phase 11.6 EL2 mapping updates and completed physical SMP regression](docs/phase11_6_status.md)
-- [System-information model](docs/system_information_model.md)
-- [U-Boot Raspberry Pi 4 memory layout](docs/uboot_rpi4_memory.md)
-- [Address translation](docs/address_translation.md)
-- [Draft tvisor EL2 memory map](docs/tvisor_memory_map.md)
-- [Private EL2 foundations](docs/private_el2_foundations.md)
-- [EL2 stage-1 page-table transition](docs/el2_stage1_page_table_transition.md)
-- [U-Boot handoff-state diagnostics](docs/check_handoff_state.md)
-- [Peripheral address translation](docs/peripheral_address_translation.md)
+- [Architecture and boot sequence](docs/architecture/overview.md)
+- [Physical CPUs and secondary startup](docs/architecture/cpu.md)
+- [Memory ownership, mappings and TLB synchronization](docs/architecture/memory.md)
+- [Physical address-space layout and boundaries](docs/architecture/physical-memory-map.md)
+- [Interrupt routing and management](docs/architecture/interrupts.md)
+- [VMs, vCPUs and the Linux guest platform](docs/architecture/virtualization.md)
+- [Platform discovery and firmware contracts](docs/architecture/platform.md)
+- [Build and configuration](docs/setup/build.md)
+- [Raspberry Pi setup and execution](docs/setup/raspberry-pi4.md)
+- [Host tests and linked-image checks](docs/testing/host-tests.md)
+- [Hardware acceptance and regression](docs/testing/hardware-tests.md)
+- [Development plan and current status](docs/development_plan.md)
+
+## Current limitations
+
+The supported startup backend is the BCM2711 Cortex-A72 armstub spin-table
+interface. Physical PSCI startup, hotplug and other boards are unsupported.
+The guest has one vCPU: guest multiprocessing, guest PSCI CPU_ON, virtual IPIs,
+vCPU scheduling/migration and shared stage-2 update coordination are future work.
+Device emulation covers the current Linux console/timer platform, not a complete
+GIC or PL011 implementation. Common IRQ dispatch, backpressure and teardown
+handling still have [documented gaps](docs/architecture/interrupts.md#remaining-work).
 
 ## License
 
-Tvisor is distributed under the terms of either the
-[MIT License](LICENSE-MIT) or the
-[Apache License 2.0](LICENSE-APACHE), at your option.
-
-Third-party components under `third_party/` retain their respective licenses.
+Tvisor is distributed under either the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option. Components under
+`third_party/` retain their respective licenses.

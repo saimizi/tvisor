@@ -151,7 +151,7 @@ global_asm!(
 // CPU0 validates/publishes the physical entry and all startup resources before
 // release. No firmware stack or argument-register contents are relied upon.
 // Unsupported state enters the holding loop without ordinary shared Rust access.
-// See docs/phase11_3_backend_contract.md and docs/phase11_3_entry_review.md.
+// See docs/architecture/platform.md and docs/architecture/cpu.md.
 __secondary_entry:
     msr daifset, #0xf
     mrs x9, CurrentEL
