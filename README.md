@@ -21,12 +21,11 @@ rustup target add aarch64-unknown-none
 cargo build --locked
 ```
 
-The ELF is `target/aarch64-unknown-none/debug/tvisor`. Run native library tests
+The ELF is `target/aarch64-unknown-none/debug/tvisor`. Run native library and VM mapping tests
 using the installed compiler's host target:
 
 ```sh
-host_target=$(rustc -vV | sed -n 's/^host: //p')
-cargo test --locked --lib --target "$host_target"
+cargo test-host --locked
 ```
 
 Use the [build guide](docs/setup/build.md) for release/diagnostic configurations

@@ -6,34 +6,49 @@ coherency require [hardware validation](hardware-tests.md).
 
 ## Native tests
 
-The default Cargo target is bare metal and has no Rust test harness. Select
-the installed compiler's native target explicitly:
+The default Cargo target is bare metal and has no Rust test harness. The
+`test-host` alias selects Cargo's `host-tuple` target and runs library,
+integration and documentation tests with the bare-metal binary feature disabled:
 
 ```sh
-host_target=$(rustc -vV | sed -n 's/^host: //p')
 cargo fmt --all -- --check
-cargo test --locked --lib --target "$host_target"
-cargo test --locked --lib --target "$host_target" --release
-cargo test --locked --lib --target "$host_target" --features diagnostics
+cargo test-host --locked
+cargo test-host --locked --release
 ```
 
-`cargo test-host` is currently an x86_64 Linux alias. It works only with that
-target and an appropriate execution environment. On AArch64 Linux use the
-commands above; installing an x86 target alone does not make its executables
-native. Hosted synchronization tests use mock/no-op interrupt control and
-hardware fault injection, not EL2 privileged instructions.
+`host-tuple` resolves to the installed compiler's native target, overriding the
+configured bare-metal default without hardcoding x86_64 or AArch64. See the
+[Cargo target documentation](https://doc.rust-lang.org/cargo/commands/cargo-test.html#compilation-options).
+Use a native compiler and runnable host environment; installing a cross target
+does not make its executables native.
+
+For the diagnostics configuration, select only the library: `diagnostics` also
+enables the bare-metal binary, which must not be built as a hosted executable.
+
+```sh
+cargo test --locked --lib --target host-tuple --features diagnostics
+```
+
+Hosted synchronization tests use mock/no-op interrupt control and hardware fault
+injection, not EL2 privileged instructions.
 
 Coverage includes DT/argument validation, memory normalization and ownership,
 allocator/heap contention, guarded stack layouts, startup generations and entry
 claims, pure waits and terminal boot policy, publication failures, management
 channel ordering, EL2 update epochs, register policy, guest DTB/layout and MMIO.
+The [VM mapping harness](../../tests/vmctl_stage2.rs) compiles the production VM
+mapper and vCPU state, including layout assertions. It checks stage-2 permissions,
+unmapped guards, host-owned GICV mappings, table budgets and allocation release.
+Its page-aligned host-memory adapter tracks live pages, rejects invalid/double
+frees and reclaims each contiguous allocation after its last page is returned.
+It does not simulate an executing CPU or the physical allocator's platform policy.
 
 ## Builds and static analysis
 
 ```sh
 cargo build --locked
 cargo build --locked --release
-cargo clippy --locked --lib --target "$host_target" -- -D warnings
+cargo clippy --locked --no-default-features --lib --test vmctl_stage2 --target host-tuple -- -D warnings
 cargo clippy --locked --bin tvisor -- -D warnings
 git diff --check
 ```
@@ -81,24 +96,20 @@ history, firmware compliance, physical coherency or actual cross-CPU execution.
 
 ## Test execution limitations
 
-The standalone [VM mapping harness](../../tests/vmctl_stage2.rs) includes
-`vmctl.rs`, which imports `crate::guest` and `crate::vcpu`; the harness does not
-provide those modules and therefore does not compile. Its separate invocation is:
+To run the VM harness separately:
 
 ```sh
-cargo test --locked --no-default-features --target "$host_target" --test vmctl_stage2
+cargo test --locked --no-default-features --target host-tuple --test vmctl_stage2
 ```
 
-Passing `--lib` runs do not cover that harness or certify its VM mapping tests.
-Record the compile failure when assessing VM test coverage rather than treating
-an excluded target as passing. Remove this limitation when the harness provides
-the required module boundary and its tests run successfully.
-
-The x86_64-only alias has the host-target restriction described in
-[native tests](#native-tests). Use an executable native target before interpreting
-target-not-installed or wrong-architecture errors as implementation failures.
-Track remediation through [issue #31](https://github.com/saimizi/tvisor/issues/31)
-and its PRs; this guide does not maintain checkpoint results.
+Passing `--lib` runs alone does not cover this harness. The host tests compile
+the VM mapping/allocation code with an explicit PA width, while register-reading
+mapping entry points, Linux launch and world-switch assembly are available only
+on the bare-metal target. Consequently host passes do not validate guest entry,
+real register access, cache maintenance, interrupt delivery or physical page
+ownership on the board. Those require the supported builds, linked checks and
+hardware acceptance. Do not add hardware acceptance features to `test-host`:
+they enable the EL2 binary and require a separate bare-metal build/run.
 
 ## Investigating an abort
 

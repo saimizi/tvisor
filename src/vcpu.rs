@@ -1,5 +1,6 @@
 //! vCPU state, pCPU-local world-switch state, and exit handling.
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use core::arch::global_asm;
 use core::fmt::Display;
 use tvisor_util::gicv2::VirtualGicV2State;
@@ -285,6 +286,7 @@ impl Vcpu {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 global_asm!(
     r#"
     .section .text.vcpu, "ax"
@@ -587,6 +589,7 @@ __vcpu_exit_common:
 "#
 );
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 unsafe extern "C" {
     pub fn __vcpu_run(vcpu: *mut Vcpu) -> u64;
 }

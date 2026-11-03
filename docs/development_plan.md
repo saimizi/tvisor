@@ -31,8 +31,8 @@ does not validate later source changes.
 - Device emulation is limited to the working Linux platform. Common current-EL/
   lower-EL dispatch, unexpected-source containment, FIFO/LR backpressure and
   full interrupt/device teardown need [further work](architecture/interrupts.md#remaining-work).
-- The standalone VM integration harness and the hardcoded x86 host-test alias
-  have [test execution limitations](testing/host-tests.md#test-execution-limitations).
+- Host tests cover VM mapping/allocation and synchronization models, but not
+  privileged execution or board behavior; see [test execution limitations](testing/host-tests.md#test-execution-limitations).
 
 ## Roadmap
 
