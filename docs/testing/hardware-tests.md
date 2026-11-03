@@ -215,14 +215,13 @@ Label a harness failure before image execution separately from hypervisor/guest
 failure. Fix the harness, validate it, and start a new attempt with new evidence.
 Keep frozen fixtures, failed attempts and existing evidence immutable.
 
-The retained comparison bundle, when present locally, is
-`docs/evidence/diagnostics_regression_20261102_01/` (ignored by Git). Its complete
-physical CPU overnight run records eleven boots, 379 commands, 360 console/IRQ
-checks and a 21,600.334-second soak with maximum lateness 50.007 ms and no
->500 ms wakes; quiet quick records a 600.461-second soak. Mapping, late-ack and
-concurrent workloads have separate bundles. Match actual source/configuration
-and artifact hashes, not the base commit alone. These are retained observations,
-not a fresh validation of subsequent changes or a prerequisite download.
+Select comparison bundles from retained test artifacts and the relevant issue/PR
+validation record. `docs/evidence/` is ignored by Git; a fresh checkout need not
+contain past runs. Keep exact durations, counts, timing observations and verdicts
+in each bundle rather than copying them into this procedure. Match actual
+source/configuration and artifact hashes, not the base commit alone. Compare
+mapping, late-ack, concurrency and guest stability with their corresponding
+coverage; a retained pass does not validate subsequent changes.
 
 Prefer overnight after translation, world-switch, timer/GIC/IRQ or concurrency
 changes. Single-vCPU Linux stability does not validate guest multiprocessing,

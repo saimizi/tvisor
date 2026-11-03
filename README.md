@@ -40,6 +40,7 @@ a fresh U-Boot boot; there is no return path to its prompt.
 - [Architecture and boot sequence](docs/architecture/overview.md)
 - [Physical CPUs and secondary startup](docs/architecture/cpu.md)
 - [Memory ownership, mappings and TLB synchronization](docs/architecture/memory.md)
+- [Physical address-space layout and boundaries](docs/architecture/physical-memory-map.md)
 - [Interrupt routing and management](docs/architecture/interrupts.md)
 - [VMs, vCPUs and the Linux guest platform](docs/architecture/virtualization.md)
 - [Platform discovery and firmware contracts](docs/architecture/platform.md)

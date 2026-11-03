@@ -16,11 +16,9 @@ and exact historical results belong in immutable evidence bundles.
 | EL2 mapping synchronization | Implemented narrow scratch update protocol; acceptance covers Online/Parked members and terminal timeout; ordinary mappings stay frozen | [Memory updates](architecture/memory.md#synchronized-el2-mapping-updates) |
 | Linux guest | One VM/vCPU on CPU0, 512 MiB RAM, stage 2, generated DTB, PL011 console and virtual timer/GICV delivery; quick/overnight stability coverage | [Virtualization](architecture/virtualization.md) |
 
-The physical CPU implementation was merged in [PR #28](https://github.com/saimizi/tvisor/pull/28).
-Its retained evidence covers mapping success/failure, concurrent workloads,
-quiet quick regression and full physical CPU overnight regression. See
-[evidence interpretation](testing/hardware-tests.md#evidence-and-comparison)
-for provenance and limits. A past pass does not validate later source changes.
+See [evidence interpretation](testing/hardware-tests.md#evidence-and-comparison)
+for the provenance and limits required when assessing validation. A past pass
+does not validate later source changes.
 
 ## Known gaps
 
@@ -33,17 +31,16 @@ for provenance and limits. A past pass does not validate later source changes.
 - Device emulation is limited to the working Linux platform. Common current-EL/
   lower-EL dispatch, unexpected-source containment, FIFO/LR backpressure and
   full interrupt/device teardown need [further work](architecture/interrupts.md#remaining-work).
-- Strict Clippy findings, the noncompiling standalone VM integration harness and
-  the hardcoded x86 host-test alias remain [local validation gaps](testing/host-tests.md#known-baseline-gaps).
+- The standalone VM integration harness and the hardcoded x86 host-test alias
+  have [test execution limitations](testing/host-tests.md#test-execution-limitations).
 
 ## Roadmap
 
 ### Consolidate and simplify the current implementation
 
-Current work is tracked in [issue #31](https://github.com/saimizi/tvisor/issues/31).
-The baseline inventory and local checks are complete. Documentation consolidation
-is ready for review; source simplification, functional naming cleanup and final
-regression are pending. Each step stops for review before the next begins.
+Reduce duplicated state and unnecessary abstractions before extending guest
+execution to multiple CPUs. [Issue #31](https://github.com/saimizi/tvisor/issues/31)
+tracks the scope; its issue/PR checklists track implementation progress.
 
 Keep permanent architecture/setup/testing guidance and this roadmap. Review
 CPU/startup, memory, VM/vCPU, interrupt and TLB ownership for redundant state,
@@ -99,5 +96,6 @@ fixtures, fresh uniquely named evidence and verified final power-off.
 
 Distinguish implemented behavior, planned behavior and the validation actually
 performed. Record hardware unavailability or incomplete runs explicitly. Keep
-progress summaries here concise; link issues/PRs and durable architecture instead
-of copying their discussion or maintaining chronological milestone reports.
+implementation progress and historical results in issues, PRs and evidence
+bundles. Keep this roadmap focused on supported capabilities, limitations,
+objectives, dependencies and acceptance criteria.

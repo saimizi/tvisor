@@ -33,6 +33,9 @@ Do not assume these interfaces are physically contiguous.
 
 ## Bus addresses and CPU addresses
 
+See the [physical memory map](physical-memory-map.md) for RAM banks, carve-outs,
+MMIO windows and hypervisor/guest allocation boundaries.
+
 A node's `reg` is in its parent bus's address space. Decode `ranges` with the
 child/parent `#address-cells` and child `#size-cells`; cells are big-endian u32.
 For a containing half-open range:

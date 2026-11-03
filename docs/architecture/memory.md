@@ -6,6 +6,9 @@ currently identity mappings, but a guest IPA does not identify its backing PA.
 Linux separately owns its EL1 VA-to-IPA translation. Device Tree bus addresses
 must first be translated to CPU physical addresses; see [platform discovery](platform.md).
 
+The [physical memory map](physical-memory-map.md) gives address-based platform,
+linker and runtime layouts, with each boundary's authority and ownership.
+
 ## Physical memory classification
 
 [MemoryMap](../../tvisor_util/memory_map.rs) is built in static storage, with

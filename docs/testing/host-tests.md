@@ -38,6 +38,11 @@ cargo clippy --locked --bin tvisor -- -D warnings
 git diff --check
 ```
 
+Treat Clippy diagnostics as findings to assess and record for the tested
+revision. A successful build or library test run does not imply a clean Clippy
+run; do not suppress findings globally to report a pass. Keep exact counts,
+toolchain versions and remediation tracking in the issue/PR or test evidence.
+
 Also build diagnostics in debug/release and each acceptance feature individually;
 the [feature table](../setup/build.md#build-features) describes the supported
 matrix. Preserve the exact ELF immediately after each build: feature variants
@@ -74,30 +79,26 @@ markers nor scratch helpers while retaining actionable failure messages.
 These are structural checks of linked instructions. They do not prove cache
 history, firmware compliance, physical coherency or actual cross-CPU execution.
 
-## Known baseline gaps
+## Test execution limitations
 
-At the start of the current refactoring, Rust 1.94.0 native debug, release and
-diagnostics library runs each pass 200 tests; ten supported bare-metal variants
-and their linked checks pass. This is a baseline observation, not a permanent
-expected test count. The following remain unresolved and should be updated here
-when repaired:
+The standalone [VM mapping harness](../../tests/vmctl_stage2.rs) includes
+`vmctl.rs`, which imports `crate::guest` and `crate::vcpu`; the harness does not
+provide those modules and therefore does not compile. Its separate invocation is:
 
-- Strict Clippy fails on the utility library with 28 findings, including missing
-  safety documentation, missing `Default` suggestions, unit error types, casts,
-  conditional simplifications and argument count. The binary can reveal further
-  findings after library cleanup. Do not suppress these globally to report a pass.
-- The standalone VM harness does not compile because its included `vmctl.rs`
-  imports `crate::guest` and `crate::vcpu`, which the harness does not provide:
+```sh
+cargo test --locked --no-default-features --target "$host_target" --test vmctl_stage2
+```
 
-  ```sh
-  cargo test --locked --no-default-features --target "$host_target" --test vmctl_stage2
-  ```
+Passing `--lib` runs do not cover that harness or certify its VM mapping tests.
+Record the compile failure when assessing VM test coverage rather than treating
+an excluded target as passing. Remove this limitation when the harness provides
+the required module boundary and its tests run successfully.
 
-  Passing `--lib` runs do not cover that harness or certify its VM mapping tests.
-- The host-test alias hardcodes x86_64 and needs portable handling/documentation.
-
-Track current remediation and validation scope in the
-[development plan](../development_plan.md#known-gaps).
+The x86_64-only alias has the host-target restriction described in
+[native tests](#native-tests). Use an executable native target before interpreting
+target-not-installed or wrong-architecture errors as implementation failures.
+Track remediation through [issue #31](https://github.com/saimizi/tvisor/issues/31)
+and its PRs; this guide does not maintain checkpoint results.
 
 ## Investigating an abort
 

@@ -60,6 +60,7 @@ workloads are feature-gated separately from ordinary execution.
 
 - [CPU storage, startup and lifecycle](cpu.md)
 - [Memory, locks and translation updates](memory.md)
+- [Physical memory layout and boundary sources](physical-memory-map.md)
 - [IRQ routing and completion](interrupts.md)
 - [Guest execution and address spaces](virtualization.md)
 - [Platform and firmware requirements](platform.md)
