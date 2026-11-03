@@ -1,9 +1,10 @@
 //! Opt-in hardware acceptance instrumentation, absent from normal builds.
 //! Delay only after coherent entry, local validation and checkpoint writes.
 //! Never change mappings, registers, release routing or publication maintenance.
-use super::{BOOT_STATE, physical_counter, report_checkpoint, startup};
+use super::{BOOT_STATE, report_checkpoint, startup};
 use core::sync::atomic::Ordering;
 use tvisor_util::{
+    aarch64_reg::{counter_frequency, physical_counter},
     println,
     secondary_boot::{BootError, BootStatus, StartupDeadline},
     secondary_mailbox::CpuState,
@@ -16,17 +17,8 @@ pub(super) const TEST_CPU: usize = 1;
 
 const MAX_POLLS: usize = 250_000_000;
 
-fn make_deadline(seconds: u64) -> Option<StartupDeadline> {
-    let frequency: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency,
-            options(nomem, nostack, preserves_flags));
-    }
-    StartupDeadline::new(frequency, seconds)
-}
-
 pub(super) fn delay_parking() {
-    if let Some(deadline) = make_deadline(4) {
+    if let Some(deadline) = StartupDeadline::new(counter_frequency(), 4) {
         let start = physical_counter();
         for _ in 0..MAX_POLLS {
             if deadline.elapsed(start, physical_counter()) >= deadline.ticks() {
@@ -62,7 +54,7 @@ pub(super) fn observe_terminal_failure() {
         record.mailbox.state(1),
         record.mailbox.entry_is_claimed(1)
     );
-    let Some(deadline) = make_deadline(5) else {
+    let Some(deadline) = StartupDeadline::new(counter_frequency(), 5) else {
         println!("Phase 11.3 timeout-test FAIL: invalid observer deadline");
         return;
     };
@@ -82,7 +74,7 @@ pub(super) fn observe_terminal_failure() {
     report_checkpoint(record);
     // Optional waits may be retried; successful readiness must not undo the
     // independent terminal boot-policy decision or create a new guest permit.
-    let Some(late_deadline) = make_deadline(1) else {
+    let Some(late_deadline) = StartupDeadline::new(counter_frequency(), 1) else {
         println!("Phase 11.3 timeout-test FAIL: invalid late-wait deadline");
         return;
     };

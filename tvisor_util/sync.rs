@@ -12,7 +12,8 @@ use spin::{Mutex, MutexGuard};
 /// Implementations must mask IRQ before returning from save_and_mask and restore
 /// the saved state on the same CPU. Neither operation may allocate or acquire locks.
 pub unsafe trait InterruptControl {
-    type State;
+    /// A value snapshot of the local mask, not an owned resource.
+    type State: Copy;
     fn save_and_mask() -> Self::State;
     fn restore(state: Self::State);
 }
@@ -48,6 +49,43 @@ unsafe impl InterruptControl for LocalIrq {
     }
 }
 
+/// Restore the acquiring CPU's IRQ mask when this scope ends. Callers may
+/// temporarily change the mask while retaining the original state for Drop.
+/// This owns no lock and changes no D/A/F bits with the LocalIrq policy.
+///
+/// Restoration must stay on the acquiring CPU, including on error/unwind:
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<tvisor_util::sync::RestoreIrq>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<tvisor_util::sync::RestoreIrq>();
+/// ```
+#[must_use = "dropping the guard immediately restores the previous IRQ mask"]
+pub struct RestoreIrq<I: InterruptControl = LocalIrq> {
+    saved: I::State,
+    // An IRQ state belongs to the CPU that captured it, not another thread.
+    local: PhantomData<*mut ()>,
+}
+impl<I: InterruptControl> RestoreIrq<I> {
+    #[inline(always)]
+    pub fn save_and_mask() -> Self {
+        Self {
+            saved: I::save_and_mask(),
+            local: PhantomData,
+        }
+    }
+}
+impl<I: InterruptControl> Drop for RestoreIrq<I> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        I::restore(self.saved);
+    }
+}
+
 pub struct IrqSpinLock<T, I: InterruptControl = LocalIrq> {
     inner: Mutex<T>,
     policy: PhantomData<fn() -> I>,
@@ -60,34 +98,26 @@ impl<T, I: InterruptControl> IrqSpinLock<T, I> {
         }
     }
     pub fn lock(&self) -> IrqGuard<'_, T, I> {
-        let saved = I::save_and_mask();
+        let irq = RestoreIrq::<I>::save_and_mask();
         IrqGuard {
             inner: Some(self.inner.lock()),
-            saved: Some(saved),
-            local: PhantomData,
+            _irq: irq,
         }
     }
     /// One bounded attempt; failure restores IRQ state too.
     pub fn try_lock(&self) -> Option<IrqGuard<'_, T, I>> {
-        let saved = I::save_and_mask();
-        match self.inner.try_lock() {
-            Some(inner) => Some(IrqGuard {
-                inner: Some(inner),
-                saved: Some(saved),
-                local: PhantomData,
-            }),
-            None => {
-                I::restore(saved);
-                None
-            }
-        }
+        let irq = RestoreIrq::<I>::save_and_mask();
+        let inner = self.inner.try_lock()?;
+        Some(IrqGuard {
+            inner: Some(inner),
+            _irq: irq,
+        })
     }
 }
 pub struct IrqGuard<'a, T, I: InterruptControl> {
     inner: Option<MutexGuard<'a, T>>,
-    saved: Option<I::State>,
-    // Prevent Send/Sync: IRQ restoration must occur on the acquiring CPU.
-    local: PhantomData<*mut ()>,
+    // Dropped automatically after Drop releases inner; also prevents Send/Sync.
+    _irq: RestoreIrq<I>,
 }
 impl<T, I: InterruptControl> Deref for IrqGuard<'_, T, I> {
     type Target = T;
@@ -103,7 +133,6 @@ impl<T, I: InterruptControl> DerefMut for IrqGuard<'_, T, I> {
 impl<T, I: InterruptControl> Drop for IrqGuard<'_, T, I> {
     fn drop(&mut self) {
         drop(self.inner.take()); // Release before restoring interrupts.
-        I::restore(self.saved.take().unwrap());
     }
 }
 
@@ -121,6 +150,42 @@ mod tests {
         }
         fn restore(state: bool) {
             IRQ_MASKED.with(|v| v.set(state));
+        }
+    }
+    #[test]
+    fn scope_restores_original_mask_after_temporary_unmasking() {
+        assert_eq!(
+            core::mem::size_of::<RestoreIrq>(),
+            core::mem::size_of::<u64>()
+        );
+        for initial in [false, true] {
+            IRQ_MASKED.with(|v| v.set(initial));
+            let restore = RestoreIrq::<MockIrq>::save_and_mask();
+            assert!(IRQ_MASKED.with(Cell::get));
+            MockIrq::restore(false);
+            assert!(!IRQ_MASKED.with(Cell::get));
+            drop(restore);
+            assert_eq!(IRQ_MASKED.with(Cell::get), initial);
+        }
+    }
+    #[test]
+    fn scope_restores_on_early_error_and_unwind() {
+        fn early_error() -> Result<(), ()> {
+            let _restore = RestoreIrq::<MockIrq>::save_and_mask();
+            MockIrq::restore(false);
+            Err(())
+        }
+        for initial in [false, true] {
+            IRQ_MASKED.with(|v| v.set(initial));
+            assert_eq!(early_error(), Err(()));
+            assert_eq!(IRQ_MASKED.with(Cell::get), initial);
+            let result = std::panic::catch_unwind(|| {
+                let _restore = RestoreIrq::<MockIrq>::save_and_mask();
+                MockIrq::restore(false);
+                panic!("test");
+            });
+            assert!(result.is_err());
+            assert_eq!(IRQ_MASKED.with(Cell::get), initial);
         }
     }
     #[test]

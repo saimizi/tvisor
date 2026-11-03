@@ -116,6 +116,11 @@ views remain available. Failed validation does not freeze, and there is no thaw.
 [`IrqSpinLock`](../../tvisor_util/sync.rs) masks local IRQ before acquisition,
 releases the lock before restoring the saved I bit, and preserves unrelated
 D/A/F bits. Failed try-locks restore IRQ state. Guards cannot move between CPUs.
+The shared `RestoreIrq` scope guard owns a Copy snapshot of that CPU's IRQ mask;
+it is neither Send nor Sync. Lock guards release their mutex before this guard
+restores the mask. Management and acceptance scopes use the same restoration
+mechanism while explicitly unmasking IRQs for their waits. The guard itself
+neither acquires a lock nor decides when those scopes may enable IRQs.
 Do not nest resource locks, allocate/format inside allocator or table critical
 sections, or wait for another CPU while holding them.
 

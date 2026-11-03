@@ -2,6 +2,7 @@
 //! publishes a validated record and completes the spin-table release protocol.
 use core::{arch::global_asm, sync::atomic::Ordering};
 use tvisor_util::{
+    aarch64_reg::{counter_frequency, physical_counter},
     el2_policy::{HostEl2Config, HostEl2ConfigStorage},
     pcpu::{PcpuContext, PcpuSlot},
     secondary_startup::StartupView,
@@ -500,10 +501,7 @@ fn validate_platform(
         return Err("active host translation differs from startup policy");
     }
 
-    let frequency: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack, preserves_flags));
-    }
+    let frequency = counter_frequency();
     let deadline = tvisor_util::secondary_boot::StartupDeadline::new(frequency, 2)
         .ok_or("invalid startup counter frequency")?;
     let counter_start = physical_counter();
@@ -806,12 +804,4 @@ fn validate_identity_range(start: u64, end: u64) -> Result<(), &'static str> {
         }
     }
     Ok(())
-}
-
-fn physical_counter() -> u64 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
 }
