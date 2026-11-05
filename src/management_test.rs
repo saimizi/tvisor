@@ -94,7 +94,7 @@ fn arm(mode: u64) -> Result<(), &'static str> {
 
 fn drain() -> Result<(), &'static str> {
     MODE.store(0, Ordering::Release);
-    let _restore = RestoreIrq(LocalIrq::save_and_mask());
+    let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
     LocalIrq::restore(0);
     let start = counter();
     for _ in 0..100_000_000 {
@@ -356,7 +356,7 @@ pub fn stage2_profiles(
     // Drop restores the original IRQ mask before the UART is re-enabled below,
     // including on an ordinary error return from this test closure.
     let result = (|| {
-        let _restore = RestoreIrq(LocalIrq::save_and_mask());
+        let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
         unsafe { crate::guest::activate_guest_stage2(regs) };
         if read!("hcr_el2") != GUEST_HCR || read!("vttbr_el2") != regs.vttbr_el2 {
             return Err("guest HCR/VTTBR readback failed");

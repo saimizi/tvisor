@@ -46,9 +46,15 @@ reserved RAM, MMIO and holes; they cannot be allocated or freed. Managed pages
 are InUse or Unused. Bitmap set counts provide consistent allocator statistics.
 RAM above the aperture is not supported by this allocator.
 
-[mm.rs](../../src/mm.rs) serializes initialization, bitmap views, allocation,
-freeing and statistics through one IRQ-save lock. Returned pages have exclusive
-ownership; freeing validates alignment, ownership and double-free conditions.
+The allocator owns both bitmaps and its initialization state. The global
+instance is constructed at compile time; runtime initialization fills its
+storage in place. Operations reject use before a
+successful initialization, and repeated initialization cannot reset live pages.
+[mm.rs](../../src/mm.rs) owns the global allocator inside one IRQ-save lock,
+which serializes initialization, allocation, freeing and statistics. The boot
+path validates the live DTB exclusion before initializing the allocator.
+Returned pages have exclusive ownership; freeing validates alignment, ownership
+and double-free conditions.
 Initial secondary stack allocation rolls back only before mapping/publication.
 
 The [Rust heap](../../tvisor_util/heap_allocator.rs) wraps `linked_list_allocator`
@@ -116,6 +122,11 @@ views remain available. Failed validation does not freeze, and there is no thaw.
 [`IrqSpinLock`](../../tvisor_util/sync.rs) masks local IRQ before acquisition,
 releases the lock before restoring the saved I bit, and preserves unrelated
 D/A/F bits. Failed try-locks restore IRQ state. Guards cannot move between CPUs.
+The shared `RestoreIrq` scope guard owns a Copy snapshot of that CPU's IRQ mask;
+it is neither Send nor Sync. Lock guards release their mutex before this guard
+restores the mask. Management and acceptance scopes use the same restoration
+mechanism while explicitly unmasking IRQs for their waits. The guard itself
+neither acquires a lock nor decides when those scopes may enable IRQs.
 Do not nest resource locks, allocate/format inside allocator or table critical
 sections, or wait for another CPU while holding them.
 

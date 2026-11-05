@@ -7,8 +7,9 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tvisor_util::{
+    aarch64_reg::{counter_frequency, physical_counter},
     management::{Operation, Reply},
-    sync::{InterruptControl, LocalIrq},
+    sync::{InterruptControl, LocalIrq, RestoreIrq},
     tlb_update::Phase,
 };
 static PREPARED: AtomicBool = AtomicBool::new(false);
@@ -54,13 +55,11 @@ fn read() -> u64 {
     value
 }
 fn elapsed() -> u64 {
-    (crate::management::counter().wrapping_sub(STARTED.load(Ordering::Acquire)))
-        & ((1u64 << 56) - 1)
+    (physical_counter().wrapping_sub(STARTED.load(Ordering::Acquire))) & ((1u64 << 56) - 1)
 }
 fn wait_for(seconds: u64, mut condition: impl FnMut() -> bool) -> Result<(), &'static str> {
-    let deadline =
-        tvisor_util::secondary_boot::StartupDeadline::new(crate::management::frequency(), seconds)
-            .ok_or("invalid mapping counter deadline")?;
+    let deadline = tvisor_util::secondary_boot::StartupDeadline::new(counter_frequency(), seconds)
+        .ok_or("invalid mapping counter deadline")?;
     for _ in 0..1_000_000_000u64 {
         if UPDATES.phase() == Phase::Failed || crate::pcpu::has_fatal() {
             return Err("failed mapping update");
@@ -81,9 +80,8 @@ pub fn worker(id: usize) {
     let epoch = UPDATES.epoch();
     #[cfg(feature = "tlb-update-timeout-test")]
     if id == 2 {
-        let deadline =
-            tvisor_util::secondary_boot::StartupDeadline::new(crate::management::frequency(), 4)
-                .expect("fault deadline");
+        let deadline = tvisor_util::secondary_boot::StartupDeadline::new(counter_frequency(), 4)
+            .expect("fault deadline");
         for _ in 0..1_000_000_000u64 {
             if elapsed() >= deadline.ticks() {
                 break;
@@ -139,12 +137,6 @@ fn fatal(reason: &str) -> ! {
     );
     tvisor_util::halt()
 }
-struct RestoreIrq(u64);
-impl Drop for RestoreIrq {
-    fn drop(&mut self) {
-        LocalIrq::restore(self.0);
-    }
-}
 /// CPU0 only. Completion permits reuse of the *old* backing, never of a table
 /// page. Both permanently reserved pages remain allocator-owned until reset.
 pub fn remap() -> Result<u64, &'static str> {
@@ -156,13 +148,13 @@ pub fn remap() -> Result<u64, &'static str> {
     if hcr != tvisor_util::el2_policy::HOST_HCR {
         return Err("mapping update requires deactivated guest/host HCR profile");
     }
-    let _restore = RestoreIrq(LocalIrq::save_and_mask());
+    let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
     LocalIrq::restore(0);
     let members = crate::secondary::required_mask() | 1;
     let epoch = UPDATES
         .begin(members)
         .map_err(|_| "mapping update busy/failed")?;
-    STARTED.store(crate::management::counter(), Ordering::Release);
+    STARTED.store(physical_counter(), Ordering::Release);
     let result = (|| {
         crate::management::validate_mapping_members(members)?;
         let old = CURRENT.load(Ordering::Acquire);
@@ -281,9 +273,8 @@ pub fn timeout_acceptance() -> Result<(), &'static str> {
     {
         return Err("wrong mapping fault outcome");
     }
-    let deadline =
-        tvisor_util::secondary_boot::StartupDeadline::new(crate::management::frequency(), 7)
-            .ok_or("observer deadline")?;
+    let deadline = tvisor_util::secondary_boot::StartupDeadline::new(counter_frequency(), 7)
+        .ok_or("observer deadline")?;
     for _ in 0..1_000_000_000u64 {
         if LATE_REJECTED.load(Ordering::Acquire) || elapsed() >= deadline.ticks() {
             break;

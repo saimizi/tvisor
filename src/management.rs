@@ -4,10 +4,11 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tvisor_util::{
+    aarch64_reg::{counter_frequency as frequency, physical_counter as counter},
     cpu_topology::MAX_CPUS,
     gicv2::{self, CpuTarget, GicV2, InterruptAck},
     management::{Channel, Operation, Pending, Reply},
-    sync::{InterruptControl, LocalIrq},
+    sync::{InterruptControl, LocalIrq, RestoreIrq},
 };
 
 #[cfg(feature = "management-irq-test")]
@@ -67,18 +68,6 @@ pub(crate) fn current_id() -> Option<usize> {
     crate::pcpu::PCPU_SLOTS
         .iter()
         .position(|s| s.context_ptr() as u64 == pointer && s.is_prepared())
-}
-pub fn counter() -> u64 {
-    let value;
-    unsafe {
-        asm!("isb", "mrs {}, cntpct_el0", out(reg) value, options(nomem, nostack, preserves_flags))
-    };
-    value
-}
-pub(crate) fn frequency() -> u64 {
-    let value;
-    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) value, options(nomem, nostack, preserves_flags)) };
-    value
 }
 fn target(id: usize) -> Option<CpuTarget> {
     let cpu = CPUS.get(id)?;
@@ -213,18 +202,11 @@ pub(crate) fn wait(pending: &mut Pending<'_>) -> Result<Reply, &'static str> {
     }
     Err("management poll limit")
 }
-struct RestoreIrq(u64);
-impl Drop for RestoreIrq {
-    fn drop(&mut self) {
-        LocalIrq::restore(self.0);
-    }
-}
-
 /// Returns after validating the worker's interface and bidirectional boot-time
 /// dispatch. CPU0 restores its previous IRQ mask before guest preparation.
 pub fn activate_secondary() -> Result<(), &'static str> {
     let required = crate::secondary::required_mask();
-    let _restore = RestoreIrq(LocalIrq::save_and_mask());
+    let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
     LocalIrq::restore(0);
     for id in 1..MAX_CPUS {
         if required & (1 << id) == 0 {

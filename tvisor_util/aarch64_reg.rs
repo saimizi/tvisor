@@ -1,3 +1,30 @@
+/// Ordered physical-counter sample for ordinary host code. The ISB remains
+/// immediately before MRS; deadline units, wrap handling and budgets belong to
+/// the caller. Stackless release timestamps stay in their assembly sequence.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[inline(always)]
+pub fn physical_counter() -> u64 {
+    let value;
+    unsafe {
+        core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) value,
+            options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Raw architectural counter frequency; each caller retains its validation
+/// and conversion policy. This adds no counter sample or barrier.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[inline(always)]
+pub fn counter_frequency() -> u64 {
+    let value;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) value,
+            options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 // TCR_EL2
 pub const TCR_EL2_RES1: u64 = (1 << 31) | (1 << 23);
 pub const TCR_EL2_T0SZ_FOR_VA_39_BIT: u64 = 64_u64 - 39_u64;

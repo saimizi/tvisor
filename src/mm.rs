@@ -1,7 +1,6 @@
 use core::{
-    cell::UnsafeCell,
     fmt,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use tvisor_util::aarch64_reg::{HcrEl2, IdAa64Mmfr0El1};
@@ -11,7 +10,7 @@ use tvisor_util::el2_stage1_translation::{
 use tvisor_util::gicv2::GicV2Info;
 use tvisor_util::memory_map::MemoryMap;
 use tvisor_util::page_allocator::{
-    AllocatorError, AllocatorStats, PAGE_BITMAP_BYTES, PageAllocator, PageBitmap,
+    AllocatorError, AllocatorStats, MAX_PHYSICAL_ADDRESS, PAGE_BITMAP_BYTES, PageAllocator,
 };
 use tvisor_util::sync::IrqSpinLock;
 use tvisor_util::system_info::{FixedList, PhysAddr, PhysRegion};
@@ -24,31 +23,8 @@ static TVISOR_TABLES: IrqSpinLock<
     Option<tvisor_util::startup_resources::BootTables<TableSet<'static, MAX_TABLE_PAGES>>>,
 > = IrqSpinLock::new(None);
 
-struct GlobalPageAllocator {
-    lock: IrqSpinLock<()>,
-    managed: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
-    in_use: UnsafeCell<PageBitmap<PAGE_BITMAP_BYTES>>,
-    ram_pages: AtomicUsize,
-    initialized: AtomicBool,
-}
-
-// SAFETY: the IRQ-save lock serializes every bitmap view, initialization and
-// statistics access. Mutable bitmap references never escape its guard.
-unsafe impl Sync for GlobalPageAllocator {}
-
-impl GlobalPageAllocator {
-    const fn new() -> Self {
-        Self {
-            lock: IrqSpinLock::new(()),
-            managed: UnsafeCell::new(PageBitmap::zeroed()),
-            in_use: UnsafeCell::new(PageBitmap::zeroed()),
-            ram_pages: AtomicUsize::new(0),
-            initialized: AtomicBool::new(false),
-        }
-    }
-}
-
-static PAGE_ALLOCATOR: GlobalPageAllocator = GlobalPageAllocator::new();
+static PAGE_ALLOCATOR: IrqSpinLock<PageAllocator<PAGE_BITMAP_BYTES>> =
+    IrqSpinLock::new(PageAllocator::uninitialized());
 static EL2_STAGE1_TABLES_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -288,8 +264,8 @@ pub fn initialize_allocator_after_takeover(
     memory_map: &MemoryMap,
     live_dtb: PhysRegion,
 ) -> Result<AllocatorInitResult, AllocatorInitError> {
-    let _guard = PAGE_ALLOCATOR.lock.lock();
-    if PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
+    let mut allocator = PAGE_ALLOCATOR.lock();
+    if allocator.is_initialized() {
         return Err(AllocatorError::DoubleFree.into());
     }
 
@@ -298,20 +274,19 @@ pub fn initialize_allocator_after_takeover(
         PhysRegion::new_aligned(live_dtb.start(), live_dtb.size(), PAGE_SIZE as u64)
             .map_err(|_| AllocatorInitError::InvalidDtb)?;
 
-    // SAFETY: the allocator lock exclusively protects both bitmap views.
-    let allocator = unsafe {
-        PageAllocator::new(
-            memory_map.ram(),
-            memory_map.usable_ram(),
-            memory_map.usable_ram(),
-            &mut *PAGE_ALLOCATOR.managed.get(),
-            &mut *PAGE_ALLOCATOR.in_use.get(),
-        )?
-    };
-
+    // Validate the DTB exclusion before publishing an initialized allocator.
+    // A bitmap manages exactly the whole pages contained in a usable region.
     let mut page = live_dtb_pages.start().value();
     while page < live_dtb_pages.end().value() {
-        if allocator.state(PhysAddr::new(page))? != tvisor_util::page_allocator::PageState::Reserved
+        if page >= MAX_PHYSICAL_ADDRESS {
+            return Err(AllocatorError::PhysicalAddressOutOfRange.into());
+        }
+        let dtb_page = PhysRegion::new(PhysAddr::new(page), PAGE_SIZE as u64)
+            .map_err(|_| AllocatorInitError::InvalidDtb)?;
+        if memory_map
+            .usable_ram()
+            .iter()
+            .any(|region| region.contains_region(dtb_page))
         {
             return Err(AllocatorInitError::DtbAllocatable);
         }
@@ -320,11 +295,12 @@ pub fn initialize_allocator_after_takeover(
             .ok_or(AllocatorError::AddressOverflow)?;
     }
 
-    let stats = allocator.stats();
-    PAGE_ALLOCATOR
-        .ram_pages
-        .store(stats.ram_pages, Ordering::Relaxed);
-    PAGE_ALLOCATOR.initialized.store(true, Ordering::Release);
+    allocator.initialize(
+        memory_map.ram(),
+        memory_map.usable_ram(),
+        memory_map.usable_ram(),
+    )?;
+    let stats = allocator.stats()?;
     Ok(AllocatorInitResult { stats, live_dtb })
 }
 
@@ -452,7 +428,7 @@ pub fn map_firmware_release_cell(address: PhysAddr) -> Result<(), PrepareError> 
 /// The returned page is changed to `InUse`. Reserved RAM, MMIO, unpopulated
 /// addresses, and pages already in use are skipped.
 pub fn allocate_page() -> Result<PhysAddr, AllocatorError> {
-    with_allocator(|allocator| allocator.allocate())
+    PAGE_ALLOCATOR.lock().allocate()
 }
 
 /// Allocate secondary stack ranges using bitmap metadata only. The ranges
@@ -463,7 +439,7 @@ pub fn allocate_secondary_stacks(
     FixedList<tvisor_util::pcpu::SecondaryStack, { tvisor_util::cpu_topology::MAX_CPUS }>,
     AllocatorError,
 > {
-    with_allocator(|allocator| tvisor_util::pcpu::allocate_secondary_stacks(topology, allocator))
+    tvisor_util::pcpu::allocate_secondary_stacks(topology, &mut PAGE_ALLOCATOR.lock())
 }
 
 /// Allocate the lowest-addressed run of `pages` contiguous unused managed
@@ -472,34 +448,15 @@ pub fn allocate_secondary_stacks(
 /// Under tvisor's current identity map, the returned physical range is also a
 /// virtually contiguous EL2 range at the same address.
 pub fn allocate_contiguous_pages(pages: usize) -> Result<PhysAddr, AllocatorError> {
-    with_allocator(|allocator| allocator.allocate_contiguous(pages))
+    PAGE_ALLOCATOR.lock().allocate_contiguous(pages)
 }
 
 pub fn free_page(page: PhysAddr) -> Result<(), AllocatorError> {
-    with_allocator(|allocator| allocator.free(page))
+    PAGE_ALLOCATOR.lock().free(page)
 }
 
 pub fn allocator_stats() -> Result<AllocatorStats, AllocatorError> {
-    with_allocator(|allocator| Ok(allocator.stats()))
-}
-
-fn with_allocator<T>(
-    operation: impl FnOnce(&mut PageAllocator<'_, PAGE_BITMAP_BYTES>) -> Result<T, AllocatorError>,
-) -> Result<T, AllocatorError> {
-    let _guard = PAGE_ALLOCATOR.lock.lock();
-    if !PAGE_ALLOCATOR.initialized.load(Ordering::Acquire) {
-        return Err(AllocatorError::NotInitialized);
-    }
-    let ram_pages = PAGE_ALLOCATOR.ram_pages.load(Ordering::Relaxed);
-    // SAFETY: the IRQ-save guard exclusively owns both bitmap views.
-    let mut allocator = unsafe {
-        PageAllocator::from_existing(
-            &mut *PAGE_ALLOCATOR.managed.get(),
-            &mut *PAGE_ALLOCATOR.in_use.get(),
-            ram_pages,
-        )?
-    };
-    operation(&mut allocator)
+    PAGE_ALLOCATOR.lock().stats()
 }
 
 fn with_tables<T>(

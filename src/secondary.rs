@@ -2,10 +2,11 @@
 //! publishes a validated record and completes the spin-table release protocol.
 use core::{arch::global_asm, sync::atomic::Ordering};
 use tvisor_util::{
+    aarch64_reg::{counter_frequency, physical_counter},
     el2_policy::{HostEl2Config, HostEl2ConfigStorage},
     pcpu::{PcpuContext, PcpuSlot},
     secondary_startup::StartupView,
-    startup_resources::StartupResources,
+    startup_resources::{CpuStartupResources, SharedStartupResources},
 };
 use tvisor_util::{
     secondary_boot::{self, BootError, BootStatus, StartupDeadline},
@@ -381,7 +382,8 @@ extern "C" fn secondary_main(
     unsafe extern "C" {
         static __el2_vectors: u8;
     }
-    let context_valid = crate::pcpu::validate_secondary_context(
+    let context_valid = tvisor_util::pcpu::validate_secondary_context(
+        &crate::pcpu::PCPU_SLOTS,
         record.identity.logical_id,
         record.identity.affinity,
         record.identity.stack_bottom,
@@ -431,10 +433,13 @@ pub fn start_all(
         if required == 0 {
             return Err(BootError::Preparation("no eligible secondary"));
         }
-        let resources = prepare_all_cpus(required, policy).map_err(BootError::Preparation)?;
-        validate_and_freeze(&resources).map_err(BootError::Preparation)?;
+        let shared = shared_startup_resources(policy).map_err(BootError::Preparation)?;
+        let resources =
+            prepare_all_cpus(required, policy, &shared).map_err(BootError::Preparation)?;
+        validate_and_freeze(&shared, &resources).map_err(BootError::Preparation)?;
         let line = cache_line_size();
-        publish_all_startups(&resources, contract, line).map_err(BootError::Preparation)?;
+        publish_all_startups(&shared, &resources, contract, line)
+            .map_err(BootError::Preparation)?;
         secondary_boot::begin_release(&BOOT_STATE)?;
         release_and_wait(required, contract, deadline, line)?;
         verify_all_parked(required)?;
@@ -500,10 +505,7 @@ fn validate_platform(
         return Err("active host translation differs from startup policy");
     }
 
-    let frequency: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack, preserves_flags));
-    }
+    let frequency = counter_frequency();
     let deadline = tvisor_util::secondary_boot::StartupDeadline::new(frequency, 2)
         .ok_or("invalid startup counter frequency")?;
     let counter_start = physical_counter();
@@ -527,7 +529,8 @@ fn validate_platform(
 fn prepare_all_cpus(
     required: u64,
     policy: tvisor_util::el2_policy::HostTranslation,
-) -> Result<[Option<StartupResources>; MAX_CPUS], &'static str> {
+    shared: &SharedStartupResources,
+) -> Result<[Option<CpuStartupResources>; MAX_CPUS], &'static str> {
     HOST_EL2_CONFIG.publish(policy)?;
     let config = HOST_EL2_CONFIG.get().ok_or("host config unavailable")?;
     let topology = crate::smp::topology().ok_or("missing topology")?;
@@ -540,7 +543,7 @@ fn prepare_all_cpus(
             .map_err(|_| "invalid target")?;
         crate::mm::map_firmware_release_cell(tvisor_util::system_info::PhysAddr::new(address))
             .map_err(|_| "release mapping failed")?;
-        *resource = Some(startup_resources(id, policy)?);
+        *resource = Some(cpu_startup_resources(id, shared)?);
         crate::pcpu::slot(id)
             .ok_or("missing slot")?
             .publish_startup(GENERATION, config)?;
@@ -548,12 +551,13 @@ fn prepare_all_cpus(
     Ok(resources)
 }
 fn validate_and_freeze(
-    resources: &[Option<StartupResources>; MAX_CPUS],
+    shared: &SharedStartupResources,
+    resources: &[Option<CpuStartupResources>; MAX_CPUS],
 ) -> Result<(), &'static str> {
     let stacks = crate::pcpu::prepared_stacks()?;
     crate::mm::validate_and_freeze_startups(|tables| {
         for resource in resources.iter().flatten() {
-            tvisor_util::startup_resources::validate_resources(tables, resource)?;
+            tvisor_util::startup_resources::validate_resources(tables, shared, resource)?;
         }
         tvisor_util::startup_resources::validate_stacks(tables, &stacks)?;
         Ok(())
@@ -568,40 +572,35 @@ fn cache_line_size() -> u64 {
     4u64 << ((ctr >> 16) & 15)
 }
 fn publish_all_startups(
-    resources: &[Option<StartupResources>; MAX_CPUS],
+    shared: &SharedStartupResources,
+    resources: &[Option<CpuStartupResources>; MAX_CPUS],
     contract: tvisor_util::secondary_entry::EntryContract,
     line: u64,
 ) -> Result<(), &'static str> {
     use tvisor_util::{
         secondary_hardware::publication_barrier,
-        startup_publication::{
-            publish_cpu_startup, publish_shared_startup, shared_regions, validate_publication,
-        },
+        startup_publication::{publish_cpu_startup, publish_shared_startup, validate_publication},
     };
     if boot_status() != BootStatus::Preparing || !crate::mm::startup_tables_frozen() {
         return Err("publication outside frozen preparation");
     }
     let topology = crate::smp::topology().ok_or("missing topology")?;
-    let shared = resources
-        .iter()
-        .flatten()
-        .next()
-        .ok_or("no startup resources")?;
+    if resources.iter().flatten().next().is_none() {
+        return Err("no startup resources");
+    }
     // Every identity and rounded cache range is checked before any maintenance.
-    // All members must name the same shared regions; slots and config are
+    // Every member uses this one shared description. Slots and config are
     // validated subregions of writable, so its single clean covers them too.
     for (id, resource) in resources.iter().enumerate() {
         let Some(resource) = resource else {
             continue;
         };
-        if shared_regions(resource) != shared_regions(shared) {
-            return Err("inconsistent shared startup regions");
-        }
         validate_publication(
             topology.cpus(),
             id,
             contract,
             startup(id, GENERATION).ok_or("missing startup")?,
+            shared,
             resource,
             line,
         )
@@ -682,11 +681,67 @@ pub fn ensure_guest_authorized() -> Result<(), BootError> {
     secondary_boot::guest_authorized(&BOOT_STATE, crate::pcpu::has_fatal())
 }
 
-fn startup_resources(
-    id: usize,
+fn shared_startup_resources(
     policy: tvisor_util::el2_policy::HostTranslation,
-) -> Result<tvisor_util::startup_resources::StartupResources, &'static str> {
-    use tvisor_util::{secondary_entry::validate_spin_table_target, system_info::PhysAddr};
+) -> Result<SharedStartupResources, &'static str> {
+    use tvisor_util::system_info::{PhysAddr, PhysRegion};
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+        static __vectors_start: u8;
+        static __vectors_end: u8;
+        static __rodata_start: u8;
+        static __rodata_end: u8;
+        static __writable_start: u8;
+        static __writable_end: u8;
+        static __el2_stage1_tables_start: u8;
+        static __el2_stage1_tables_end: u8;
+        fn __secondary_entry();
+    }
+    let image_start = core::ptr::addr_of!(__text_start) as u64;
+    let image_end = core::ptr::addr_of!(__writable_end) as u64;
+    let tables_start = core::ptr::addr_of!(__el2_stage1_tables_start) as u64;
+    let tables_end = core::ptr::addr_of!(__el2_stage1_tables_end) as u64;
+    let bounds = |start, end| {
+        PhysRegion::from_bounds(PhysAddr::new(start), PhysAddr::new(end))
+            .map_err(|_| "invalid startup region")
+    };
+    Ok(SharedStartupResources {
+        code: bounds(image_start, core::ptr::addr_of!(__text_end) as u64)?,
+        vectors: bounds(
+            core::ptr::addr_of!(__vectors_start) as u64,
+            core::ptr::addr_of!(__vectors_end) as u64,
+        )?,
+        rodata: bounds(
+            core::ptr::addr_of!(__rodata_start) as u64,
+            core::ptr::addr_of!(__rodata_end) as u64,
+        )?,
+        writable: bounds(core::ptr::addr_of!(__writable_start) as u64, image_end)?,
+        tables: bounds(tables_start, tables_end)?,
+        slots: PhysRegion::new(
+            PhysAddr::new(core::ptr::addr_of!(crate::pcpu::PCPU_SLOTS) as u64),
+            core::mem::size_of_val(&crate::pcpu::PCPU_SLOTS) as u64,
+        )
+        .map_err(|_| "invalid slot array region")?,
+        config: PhysRegion::new(
+            PhysAddr::new(core::ptr::addr_of!(HOST_EL2_CONFIG) as u64),
+            core::mem::size_of::<HostEl2ConfigStorage>() as u64,
+        )
+        .map_err(|_| "invalid shared host config region")?,
+        entry: __secondary_entry as *const () as u64,
+        root: policy.root(),
+    })
+}
+
+fn cpu_startup_resources(
+    id: usize,
+    shared: &SharedStartupResources,
+) -> Result<CpuStartupResources, &'static str> {
+    use tvisor_util::{
+        secondary_entry::validate_spin_table_target,
+        startup_resources::release_page,
+        system_info::{PhysAddr, PhysRegion},
+    };
     let topology = crate::smp::topology().ok_or("missing topology")?;
     let address =
         validate_spin_table_target(topology.cpus(), id).map_err(|_| "invalid release target")?;
@@ -710,66 +765,21 @@ fn startup_resources(
     {
         return Err("prepared secondary affinity differs from topology");
     }
-    unsafe extern "C" {
-        static __text_start: u8;
-        static __text_end: u8;
-        static __vectors_start: u8;
-        static __vectors_end: u8;
-        static __rodata_start: u8;
-        static __rodata_end: u8;
-        static __writable_start: u8;
-        static __writable_end: u8;
-        static __el2_stage1_tables_start: u8;
-        static __el2_stage1_tables_end: u8;
-        fn __secondary_entry();
-    }
-    let image_start = core::ptr::addr_of!(__text_start) as u64;
-    let image_end = core::ptr::addr_of!(__writable_end) as u64;
-    let tables_start = core::ptr::addr_of!(__el2_stage1_tables_start) as u64;
-    let tables_end = core::ptr::addr_of!(__el2_stage1_tables_end) as u64;
-    // Validate every cache-maintenance address while CPU 0 owns all mappings.
+    // Keep actual translation checks after this CPU's release-page mapping.
+    // They protect the active hardware regime independently of table validation.
     for (start, end) in [
-        (image_start, image_end),
-        (tables_start, tables_end),
+        (shared.code.start().value(), shared.writable.end().value()),
+        (shared.tables.start().value(), shared.tables.end().value()),
         (stack_bottom, stack_top),
     ] {
         validate_identity_range(start, end)?;
     }
-    use tvisor_util::{
-        startup_resources::{StartupResources, release_page},
-        system_info::PhysRegion,
-    };
-    let bounds = |start, end| {
-        PhysRegion::from_bounds(PhysAddr::new(start), PhysAddr::new(end))
-            .map_err(|_| "invalid startup region")
-    };
     let page = release_page(
         crate::boot::memory_map().ok_or("memory map unavailable")?,
         address,
     )
     .map_err(|_| "firmware release page ownership failed")?;
-    let resources = StartupResources {
-        code: bounds(image_start, core::ptr::addr_of!(__text_end) as u64)?,
-        vectors: bounds(
-            core::ptr::addr_of!(__vectors_start) as u64,
-            core::ptr::addr_of!(__vectors_end) as u64,
-        )?,
-        rodata: bounds(
-            core::ptr::addr_of!(__rodata_start) as u64,
-            core::ptr::addr_of!(__rodata_end) as u64,
-        )?,
-        writable: bounds(core::ptr::addr_of!(__writable_start) as u64, image_end)?,
-        tables: bounds(tables_start, tables_end)?,
-        slots: PhysRegion::new(
-            PhysAddr::new(core::ptr::addr_of!(crate::pcpu::PCPU_SLOTS) as u64),
-            core::mem::size_of_val(&crate::pcpu::PCPU_SLOTS) as u64,
-        )
-        .map_err(|_| "invalid slot array region")?,
-        config: PhysRegion::new(
-            PhysAddr::new(core::ptr::addr_of!(HOST_EL2_CONFIG) as u64),
-            core::mem::size_of::<HostEl2ConfigStorage>() as u64,
-        )
-        .map_err(|_| "invalid shared host config region")?,
+    let resources = CpuStartupResources {
         context: PhysRegion::new(
             PhysAddr::new(context),
             core::mem::size_of::<tvisor_util::pcpu::PcpuContext<()>>() as u64,
@@ -782,14 +792,11 @@ fn startup_resources(
                 .ok_or("invalid stack guard")?,
         )
         .map_err(|_| "invalid stack layout")?,
-        entry: __secondary_entry as *const () as u64,
-        root: policy.root(),
     };
     crate::smp::verify_unreleased_cell(PhysAddr::new(address))
         .map_err(|_| "release cell is not zero or identity mapped")?;
     Ok(resources)
 }
-
 fn validate_identity_range(start: u64, end: u64) -> Result<(), &'static str> {
     if start >= end || start & 4095 != 0 || end & 4095 != 0 {
         return Err("invalid startup mapping range");
@@ -806,12 +813,4 @@ fn validate_identity_range(start: u64, end: u64) -> Result<(), &'static str> {
         }
     }
     Ok(())
-}
-
-fn physical_counter() -> u64 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value
 }

@@ -284,10 +284,9 @@ extern "C" fn post_switch_page_tables(
                 Ok(())
             })
         };
-        if initialized.is_err() {
+        let Ok(memory_map) = initialized else {
             break 'wait;
-        }
-        let memory_map = memory_map().expect("published boot memory map");
+        };
         tvisor_util::diagnostic_println!(
             "Phase 11.0 DT firmware reservations verified before allocation; spin-table cells={}",
             startup.release_cells().len()

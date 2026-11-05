@@ -1,14 +1,15 @@
 //! Opt-in, bounded acceptance workloads. IRQs only admit a one-shot job;
 //! allocation, logging, barriers and management waits run in ordinary EL2 code.
 //! A failed job retains its allocations and state until reset.
-use crate::management::{counter, frequency, request, wait};
+use crate::management::{request, wait};
 use core::{
     alloc::Layout,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tvisor_util::{
+    aarch64_reg::{counter_frequency as frequency, physical_counter as counter},
     management::{Operation, Reply},
-    sync::{InterruptControl, LocalIrq},
+    sync::{InterruptControl, LocalIrq, RestoreIrq},
     system_info::PhysAddr,
 };
 const CPUS: usize = 4;
@@ -319,18 +320,14 @@ fn verify(phase: usize) -> Result<(), &'static str> {
     Ok(())
 }
 pub fn before_guest() -> Result<(), &'static str> {
-    let saved = LocalIrq::save_and_mask();
+    let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
     LocalIrq::restore(0);
-    let result = (|| {
-        start(0)?;
-        PHASES[0].jobs[0].state.store(2, Ordering::Release);
-        exercise(0, 0)?;
-        PHASES[0].jobs[0].state.store(3, Ordering::Release);
-        bounded(0, || done(0))?;
-        verify(0)
-    })();
-    LocalIrq::restore(saved);
-    result
+    start(0)?;
+    PHASES[0].jobs[0].state.store(2, Ordering::Release);
+    exercise(0, 0)?;
+    PHASES[0].jobs[0].state.store(3, Ordering::Release);
+    bounded(0, || done(0))?;
+    verify(0)
 }
 pub fn guest_progress() {
     if !GUEST_STARTED.swap(true, Ordering::AcqRel) {

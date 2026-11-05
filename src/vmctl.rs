@@ -1,18 +1,23 @@
 use crate::alloc::string::ToString;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use crate::guest::{self, GuestRunError};
 use crate::mm;
 use crate::vcpu::Vcpu;
 use alloc::vec::Vec;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use tvisor_util::aarch64_reg::*;
 use tvisor_util::el2_stage1_translation::*;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use tvisor_util::guest_fdt;
+use tvisor_util::guest_platform::DEFAULT_GUEST_RAM_SIZE;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use tvisor_util::guest_platform::{
-    self, DEFAULT_GUEST_RAM_SIZE, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ,
-    GUEST_RAM, VIRTUAL_PL011_IRQ,
+    self, GUEST_GICD, GUEST_GICV, GUEST_PL011, GUEST_PL011_CLOCK_HZ, GUEST_RAM, VIRTUAL_PL011_IRQ,
 };
 use tvisor_util::guest_stage2_translation::*;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use tvisor_util::linux_boot;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use tvisor_util::mmio;
 use tvisor_util::page_allocator::AllocatorError;
 use tvisor_util::*;
@@ -347,6 +352,9 @@ impl VmCtl {
         }
     }
 
+    // Hardware-facing entry points read architectural ID registers; hosted tests call
+    // the same mapper with an explicit physical-address width instead.
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     pub fn map(
         &mut self,
         usage: VmMemUsage,
@@ -354,25 +362,18 @@ impl VmCtl {
         access: GuestStage2Access,
         exec: GuestStage2Exec,
     ) -> Result<(), TranslationError> {
-        #[cfg(target_arch = "aarch64")]
         let pa_bits = IdAa64Mmfr0El1::dump()
             .ok_or(TranslationError::Unexpected)?
             .pa_bits()
             .ok_or(TranslationError::Unexpected)?;
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (usage, mem_type, access, exec);
-            return Err(TranslationError::Unexpected);
-        }
-
-        #[cfg(target_arch = "aarch64")]
         self.map_with_pa_bits(usage, mem_type, access, exec, pa_bits)
     }
 
     /// Maps a host-owned device page into a guest IPA without making it a VM
     /// allocation. This is only for explicitly selected virtualization
     /// hardware, such as the GICv2 virtual CPU interface.
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     pub fn map_external_device(
         &mut self,
         ipa: IpaAddr,
@@ -385,19 +386,11 @@ impl VmCtl {
         {
             return Err(TranslationError::UnalignedMapping);
         }
-        #[cfg(target_arch = "aarch64")]
         let pa_bits = IdAa64Mmfr0El1::dump()
             .ok_or(TranslationError::Unexpected)?
             .pa_bits()
             .ok_or(TranslationError::Unexpected)?;
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (ipa, pa, size);
-            return Err(TranslationError::Unexpected);
-        }
-
-        #[cfg(target_arch = "aarch64")]
         self.map_external_device_with_pa_bits(ipa, pa, size, pa_bits)
     }
 
@@ -768,6 +761,7 @@ impl VmCtl {
         self.vm_mem.clear();
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     pub fn run_linux_vm(
         &mut self,
         linux_image: PhysRegion,

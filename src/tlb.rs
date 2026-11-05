@@ -1,7 +1,7 @@
 //! Shared lifecycle/update gate and responsive worker parking.
 use tvisor_util::{
     management::{Operation, Reply},
-    sync::{InterruptControl, LocalIrq},
+    sync::{InterruptControl, LocalIrq, RestoreIrq},
     tlb_update::UpdateState,
 };
 pub static UPDATES: UpdateState = UpdateState::new();
@@ -16,16 +16,9 @@ pub use acceptance::timeout_acceptance;
 #[cfg(any(feature = "tlb-update-test", feature = "tlb-update-timeout-test"))]
 pub use acceptance::{owns, prepare, ready_to_write, worker};
 
-struct RestoreIrq(u64);
-impl Drop for RestoreIrq {
-    fn drop(&mut self) {
-        LocalIrq::restore(self.0);
-    }
-}
-
 pub fn park_workers() -> Result<(), &'static str> {
     let required = crate::secondary::required_mask();
-    let _restore = RestoreIrq(LocalIrq::save_and_mask());
+    let _restore = RestoreIrq::<LocalIrq>::save_and_mask();
     LocalIrq::restore(0);
     for id in 1..tvisor_util::cpu_topology::MAX_CPUS {
         if required & (1 << id) == 0 {

@@ -61,21 +61,23 @@ pub struct AllocatorStats {
 /// bit distinguishes allocator-controlled RAM from unavailable addresses. The
 /// latter include reserved RAM, MMIO, firmware carve-outs, and unpopulated
 /// space; their semantic classification remains in `MemoryMap`. A managed
-/// page is InUse or Unused according to the second bitmap.
-pub struct PageAllocator<'a, const BITMAP_BYTES: usize> {
+/// page is InUse or Unused according to the second bitmap. The allocator owns
+/// its storage; callers provide synchronization when sharing it across CPUs.
+pub struct PageAllocator<const BITMAP_BYTES: usize> {
     /// Bitmap covering every page in the complete physical-address aperture,
     /// including RAM, MMIO, and unpopulated addresses. A set bit identifies
     /// RAM that the allocator is permitted to manage. A clear bit identifies
     /// reserved RAM, MMIO, or an unpopulated address and is not an
     /// allocator-managed page.
-    managed: &'a mut PageBitmap<BITMAP_BYTES>,
+    managed: PageBitmap<BITMAP_BYTES>,
     /// Allocation-state bitmap for pages selected by `managed`. A set bit
     /// means `InUse`, while a clear bit means `Unused`; bits for unavailable
     /// pages are ignored.
-    in_use: &'a mut PageBitmap<BITMAP_BYTES>,
+    in_use: PageBitmap<BITMAP_BYTES>,
     /// Total number of RAM-backed pages described by the system information,
     /// including reserved firmware carve-outs.
     ram_pages: usize,
+    initialized: bool,
 }
 
 /// A bitmap and its cached set-bit count.
@@ -83,7 +85,7 @@ pub struct PageAllocator<'a, const BITMAP_BYTES: usize> {
 /// Raw bitmap storage is private so every bit change passes through
 /// `set_bit()`, which updates `set_pages` in the same operation. This preserves
 /// `set_pages == popcount(bits)` while the allocator has exclusive access.
-pub struct PageBitmap<const BYTES: usize> {
+struct PageBitmap<const BYTES: usize> {
     /// Packed page-state bits covering the configured physical aperture.
     bits: [u8; BYTES],
     /// Cached number of set bits in `bits`.
@@ -91,7 +93,7 @@ pub struct PageBitmap<const BYTES: usize> {
 }
 
 impl<const BYTES: usize> PageBitmap<BYTES> {
-    pub const fn zeroed() -> Self {
+    const fn zeroed() -> Self {
         Self {
             bits: [0; BYTES],
             set_pages: 0,
@@ -99,12 +101,12 @@ impl<const BYTES: usize> PageBitmap<BYTES> {
     }
 
     /// Return whether the bit for `index` is set.
-    pub fn is_set(&self, index: usize) -> bool {
+    fn is_set(&self, index: usize) -> bool {
         bit_is_set(&self.bits, index)
     }
 
     /// Return the cached number of set bits.
-    pub const fn pages(&self) -> usize {
+    const fn pages(&self) -> usize {
         self.set_pages
     }
 
@@ -127,50 +129,55 @@ impl<const BYTES: usize> PageBitmap<BYTES> {
     }
 }
 
-impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
-    pub fn new<const R: usize, const A: usize, const U: usize>(
+impl<const BITMAP_BYTES: usize> PageAllocator<BITMAP_BYTES> {
+    /// Construct static storage at compile time. Initialize large allocators
+    /// in place rather than constructing a replacement on a runtime stack.
+    pub const fn uninitialized() -> Self {
+        Self {
+            managed: PageBitmap::zeroed(),
+            in_use: PageBitmap::zeroed(),
+            ram_pages: 0,
+            initialized: false,
+        }
+    }
+
+    pub const fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Populate the owned bitmaps in place. A failed attempt stays unavailable
+    /// and can be retried; a successful initialization cannot be repeated.
+    pub fn initialize<const R: usize, const A: usize, const U: usize>(
+        &mut self,
         ram: &FixedList<PhysRegion, R>,
         allocatable: &FixedList<PhysRegion, A>,
         initially_unused: &FixedList<PhysRegion, U>,
-        managed: &'a mut PageBitmap<BITMAP_BYTES>,
-        in_use: &'a mut PageBitmap<BITMAP_BYTES>,
-    ) -> Result<Self, AllocatorError> {
-        validate_bitmaps(managed, in_use)?;
-        managed.clear();
-        in_use.clear();
-        let ram_pages = count_pages(ram)?;
-        let mut allocator = Self {
-            managed,
-            in_use,
-            ram_pages,
-        };
+    ) -> Result<(), AllocatorError> {
+        if self.initialized {
+            // Preserve the global allocator's existing repeated-init error.
+            return Err(AllocatorError::DoubleFree);
+        }
+        if BITMAP_BYTES == 0 {
+            return Err(AllocatorError::PhysicalAddressOutOfRange);
+        }
+        self.managed.clear();
+        self.in_use.clear();
+        self.ram_pages = count_pages(ram)?;
         for region in allocatable {
-            allocator.mark_managed(*region)?;
+            self.mark_managed(*region)?;
         }
-        allocator.mark_all_managed_in_use();
+        self.mark_all_managed_in_use();
         for region in initially_unused {
-            allocator.release(*region)?;
+            self.release_managed(*region)?;
         }
-        Ok(allocator)
-    }
-
-    pub fn from_existing(
-        managed: &'a mut PageBitmap<BITMAP_BYTES>,
-        in_use: &'a mut PageBitmap<BITMAP_BYTES>,
-        ram_pages: usize,
-    ) -> Result<Self, AllocatorError> {
-        validate_bitmaps(managed, in_use)?;
-        if ram_pages > BITMAP_BYTES * 8
-            || managed.pages() > ram_pages
-            || in_use.pages() > managed.pages()
+        if self.ram_pages > BITMAP_BYTES * 8
+            || self.managed.pages() > self.ram_pages
+            || self.in_use.pages() > self.managed.pages()
         {
             return Err(AllocatorError::AddressOverflow);
         }
-        Ok(Self {
-            managed,
-            in_use,
-            ram_pages,
-        })
+        self.initialized = true;
+        Ok(())
     }
 
     pub fn allocate(&mut self) -> Result<PhysAddr, AllocatorError> {
@@ -179,6 +186,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
 
     /// Allocate the highest-addressed currently unused managed page.
     pub fn allocate_high(&mut self) -> Result<PhysAddr, AllocatorError> {
+        self.ensure_initialized()?;
         for index in (0..BITMAP_BYTES * 8).rev() {
             if self.managed.is_set(index) && !self.in_use.is_set(index) {
                 self.in_use.set_bit(index, true);
@@ -189,6 +197,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     pub fn allocate_contiguous(&mut self, pages: usize) -> Result<PhysAddr, AllocatorError> {
+        self.ensure_initialized()?;
         if pages == 0 {
             return Err(AllocatorError::Exhausted);
         }
@@ -213,6 +222,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     pub fn allocate_in(&mut self, requested: PhysRegion) -> Result<PhysAddr, AllocatorError> {
+        self.ensure_initialized()?;
         let start = align_up(requested.start().value() as usize, PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
         let end = align_down(requested.end().value() as usize, PAGE_SIZE)
@@ -246,6 +256,11 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
 
     /// Change managed pages fully covered by `region` to Unused.
     pub fn release(&mut self, region: PhysRegion) -> Result<usize, AllocatorError> {
+        self.ensure_initialized()?;
+        self.release_managed(region)
+    }
+
+    fn release_managed(&mut self, region: PhysRegion) -> Result<usize, AllocatorError> {
         let start = align_up(region.start().value() as usize, PAGE_SIZE)
             .ok_or(AllocatorError::AddressOverflow)?;
         let end = align_down(region.end().value() as usize, PAGE_SIZE)
@@ -267,6 +282,7 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 
     pub fn state(&self, page: PhysAddr) -> Result<PageState, AllocatorError> {
+        self.ensure_initialized()?;
         if !is_page_aligned(page.value() as usize) {
             return Err(AllocatorError::UnalignedPage);
         }
@@ -280,12 +296,21 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
         }
     }
 
-    pub const fn stats(&self) -> AllocatorStats {
-        AllocatorStats {
+    pub fn stats(&self) -> Result<AllocatorStats, AllocatorError> {
+        self.ensure_initialized()?;
+        Ok(AllocatorStats {
             ram_pages: self.ram_pages,
             reserved_pages: self.ram_pages - self.managed.pages(),
             in_use_pages: self.in_use.pages(),
             unused_pages: self.managed.pages() - self.in_use.pages(),
+        })
+    }
+
+    fn ensure_initialized(&self) -> Result<(), AllocatorError> {
+        if self.initialized {
+            Ok(())
+        } else {
+            Err(AllocatorError::NotInitialized)
         }
     }
 
@@ -330,17 +355,6 @@ impl<'a, const BITMAP_BYTES: usize> PageAllocator<'a, BITMAP_BYTES> {
     }
 }
 
-fn validate_bitmaps<const BYTES: usize>(
-    _managed: &PageBitmap<BYTES>,
-    _in_use: &PageBitmap<BYTES>,
-) -> Result<(), AllocatorError> {
-    if BYTES == 0 {
-        Err(AllocatorError::PhysicalAddressOutOfRange)
-    } else {
-        Ok(())
-    }
-}
-
 fn count_pages<const N: usize>(
     regions: &FixedList<PhysRegion, N>,
 ) -> Result<usize, AllocatorError> {
@@ -382,6 +396,103 @@ mod tests {
     }
 
     #[test]
+    fn uninitialized_allocator_rejects_every_page_operation() {
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        let page = PhysAddr::new(0);
+        assert!(!allocator.is_initialized());
+        assert_eq!(allocator.allocate(), Err(AllocatorError::NotInitialized));
+        assert_eq!(
+            allocator.allocate_high(),
+            Err(AllocatorError::NotInitialized)
+        );
+        assert_eq!(
+            allocator.allocate_contiguous(0),
+            Err(AllocatorError::NotInitialized)
+        );
+        assert_eq!(
+            allocator.allocate_in(region(0, 4096)),
+            Err(AllocatorError::NotInitialized)
+        );
+        assert_eq!(allocator.free(page), Err(AllocatorError::NotInitialized));
+        assert_eq!(
+            allocator.release(region(0, 4096)),
+            Err(AllocatorError::NotInitialized)
+        );
+        assert_eq!(allocator.state(page), Err(AllocatorError::NotInitialized));
+        assert_eq!(allocator.stats(), Err(AllocatorError::NotInitialized));
+    }
+
+    #[test]
+    fn failed_initialization_stays_unavailable_and_retry_clears_partial_state() {
+        let mut ram = FixedList::<_, 1>::new();
+        ram.push(region(0, 0x8000)).unwrap();
+        let mut invalid = FixedList::<_, 2>::new();
+        invalid.push(region(0, 0x2000)).unwrap();
+        invalid.push(region(0x8000, 0x1000)).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        assert_eq!(
+            allocator.initialize(&ram, &invalid, &ram),
+            Err(AllocatorError::PhysicalAddressOutOfRange)
+        );
+        assert!(!allocator.is_initialized());
+        assert_eq!(allocator.allocate(), Err(AllocatorError::NotInitialized));
+        assert_eq!(allocator.stats(), Err(AllocatorError::NotInitialized));
+
+        let mut usable = FixedList::<_, 1>::new();
+        usable.push(region(0x4000, 0x1000)).unwrap();
+        allocator.initialize(&ram, &usable, &usable).unwrap();
+        assert_eq!(allocator.state(PhysAddr::new(0)), Ok(PageState::Reserved));
+        assert_eq!(allocator.stats().unwrap().unused_pages, 1);
+        assert_eq!(allocator.allocate(), Ok(PhysAddr::new(0x4000)));
+        assert_eq!(allocator.allocate(), Err(AllocatorError::Exhausted));
+    }
+
+    #[test]
+    fn repeated_initialization_preserves_live_allocations() {
+        let mut ram = FixedList::<_, 1>::new();
+        ram.push(region(0, 0x8000)).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &ram, &ram).unwrap();
+        let page = allocator.allocate().unwrap();
+        let before = allocator.stats().unwrap();
+        assert_eq!(
+            allocator.initialize(&ram, &ram, &ram),
+            Err(AllocatorError::DoubleFree)
+        );
+        assert!(allocator.is_initialized());
+        assert_eq!(allocator.stats().unwrap(), before);
+        assert_eq!(allocator.state(page), Ok(PageState::InUse));
+        assert_eq!(allocator.allocate(), Ok(PhysAddr::new(4096)));
+    }
+
+    #[test]
+    fn invalid_capacity_and_counts_cannot_publish_an_allocator() {
+        let mut ram = FixedList::<_, 1>::new();
+        ram.push(region(0, 0x9000)).unwrap();
+        let empty = FixedList::<PhysRegion, 0>::new();
+        let mut zero = PageAllocator::<0>::uninitialized();
+        assert_eq!(
+            zero.initialize(&ram, &empty, &empty),
+            Err(AllocatorError::PhysicalAddressOutOfRange)
+        );
+        assert_eq!(zero.stats(), Err(AllocatorError::NotInitialized));
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        assert_eq!(
+            allocator.initialize(&ram, &empty, &empty),
+            Err(AllocatorError::AddressOverflow)
+        );
+        assert_eq!(allocator.stats(), Err(AllocatorError::NotInitialized));
+
+        let mut usable = FixedList::<_, 1>::new();
+        usable.push(region(0, 4096)).unwrap();
+        assert_eq!(
+            allocator.initialize(&empty, &usable, &usable),
+            Err(AllocatorError::AddressOverflow)
+        );
+        assert_eq!(allocator.stats(), Err(AllocatorError::NotInitialized));
+    }
+
+    #[test]
     fn counted_bitmap_keeps_set_page_count_consistent() {
         let mut bitmap = PageBitmap::<1>::zeroed();
         assert!(!bitmap.is_set(3));
@@ -407,9 +518,8 @@ mod tests {
         allocatable.push(region(0x2000, 0x4000)).unwrap();
         let mut unused = FixedList::<_, 1>::new();
         unused.push(region(0x2000, 0x2000)).unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let allocator =
-            PageAllocator::new(&ram, &allocatable, &unused, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &allocatable, &unused).unwrap();
 
         assert_eq!(allocator.state(PhysAddr::new(0)), Ok(PageState::Reserved));
         assert_eq!(
@@ -422,7 +532,7 @@ mod tests {
         );
         assert_eq!(allocator.state(PhysAddr::new(0x4000)), Ok(PageState::InUse));
         assert_eq!(
-            allocator.stats(),
+            allocator.stats().unwrap(),
             AllocatorStats {
                 ram_pages: 5,
                 reserved_pages: 1,
@@ -440,9 +550,8 @@ mod tests {
         allocatable.push(region(0x1000, 0x2000)).unwrap();
         allocatable.push(region(0x4000, 0x3000)).unwrap();
         let unused = allocatable;
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &allocatable, &unused, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &allocatable, &unused).unwrap();
 
         assert_eq!(allocator.allocate_contiguous(3), Ok(PhysAddr::new(0x4000)));
         assert_eq!(allocator.allocate_contiguous(2), Ok(PhysAddr::new(0x1000)));
@@ -457,9 +566,8 @@ mod tests {
         allocatable.push(region(0x1000, 0x2000)).unwrap();
         allocatable.push(region(0x5000, 0x2000)).unwrap();
         let unused = allocatable;
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &allocatable, &unused, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &allocatable, &unused).unwrap();
 
         assert_eq!(allocator.allocate_high(), Ok(PhysAddr::new(0x6000)));
         assert_eq!(allocator.allocate_high(), Ok(PhysAddr::new(0x5000)));
@@ -471,15 +579,10 @@ mod tests {
         ram.push(region(0x1000, 0x5000)).unwrap();
         let mut allocatable = FixedList::<_, 1>::new();
         allocatable.push(region(0x2000, 0x4000)).unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let mut allocator = PageAllocator::new(
-            &ram,
-            &allocatable,
-            &FixedList::<PhysRegion, 0>::new(),
-            &mut managed,
-            &mut in_use,
-        )
-        .unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator
+            .initialize(&ram, &allocatable, &FixedList::<PhysRegion, 0>::new())
+            .unwrap();
 
         assert_eq!(allocator.release(region(0x1000, 0x3000)), Ok(2));
         assert_eq!(
@@ -501,9 +604,8 @@ mod tests {
         allocatable.push(region(0x2000, 0x2000)).unwrap();
         let mut unused = FixedList::<_, 1>::new();
         unused.push(region(0x2000, 0x1000)).unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let mut allocator =
-            PageAllocator::new(&ram, &allocatable, &unused, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &allocatable, &unused).unwrap();
 
         assert_eq!(
             allocator.free(PhysAddr::new(0x2001)),
@@ -524,8 +626,8 @@ mod tests {
     fn rejects_addresses_outside_bitmap_aperture() {
         let mut ram = FixedList::<_, 1>::new();
         ram.push(region(0, 0x1000)).unwrap();
-        let (mut managed, mut in_use) = (PageBitmap::<1>::zeroed(), PageBitmap::<1>::zeroed());
-        let allocator = PageAllocator::new(&ram, &ram, &ram, &mut managed, &mut in_use).unwrap();
+        let mut allocator = PageAllocator::<1>::uninitialized();
+        allocator.initialize(&ram, &ram, &ram).unwrap();
         assert_eq!(
             allocator.state(PhysAddr::new(0x8000)),
             Err(AllocatorError::PhysicalAddressOutOfRange)
