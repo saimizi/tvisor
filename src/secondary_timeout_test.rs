@@ -92,7 +92,8 @@ pub(super) fn observe_terminal_failure() {
     );
     let retained = startup(TEST_CPU, 1)
         .is_some_and(|again| record.slot_address() == again.slot_address())
-        && crate::pcpu::validate_secondary_context(
+        && tvisor_util::pcpu::validate_secondary_context(
+            &crate::pcpu::PCPU_SLOTS,
             record.identity.logical_id,
             record.identity.affinity,
             record.identity.stack_bottom,

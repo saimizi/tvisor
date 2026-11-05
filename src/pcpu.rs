@@ -152,42 +152,6 @@ pub fn prepared_stacks()
     Ok(result)
 }
 
-/// Called by a secondary only after establishing its published TPIDR and
-/// crossing the coherent Rust boundary. The slot is private to that CPU.
-pub fn validate_secondary_context(
-    id: u64,
-    affinity: u64,
-    bottom: u64,
-    top: u64,
-    pointer: u64,
-) -> bool {
-    let Ok(index) = usize::try_from(id) else {
-        return false;
-    };
-    let Some(slot) = PCPU_SLOTS.get(index) else {
-        return false;
-    };
-    if index == 0 || slot.context_ptr() as u64 != pointer || !slot.is_prepared() {
-        return false;
-    }
-    let Some(identity) = slot.identity() else {
-        return false;
-    };
-    // Only immutable identity fields are shared. During Phase 11.3 the selected
-    // secondary never runs a guest or writes host_sp/active_vcpu. The owner calls
-    // here before arrival, or CPU0 after acquiring Parked; no whole-context borrow.
-    identity.logical_id == id
-        && identity.affinity == affinity
-        && identity.stack_bottom == bottom
-        && identity.stack_top == top
-        && unsafe {
-            core::ptr::addr_of!((*slot.context_ptr()).host_sp).read() == 0
-                && core::ptr::addr_of!((*slot.context_ptr()).active_vcpu)
-                    .read()
-                    .is_null()
-        }
-}
-
 /// Called only outside a world switch on its owning boot CPU. No references
 /// to mutable CPU context persist across guest entry/exit or exception entry.
 pub fn assert_boot_cpu_idle() {

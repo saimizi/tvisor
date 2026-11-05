@@ -29,6 +29,13 @@ generation and shared EL2 configuration. Neither is persistent duplicate storage
 Shared readers must not borrow the whole context while its CPU can write the
 world-switch fields. Physical contexts do not own VM allocations or vCPU lifetime.
 
+The shared CPU utility validates secondary contexts against the caller's fixed
+slot array. Both coherent entry and the boot CPU's acquired Parked check use
+this same host-tested path: the selected slot must be prepared, its pointer and
+immutable identity/stack bounds must match, and its world-switch fields must
+remain idle. The check reads individual fields rather than borrowing the whole
+context. It does not grant publication, release or guest-execution permission.
+
 Each CPU has a 64 KiB downward-growing stack and a 4 KiB unmapped lower guard.
 CPU0's stack is linker-owned. Enabled secondary stacks are exclusive physical
 allocations, mapped Normal RW/NX and zeroed before context publication.

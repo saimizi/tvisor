@@ -382,7 +382,8 @@ extern "C" fn secondary_main(
     unsafe extern "C" {
         static __el2_vectors: u8;
     }
-    let context_valid = crate::pcpu::validate_secondary_context(
+    let context_valid = tvisor_util::pcpu::validate_secondary_context(
+        &crate::pcpu::PCPU_SLOTS,
         record.identity.logical_id,
         record.identity.affinity,
         record.identity.stack_bottom,

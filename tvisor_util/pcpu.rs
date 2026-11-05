@@ -146,6 +146,46 @@ const _: () = {
     assert!(core::mem::offset_of!(PcpuContext<()>, present) == 48);
 };
 
+/// Called by a secondary only after establishing its published TPIDR and
+/// crossing the coherent Rust boundary, or by the boot CPU after acquiring
+/// Parked. The selected worker must remain host-only: no world-switch writer
+/// may modify host_sp/active_vcpu during this check. The caller owns the fixed
+/// slot array; this function owns its context/identity validation.
+pub fn validate_secondary_context<V>(
+    slots: &[PcpuSlot<V>; MAX_CPUS],
+    id: u64,
+    affinity: u64,
+    bottom: u64,
+    top: u64,
+    pointer: u64,
+) -> bool {
+    let Ok(index) = usize::try_from(id) else {
+        return false;
+    };
+    let Some(slot) = slots.get(index) else {
+        return false;
+    };
+    if index == 0 || slot.context_ptr() as u64 != pointer || !slot.is_prepared() {
+        return false;
+    }
+    let Some(identity) = slot.identity() else {
+        return false;
+    };
+    // Only immutable identity fields are shared. The owner calls here before
+    // arrival, or the boot CPU after acquiring Parked. These host-only workers
+    // never write world-switch fields; no whole-context reference is formed.
+    identity.logical_id == id
+        && identity.affinity == affinity
+        && identity.stack_bottom == bottom
+        && identity.stack_top == top
+        && unsafe {
+            core::ptr::addr_of!((*slot.context_ptr()).host_sp).read() == 0
+                && core::ptr::addr_of!((*slot.context_ptr()).active_vcpu)
+                    .read()
+                    .is_null()
+        }
+}
+
 /// Bounded lookup over immutable prepared identities, mirroring entry assembly.
 /// Full affinities may be sparse; duplicate matches are never routed arbitrarily.
 pub fn find_slot_by_affinity<V>(slots: &[PcpuSlot<V>], mpidr: u64) -> Option<&PcpuSlot<V>> {
@@ -299,17 +339,6 @@ pub struct PcpuContext<V> {
 }
 impl<V> PcpuContext<V> {
     /// Owner-CPU validation only: never borrow another CPU's mutable context.
-    pub fn matches_secondary(&self, id: u64, affinity: u64, bottom: u64, top: u64) -> bool {
-        id > 0
-            && id < MAX_CPUS as u64
-            && self.present == 1
-            && self.logical_id == id
-            && self.affinity == affinity
-            && self.stack_bottom == bottom
-            && self.stack_top == top
-            && self.host_sp == 0
-            && self.active_vcpu.is_null()
-    }
     pub const fn empty() -> Self {
         Self {
             host_sp: 0,
@@ -333,30 +362,97 @@ mod tests {
     use crate::el2_stage1_translation::TableStorage;
     #[test]
     fn secondary_context_validation_rejects_identity_and_guest_ownership_mismatches() {
-        for fault in 0..9 {
-            let mut c = PcpuContext::<()>::empty();
-            c.present = 1;
-            c.logical_id = 1;
-            c.affinity = 0x100;
-            c.stack_bottom = 0x800000;
-            c.stack_top = 0x810000;
+        for fault in 0..8 {
+            let slots = [const { PcpuSlot::<()>::new() }; MAX_CPUS];
+            slots[1]
+                .prepare(1, 0x100, stack_layout(0x7ff000).unwrap())
+                .unwrap();
+            let mut id = 1;
+            let mut affinity = 0x100;
+            let mut bottom = 0x800000;
+            let mut top = 0x810000;
+            let context = slots[1].context_ptr();
             match fault {
-                1 => c.present = 0,
-                2 => c.logical_id = 0,
-                3 => c.affinity = 1,
-                4 => c.stack_bottom += 4096,
-                5 => c.stack_top += 4096,
-                6 => c.host_sp = 0x80ff00,
-                7 => c.active_vcpu = core::ptr::dangling_mut(),
-                8 => c.logical_id = MAX_CPUS as u64,
+                1 => id = 0,
+                2 => affinity = 1,
+                3 => bottom += 4096,
+                4 => top += 4096,
+                // SAFETY: this test exclusively owns the prepared slot. These
+                // writes model owner state without a concurrent world switch.
+                5 => unsafe { core::ptr::addr_of_mut!((*context).host_sp).write(0x80ff00) },
+                6 => unsafe {
+                    core::ptr::addr_of_mut!((*context).active_vcpu).write(core::ptr::dangling_mut())
+                },
+                7 => id = MAX_CPUS as u64,
                 _ => {}
             }
             assert_eq!(
-                c.matches_secondary(1, 0x100, 0x800000, 0x810000),
-                fault == 0
+                validate_secondary_context(&slots, id, affinity, bottom, top, context as u64),
+                fault == 0,
+                "fault {fault}"
             );
         }
     }
+
+    #[test]
+    fn secondary_context_validation_requires_the_selected_prepared_slot() {
+        let slots = [const { PcpuSlot::<()>::new() }; MAX_CPUS];
+        let pointer = slots[1].context_ptr() as u64;
+        assert!(!validate_secondary_context(
+            &slots, 1, 0x100, 0x800000, 0x810000, pointer
+        ));
+        slots[1]
+            .prepare(1, 0x100, stack_layout(0x7ff000).unwrap())
+            .unwrap();
+        slots[2]
+            .prepare(2, 0x100, stack_layout(0x7ff000).unwrap())
+            .unwrap();
+        for pointer in [
+            0,
+            pointer + 64,
+            slots[0].context_ptr() as u64,
+            slots[2].context_ptr() as u64,
+        ] {
+            assert!(!validate_secondary_context(
+                &slots, 1, 0x100, 0x800000, 0x810000, pointer
+            ));
+        }
+        assert!(validate_secondary_context(
+            &slots,
+            1,
+            0x100,
+            0x800000,
+            0x810000,
+            slots[1].context_ptr() as u64
+        ));
+        assert!(!validate_secondary_context(
+            &slots,
+            u64::MAX,
+            0x100,
+            0x800000,
+            0x810000,
+            slots[1].context_ptr() as u64
+        ));
+    }
+
+    #[test]
+    fn secondary_context_validation_checks_the_published_logical_id() {
+        let slots = [const { PcpuSlot::<()>::new() }; MAX_CPUS];
+        // The slot's published ID must match its position in the fixed array,
+        // even when all supplied stack/affinity/pointer values otherwise match.
+        slots[1]
+            .prepare(2, 0x100, stack_layout(0x7ff000).unwrap())
+            .unwrap();
+        assert!(!validate_secondary_context(
+            &slots,
+            1,
+            0x100,
+            0x800000,
+            0x810000,
+            slots[1].context_ptr() as u64
+        ));
+    }
+
     #[test]
     fn guarded_stack_layout_checks_alignment_and_overflow() {
         for base in [0, 0x4100000, 0x8000000] {
