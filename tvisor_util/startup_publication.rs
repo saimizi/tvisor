@@ -7,7 +7,7 @@ use crate::{
     secondary_hardware::*,
     secondary_mailbox::CpuState,
     secondary_startup::StartupView,
-    startup_resources::StartupResources,
+    startup_resources::{CpuStartupResources, SharedStartupResources},
     system_info::{PhysAddr, PhysRegion},
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -44,7 +44,7 @@ pub unsafe fn clean_range(start: u64, end: u64, line: u64) -> Result<(), Publica
     Ok(())
 }
 /// Slots and shared config are contained in writable, validated before release.
-pub fn shared_regions(r: &StartupResources) -> [PhysRegion; 5] {
+pub fn shared_regions(r: &SharedStartupResources) -> [PhysRegion; 5] {
     [r.code, r.vectors, r.rodata, r.writable, r.tables]
 }
 pub fn validate_publication(
@@ -52,7 +52,8 @@ pub fn validate_publication(
     id: usize,
     contract: EntryContract,
     record: StartupView<'_>,
-    r: &StartupResources,
+    shared: &SharedStartupResources,
+    r: &CpuStartupResources,
     line: u64,
 ) -> Result<(), PublicationError> {
     let cell = validate_spin_table_release(cpus, id, contract)
@@ -71,25 +72,25 @@ pub fn validate_publication(
         .is_ok_and(|p| p.tcr() == record.config.tcr)
         || record.slot_address() != r.context.start().value()
         || record.slot_address()
-            != r.slots.start().value()
+            != shared.slots.start().value()
                 + id as u64 * core::mem::size_of::<crate::pcpu::PcpuSlot<()>>() as u64
-        || record.config_address() != r.config.start().value()
+        || record.config_address() != shared.config.start().value()
         || record.identity.logical_id != id as u64
         || record.identity.affinity != cpu.affinity
         || !record.mailbox.observe_ready(record.generation)
         || record.identity.context != record.slot_address()
-        || record.config.root != r.root
+        || record.config.root != shared.root
         || record.identity.stack_bottom != r.stack.bottom
         || record.identity.stack_top != r.stack.top
-        || r.entry & 3 != 0
-        || !r.code.contains_address(PhysAddr::new(r.entry))
+        || shared.entry & 3 != 0
+        || !shared.code.contains_address(PhysAddr::new(shared.entry))
         || !r.release_page.contains_region(
             PhysRegion::new(PhysAddr::new(cell), 8).map_err(|_| PublicationError::Overflow)?,
         )
     {
         return Err(PublicationError::Preconditions);
     }
-    for region in shared_regions(r).into_iter().chain([
+    for region in shared_regions(shared).into_iter().chain([
         PhysRegion::from_bounds(PhysAddr::new(r.stack.bottom), PhysAddr::new(r.stack.top))
             .map_err(|_| PublicationError::Preconditions)?,
         r.release_page,
@@ -104,7 +105,7 @@ pub fn validate_publication(
 /// any release. No overlapping slot/config cleans are needed: writable covers
 /// both, and that containment is independently validated here.
 pub unsafe fn publish_shared_startup(
-    r: &StartupResources,
+    r: &SharedStartupResources,
     line: u64,
 ) -> Result<(), PublicationError> {
     if !r.writable.contains_region(r.slots) || !r.writable.contains_region(r.config) {
@@ -254,28 +255,37 @@ mod tests {
             },
         })
     }
-    fn resources_for(r: StartupView<'_>, id: usize, cell: u64) -> StartupResources {
+    fn shared_resources_for(r: StartupView<'_>, id: usize) -> SharedStartupResources {
         let slots = region(r.slot_address() - id as u64 * 384, 4 * 384);
         let config = region(r.config_address(), 128);
         let start = slots.start().value().min(config.start().value()) & !4095;
         let end = (slots.end().value().max(config.end().value()) + 4095) & !4095;
-        StartupResources {
+        SharedStartupResources {
             code: region(0x100000, 4096),
             vectors: region(0x101000, 4096),
             rodata: region(0x102000, 4096),
             writable: region(start, end - start),
             tables: region(0x800000, 16 * 4096),
             slots,
-            context: region(r.slot_address(), 64),
             config,
-            release_page: region(cell & !4095, 4096),
-            stack: crate::pcpu::stack_layout(r.identity.stack_bottom - 4096).unwrap(),
             entry: 0x100000,
             root: 0x800000,
         }
     }
-    fn resources(f: &Fixture, id: usize, cell: u64) -> StartupResources {
-        resources_for(f.get(7).unwrap(), id, cell)
+    fn cpu_resources_for(r: StartupView<'_>, cell: u64) -> CpuStartupResources {
+        CpuStartupResources {
+            context: region(r.slot_address(), 64),
+            release_page: region(cell & !4095, 4096),
+            stack: crate::pcpu::stack_layout(r.identity.stack_bottom - 4096).unwrap(),
+        }
+    }
+    fn resources(
+        f: &Fixture,
+        id: usize,
+        cell: u64,
+    ) -> (SharedStartupResources, CpuStartupResources) {
+        let r = f.get(7).unwrap();
+        (shared_resources_for(r, id), cpu_resources_for(r, cell))
     }
     fn cleans(region: PhysRegion) -> std::vec::Vec<Event> {
         let (start, end) = cache_range(region.start().value(), region.end().value(), 64).unwrap();
@@ -334,17 +344,34 @@ mod tests {
                     .unwrap();
                 slots[id].publish_startup(7, config).unwrap();
             }
-            let resources: [Option<StartupResources>; 4] = core::array::from_fn(|id| {
+            let shared = shared_resources_for(slots[1].startup_view(7, config).unwrap(), 1);
+            let resources: [Option<CpuStartupResources>; 4] = core::array::from_fn(|id| {
                 if id == 0 {
                     None
                 } else {
-                    Some(resources_for(
+                    Some(cpu_resources_for(
                         slots[id].startup_view(7, config).unwrap(),
-                        id,
                         cell + (id as u64 - 1) * 8,
                     ))
                 }
             });
+            // A bad later member must fail preflight after the earlier valid
+            // member without issuing any cache maintenance or release I/O.
+            let mut bad = resources;
+            bad[2].as_mut().unwrap().context = region(0, 64);
+            let result = (1..4).try_for_each(|id| {
+                validate_publication(
+                    &cpus,
+                    id,
+                    contract(),
+                    slots[id].startup_view(7, config).unwrap(),
+                    &shared,
+                    bad[id].as_ref().unwrap(),
+                    64,
+                )
+            });
+            assert_eq!(result, Err(PublicationError::Preconditions));
+            assert!(IO.with(|io| io.borrow().events.is_empty()));
             // Check the complete set before starting any maintenance.
             for id in 1..4 {
                 validate_publication(
@@ -352,21 +379,21 @@ mod tests {
                     id,
                     contract(),
                     slots[id].startup_view(7, config).unwrap(),
+                    &shared,
                     resources[id].as_ref().unwrap(),
                     64,
                 )
                 .unwrap();
             }
-            let shared = resources[1].as_ref().unwrap();
             unsafe {
-                publish_shared_startup(shared, 64).unwrap();
+                publish_shared_startup(&shared, 64).unwrap();
                 for r in resources.iter().flatten() {
                     publish_cpu_startup(r.stack, 64).unwrap();
                 }
                 publication_barrier().unwrap();
             }
             let mut expected = std::vec::Vec::new();
-            for region in shared_regions(shared) {
+            for region in shared_regions(&shared) {
                 expected.extend(cleans(region));
             }
             for r in resources.iter().flatten() {
@@ -436,8 +463,8 @@ mod tests {
     #[test]
     fn every_publication_failure_prevents_release_and_is_terminal() {
         let f = fixture(1);
-        let r = resources(&f, 1, 0xe0);
-        let shared_count = shared_regions(&r)
+        let (shared, r) = resources(&f, 1, 0xe0);
+        let shared_count = shared_regions(&shared)
             .into_iter()
             .map(|r| cleans(r).len())
             .sum::<usize>();
@@ -453,9 +480,17 @@ mod tests {
             secondary_boot::begin_boot_once(&state).unwrap();
             IO.with(|io| io.borrow_mut().fail_at = Some(position));
             let result = (|| {
-                validate_publication(&cpus(0xe0), 1, contract(), f.get(7).unwrap(), &r, 64)?;
+                validate_publication(
+                    &cpus(0xe0),
+                    1,
+                    contract(),
+                    f.get(7).unwrap(),
+                    &shared,
+                    &r,
+                    64,
+                )?;
                 unsafe {
-                    publish_shared_startup(&r, 64)?;
+                    publish_shared_startup(&shared, 64)?;
                     publish_cpu_startup(r.stack, 64)?;
                     publication_barrier()
                 }
@@ -477,7 +512,7 @@ mod tests {
         for case in 0..12 {
             test_io::reset();
             let f = fixture(1);
-            let mut r = resources(&f, 1, 0xe0);
+            let (mut shared, mut r) = resources(&f, 1, 0xe0);
             let mut cpus = cpus(0xe0);
             let mut c = contract();
             let mut v = f.get(7).unwrap();
@@ -488,15 +523,15 @@ mod tests {
                 2 => cpus[1].affinity = 8,
                 3 => cpus[1].startup = StartupMethod::Psci,
                 4 => r.context = region(r.context.start().value() + 64, 64),
-                5 => r.config = region(r.config.start().value() + 64, 128),
+                5 => shared.config = region(shared.config.start().value() + 64, 128),
                 6 => v.generation = 8,
-                7 => r.entry = r.code.end().value(),
+                7 => shared.entry = shared.code.end().value(),
                 8 => r.release_page = region(4096, 4096),
                 9 => line = 7,
                 10 => cpus[2].logical_id = Some(1),
                 _ => cpus[2].affinity = 1,
             }
-            assert!(validate_publication(&cpus, 1, c, v, &r, line).is_err());
+            assert!(validate_publication(&cpus, 1, c, v, &shared, &r, line).is_err());
             assert!(IO.with(|io| io.borrow().events.is_empty()));
         }
     }
@@ -505,15 +540,16 @@ mod tests {
         for case in 0..4 {
             test_io::reset();
             let f = fixture(1);
-            let mut r = resources(&f, 1, 0xe0);
+            let (mut shared, _) = resources(&f, 1, 0xe0);
             match case {
-                0 => r.slots = region(0x900000, 1536),
-                1 => r.config = region(0x900000, 128),
-                2 => r.tables = region(u64::MAX - 8, 8),
+                0 => shared.slots = region(0x900000, 1536),
+                1 => shared.config = region(0x900000, 128),
+                2 => shared.tables = region(u64::MAX - 8, 8),
                 _ => {}
             }
             assert!(
-                unsafe { publish_shared_startup(&r, if case == 3 { 12 } else { 64 }) }.is_err()
+                unsafe { publish_shared_startup(&shared, if case == 3 { 12 } else { 64 }) }
+                    .is_err()
             );
             assert!(IO.with(|io| io.borrow().events.is_empty()));
         }

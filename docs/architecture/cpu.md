@@ -74,6 +74,15 @@ registers and cannot be replaced after failure.
 secondary. It does not silently skip a failing CPU or fall back to another
 startup mechanism.
 
+The coordinator constructs one `SharedStartupResources` description for image
+sections, the table arena, slot array, host configuration, entry and root. Each
+`CpuStartupResources` contains only that CPU's context, stack and firmware
+release page. Every member is validated against the same borrowed shared
+description before publication. Hardware translation checks remain after each
+release-page mapping; table validation/freeze and cache-range preflight retain
+their own checks. These descriptions are temporary boot metadata and own no
+physical allocations or release permission.
+
 1. Validate board/CPU/cluster selection, each unique aligned release cell and
    the physical-counter deadline. A cell shared with a disabled CPU is rejected
    too. Full firmware holding-memory ownership must already be reserved.
